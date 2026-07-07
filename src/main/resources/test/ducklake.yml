@@ -3,6 +3,13 @@
 # 密码经 compose 注入 STACK_PASSWORD 环境变量,不落文件
 
 spring:
+  data:
+    redis: # 备用连接(暂无业务使用):走宿主映射端口(与 PG 同风格);集群/异机部署经环境变量覆盖
+      host: ${SPRING_DATA_REDIS_HOST:${HOST_IP:10.144.144.1}}
+      port: ${SPRING_DATA_REDIS_PORT:46379}
+      password: ${STACK_PASSWORD}
+      database: 0
+      timeout: 5s
   datasource: # core MultiDataSourceConfiguration 动态注册;业务实体 EasyQuery 查询用(需要时可用)
     dynamic:
       primary:

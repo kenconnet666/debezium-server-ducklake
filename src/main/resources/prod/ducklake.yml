@@ -1,5 +1,12 @@
 # prod = 全环境变量注入(与 a_start prod 同款风格)
 spring:
+  data:
+    redis: # 备用连接(暂无业务使用):全环境变量注入,与 a_start prod 同款风格
+      host: ${SPRING_DATA_REDIS_HOST}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+      password: ${SPRING_DATA_REDIS_PASSWORD:${STACK_PASSWORD}}
+      database: ${SPRING_DATA_REDIS_DATABASE:0}
+      timeout: 5s
   datasource:
     dynamic:
       primary:

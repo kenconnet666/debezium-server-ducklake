@@ -1,6 +1,13 @@
 # standalone = 单机 compose 形态(.doc/.standalone):全部容器名直连(同一 compose 网络),
 # PG/rustfs 无 HAProxy 层;密码经 compose 注入 STACK_PASSWORD
 spring:
+  data:
+    redis: # 备用连接(暂无业务使用):同 compose 网内 zredis 直连(requirepass=STACK_PASSWORD)
+      host: zredis
+      port: 6379
+      password: ${STACK_PASSWORD}
+      database: 0
+      timeout: 5s
   datasource: # core MultiDataSourceConfiguration 动态注册;业务实体 EasyQuery 查询用(需要时可用)
     dynamic:
       primary:

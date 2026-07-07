@@ -1,5 +1,12 @@
 # dev = 本机开发(单机 docker 栈:PG :25432 / rustfs :39000);密码为本机开发默认,与 a_start dev 一致
 spring:
+  data:
+    redis: # 备用连接(暂无业务使用):dev 单机栈,与 a_start dev 同一实例
+      host: 127.0.0.1
+      port: 46379
+      password: changeme
+      database: 0
+      timeout: 5s
   datasource:
     dynamic:
       primary:

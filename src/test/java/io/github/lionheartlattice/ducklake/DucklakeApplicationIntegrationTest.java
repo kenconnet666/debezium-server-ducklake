@@ -36,7 +36,17 @@ import static org.awaitility.Awaitility.await;
  * DDL 审计流(RENAME COLUMN 湖侧真 rename)→ /watermark 接口。
  */
 @Testcontainers(disabledWithoutDocker = true)
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+// Redis 是备用连接(暂无业务逻辑依赖),集成测试不起 Redis 容器,按类排除其装配
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = "spring.autoconfigure.exclude="
+                + "org.redisson.spring.starter.RedissonAutoConfigurationV2,"
+                + "org.redisson.spring.starter.RedissonAutoConfigurationV4,"
+                + "org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration,"
+                + "org.springframework.boot.data.redis.autoconfigure.DataRedisReactiveAutoConfiguration,"
+                + "org.springframework.boot.data.redis.autoconfigure.DataRedisRepositoriesAutoConfiguration,"
+                + "org.springframework.boot.data.redis.autoconfigure.health.DataRedisHealthContributorAutoConfiguration,"
+                + "org.springframework.boot.data.redis.autoconfigure.health.DataRedisReactiveHealthContributorAutoConfiguration,"
+                + "org.springframework.boot.data.redis.autoconfigure.observation.LettuceObservationAutoConfiguration")
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class DucklakeApplicationIntegrationTest {
 
