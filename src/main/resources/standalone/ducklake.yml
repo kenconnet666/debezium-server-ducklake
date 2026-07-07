@@ -1,0 +1,52 @@
+# standalone = 单机 compose 形态(.doc/.standalone):全部容器名直连(同一 compose 网络),
+# PG/rustfs 无 HAProxy 层;密码经 compose 注入 STACK_PASSWORD
+spring:
+  datasource: # core MultiDataSourceConfiguration 动态注册;业务实体 EasyQuery 查询用(需要时可用)
+    dynamic:
+      primary:
+        type: com.zaxxer.hikari.HikariDataSource
+        url: jdbc:postgresql://zpostgres:5432/postgres?currentSchema=public
+        username: dbuser_zadmin
+        password: ${STACK_PASSWORD}
+        driver-class-name: org.postgresql.Driver
+    hikari:
+      primary:
+        maximum-pool-size: 4
+        minimum-idle: 1
+
+oss:
+  endpoint: zrustfs:9000
+  access-key: ${RUSTFS_ACCESS_KEY:admin}
+  secret-key: ${STACK_PASSWORD}
+  bucket-name: lake
+  region: us-east-1
+  path-style-access: true
+
+zadmin:
+  ducklake:
+    source:
+      hostname: zpostgres
+      port: 5432
+      user: dbuser_cdc
+      password: ${STACK_PASSWORD}
+      dbname: postgres
+      slot-name: dbz_ducklake
+      publication-name: dbz_publication
+    lake:
+      catalog-host: zpostgres
+      catalog-port: 5432
+      catalog-db: ducklake_catalog
+      catalog-user: dbuser_zadmin
+      catalog-password: ${STACK_PASSWORD}
+      data-path: s3://lake/ducklake/
+      s3-endpoint: zrustfs:9000
+      s3-access-key: ${RUSTFS_ACCESS_KEY:admin}
+      s3-secret-key: ${STACK_PASSWORD}
+      s3-ssl: false
+      memory-limit: 512MB
+      threads: 2
+    engine:
+      snapshot-mode: initial
+    maintenance:
+      enabled: true
+      snapshot-retain-days: 30

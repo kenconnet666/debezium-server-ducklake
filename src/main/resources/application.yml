@@ -1,0 +1,74 @@
+spring:
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+  application:
+    name: debezium-server-ducklake
+  lifecycle:
+    timeout-per-shutdown-phase: 30s   # 优雅停:引擎 close 等当前批落盘
+  threads:
+    virtual:
+      enabled: true
+  autoconfigure:
+    # core 传递带入 redisson-starter 与 data-redis(Lettuce);本模块不用 Redis,全部排除:
+    # ① 避免启动即连不存在的 Redis;② Lettuce 装配会触发 netty 4.1/4.2 混装的
+    #    ClassNotFoundError: io.netty.channel.socket.SocketProtocolFamily(部署实测)。
+    # 精确类名取自各 jar 的 AutoConfiguration.imports(Boot 4 更名为 DataRedis* 前缀)
+    exclude:
+      - org.redisson.spring.starter.RedissonAutoConfigurationV2
+      - org.redisson.spring.starter.RedissonAutoConfigurationV4
+      - org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration
+      - org.springframework.boot.data.redis.autoconfigure.DataRedisReactiveAutoConfiguration
+      - org.springframework.boot.data.redis.autoconfigure.DataRedisRepositoriesAutoConfiguration
+      - org.springframework.boot.data.redis.autoconfigure.health.DataRedisHealthContributorAutoConfiguration
+      - org.springframework.boot.data.redis.autoconfigure.health.DataRedisReactiveHealthContributorAutoConfiguration
+      - org.springframework.boot.data.redis.autoconfigure.observation.LettuceObservationAutoConfiguration
+
+easy-query:
+  build: false   # 与 a_start 同款:数据源由 core 的 MultiDataSourceConfiguration 动态注册
+
+server:
+  port: ${SERVER_PORT:19992}
+  shutdown: graceful
+  servlet:
+    context-path: /api/ducklake
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus   # /api/ducklake/actuator/prometheus 供 VM 抓取(job=ducklake)
+  health:
+    redis:
+      enabled: false   # core 传递带入 data-redis;本模块无 Redis,禁 health ping 防 health 永久 DOWN
+
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+    import:
+      - optional:classpath:/dev/ducklake.yml
+
+---
+spring:
+  config:
+    activate:
+      on-profile: test
+    import:
+      - optional:classpath:/test/ducklake.yml
+
+---
+spring:
+  config:
+    activate:
+      on-profile: standalone   # 单机 compose 形态(.doc/.standalone,容器名直连)
+    import:
+      - optional:classpath:/standalone/ducklake.yml
+
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+    import:
+      - optional:classpath:/prod/ducklake.yml

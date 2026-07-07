@@ -1,0 +1,46 @@
+# dev = 本机开发(单机 docker 栈:PG :25432 / rustfs :39000);密码为本机开发默认,与 a_start dev 一致
+spring:
+  datasource:
+    dynamic:
+      primary:
+        type: com.zaxxer.hikari.HikariDataSource
+        url: jdbc:postgresql://127.0.0.1:25432/postgres?currentSchema=public
+        username: postgres
+        password: changeme
+        driver-class-name: org.postgresql.Driver
+    hikari:
+      primary:
+        maximum-pool-size: 4
+        minimum-idle: 1
+
+oss:
+  endpoint: 127.0.0.1:39000
+  access-key: admin
+  secret-key: changeme
+  bucket-name: lake
+  region: us-east-1
+  path-style-access: true
+
+zadmin:
+  ducklake:
+    source:
+      hostname: 127.0.0.1
+      port: 25432
+      user: dbuser_cdc
+      password: changeme
+      dbname: postgres
+      slot-name: dbz_ducklake
+      publication-name: dbz_publication
+    lake:
+      catalog-host: 127.0.0.1
+      catalog-port: 25432
+      catalog-db: ducklake_catalog
+      catalog-user: postgres
+      catalog-password: changeme
+      data-path: s3://lake/ducklake/
+      s3-endpoint: 127.0.0.1:39000
+      s3-access-key: admin
+      s3-secret-key: changeme
+      s3-ssl: false
+    maintenance:
+      enabled: false   # 开发机默认不跑维护任务

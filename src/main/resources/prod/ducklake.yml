@@ -1,0 +1,48 @@
+# prod = 全环境变量注入(与 a_start prod 同款风格)
+spring:
+  datasource:
+    dynamic:
+      primary:
+        type: com.zaxxer.hikari.HikariDataSource
+        url: ${DUCKLAKE_PRIMARY_URL:jdbc:postgresql://postgres:5432/postgres?currentSchema=public}
+        username: ${DUCKLAKE_PRIMARY_USER:dbuser_zadmin}
+        password: ${STACK_PASSWORD}
+        driver-class-name: org.postgresql.Driver
+    hikari:
+      primary:
+        maximum-pool-size: 4
+        minimum-idle: 1
+
+oss:
+  endpoint: ${OSS_ENDPOINT:zrustfs:9000}
+  access-key: ${RUSTFS_ACCESS_KEY:admin}
+  secret-key: ${STACK_PASSWORD}
+  bucket-name: ${OSS_BUCKET:lake}
+  region: us-east-1
+  path-style-access: true
+
+zadmin:
+  ducklake:
+    source:
+      hostname: ${DUCKLAKE_PG_HOST}
+      port: ${DUCKLAKE_PG_PORT:5432}
+      user: ${DUCKLAKE_CDC_USER:dbuser_cdc}
+      password: ${STACK_PASSWORD}
+      dbname: ${DUCKLAKE_PG_DB:postgres}
+      slot-name: ${DUCKLAKE_SLOT:dbz_ducklake}
+      publication-name: dbz_publication
+    lake:
+      catalog-host: ${DUCKLAKE_PG_HOST}
+      catalog-port: ${DUCKLAKE_PG_PORT:5432}
+      catalog-db: ducklake_catalog
+      catalog-user: ${DUCKLAKE_CATALOG_USER:dbuser_zadmin}
+      catalog-password: ${STACK_PASSWORD}
+      data-path: ${DUCKLAKE_DATA_PATH:s3://lake/ducklake/}
+      s3-endpoint: ${OSS_ENDPOINT:zrustfs:9000}
+      s3-access-key: ${RUSTFS_ACCESS_KEY:admin}
+      s3-secret-key: ${STACK_PASSWORD}
+      s3-ssl: false
+      memory-limit: ${DUCKLAKE_MEMORY_LIMIT:512MB}
+      threads: 2
+    maintenance:
+      enabled: true

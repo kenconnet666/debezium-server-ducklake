@@ -1,0 +1,55 @@
+# test = 10.144.144.1 测试服务器(集群形态:3 节点 Patroni,经 node1 HAProxy 读写口 35115 寻主)
+# 模块容器加入 zadmin_net,rustfs 走容器名;PG 走宿主 IP+HAProxy(跨 compose 项目无容器名 DNS)
+# 密码经 compose 注入 STACK_PASSWORD 环境变量,不落文件
+
+spring:
+  datasource: # core MultiDataSourceConfiguration 动态注册;业务实体 EasyQuery 查询用(需要时可用)
+    dynamic:
+      primary:
+        type: com.zaxxer.hikari.HikariDataSource
+        url: jdbc:postgresql://${HOST_IP:10.144.144.1}:35115/postgres?currentSchema=public
+        username: dbuser_zadmin
+        password: ${STACK_PASSWORD}
+        driver-class-name: org.postgresql.Driver
+    hikari:
+      primary:
+        maximum-pool-size: 4
+        minimum-idle: 1
+
+# core 的 S3Config 无条件装配,给真实 rustfs 配置(与湖同一存储,顺手可用)
+oss:
+  endpoint: zrustfs:9000
+  access-key: ${RUSTFS_ACCESS_KEY:admin}
+  secret-key: ${STACK_PASSWORD}
+  bucket-name: lake
+  region: us-east-1
+  path-style-access: true
+
+zadmin:
+  ducklake:
+    source:
+      hostname: ${HOST_IP:10.144.144.1}
+      port: 35115                    # HAProxy 读写口(故障转移自动跟随;单机形态改 zpostgres:5432)
+      user: dbuser_cdc
+      password: ${STACK_PASSWORD}
+      dbname: postgres
+      slot-name: dbz_ducklake        # 独立于旧链 dbz_iceberg 槽
+      publication-name: dbz_publication
+    lake:
+      catalog-host: ${HOST_IP:10.144.144.1}
+      catalog-port: 35115
+      catalog-db: ducklake_catalog
+      catalog-user: dbuser_zadmin
+      catalog-password: ${STACK_PASSWORD}
+      data-path: s3://lake/ducklake/
+      s3-endpoint: zrustfs:9000
+      s3-access-key: ${RUSTFS_ACCESS_KEY:admin}
+      s3-secret-key: ${STACK_PASSWORD}
+      s3-ssl: false
+      memory-limit: 512MB
+      threads: 2
+    engine:
+      snapshot-mode: initial
+    maintenance:
+      enabled: true
+      snapshot-retain-days: 30
