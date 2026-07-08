@@ -53,6 +53,10 @@ class DucklakeApplicationIntegrationTest {
     DuckLakeEngine engine;
     @Autowired
     SyncState syncState;
+    @Autowired
+    io.github.lionheartlattice.ducklake.maintain.LakeMaintenanceJobs maintenanceJobs;
+    @Autowired
+    io.github.lionheartlattice.ducklake.config.DucklakeProperties props;
     @LocalServerPort
     int port;
 
@@ -210,6 +214,53 @@ class DucklakeApplicationIntegrationTest {
 
     @Test
     @Order(4)
+    void monthlyFullMergeConvergesFilesWithoutDataLoss() throws Exception {
+        maintenanceJobs.getClass(); // 显式引用,防未用告警
+        boolean prev = propsEnabled(true);
+        try {
+            // 两轮 flush 制造多个 parquet 文件,再全量归并
+            long rows0 = lakeCount("SELECT count(*) FROM cdc.public_cdc_test");
+            maintenanceJobs.quick();
+            try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+                 Statement s = c.createStatement()) {
+                s.execute("INSERT INTO cdc_test (name, price) VALUES ('merge_probe', 9.99)");
+            }
+            await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+                    assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='merge_probe'")).isEqualTo(1L));
+            maintenanceJobs.quick();
+
+            long filesBefore = catalogFileCount();
+            maintenanceJobs.monthlyFullMerge();
+            long filesAfter = catalogFileCount();
+            long rowsAfter = lakeCount("SELECT count(*) FROM cdc.public_cdc_test");
+
+            assertThat(rowsAfter).isEqualTo(rows0 + 1);          // 行数无损
+            assertThat(filesAfter).isLessThanOrEqualTo(filesBefore); // 文件收敛(或已最优)
+        } finally {
+            propsEnabled(prev);
+        }
+    }
+
+    /** 切换 maintenance.enabled 并返回旧值(集成测试默认 false,归并用例需临时打开) */
+    private boolean propsEnabled(boolean value) {
+        boolean prev = props.getMaintenance().isEnabled();
+        props.getMaintenance().setEnabled(value);
+        return prev;
+    }
+
+    /** catalog PG 里活跃数据文件数 */
+    private long catalogFileCount() throws Exception {
+        try (Connection c = DriverManager.getConnection(
+                PG.getJdbcUrl().replace("/postgres", "/ducklake_catalog"), "dbuser_zadmin", "test");
+             Statement s = c.createStatement();
+             var rs = s.executeQuery("SELECT count(*) FROM ducklake_data_file WHERE end_snapshot IS NULL")) {
+            rs.next();
+            return rs.getLong(1);
+        }
+    }
+
+    @Test
+    @Order(5)
     void watermarkEndpointReportsHealthyPipeline() {
         String body = RestClient.create("http://127.0.0.1:" + port + "/api/ducklake")
                 .get().uri("/watermark").retrieve().body(String.class);
