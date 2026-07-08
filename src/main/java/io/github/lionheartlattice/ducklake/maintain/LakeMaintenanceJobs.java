@@ -7,6 +7,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.sql.Connection;
+import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 
@@ -38,7 +40,7 @@ public class LakeMaintenanceJobs {
         call("CALL ducklake_merge_adjacent_files('%s')".formatted(DuckLakeEngine.LAKE), "merge_adjacent_files");
     }
 
-    /** 每日 04:40：过期旧快照（保留窗口 = time travel 窗口）+ 物理清理被标记文件 */
+    /** 每日 04:40：过期旧快照（保留窗口 = time travel 窗口）+ 物理清理被标记文件 + DDL 信号表防堆积 */
     @Scheduled(cron = "0 40 4 * * *")
     public void daily() {
         if (!props.getMaintenance().isEnabled()) {
@@ -49,6 +51,31 @@ public class LakeMaintenanceJobs {
                 .formatted(DuckLakeEngine.LAKE, days), "expire_snapshots");
         call("CALL ducklake_cleanup_old_files('%s', older_than => now() - INTERVAL 2 HOURS)"
                 .formatted(DuckLakeEngine.LAKE), "cleanup_old_files");
+        truncateDdlSignals();
+    }
+
+    /**
+     * 源库 DDL 信号表阅后即焚：TRUNCATE 不产生复制事件（Debezium 默认 skipped.operations=t），
+     * 已提交信号早在 WAL/复制流内、消费与表内容无关，任意时刻清空都安全；重快照后无历史信号
+     * 也安全（rename/删列应用有列存在性幂等兜底）。⚠️ 不能用 DELETE 清——会产生墓碑事件流进
+     * DdlApplier（其 __op 过滤只是兜底）。需要 GRANT TRUNCATE ON sys_ddl_log TO dbuser_cdc。
+     */
+    private void truncateDdlSignals() {
+        DucklakeProperties.Source src = props.getSource();
+        String url = "jdbc:postgresql://%s:%d/%s".formatted(src.getHostname(), src.getPort(), src.getDbname());
+        try (Connection c = DriverManager.getConnection(url, src.getUser(), src.getPassword());
+             Statement s = c.createStatement()) {
+            for (String table : props.getMaintenance().getDdlAuditTables()) {
+                s.execute("TRUNCATE TABLE " + table);
+            }
+            // 增量快照 signal 表同样阅后即焚(已消费的 execute-snapshot 与水位标记行无保留价值)
+            s.execute("TRUNCATE TABLE " + src.getSignalTable());
+            log.info("信号表已清空(防堆积): {} + {}",
+                    props.getMaintenance().getDdlAuditTables(), src.getSignalTable());
+        } catch (SQLException e) {
+            // 单项失败不影响主链;常见原因是 TRUNCATE 未授权(见 init 脚本 GRANT)或源库瞬时不可达
+            log.warn("信号表清理失败: {}", e.getMessage());
+        }
     }
 
     /** 每周一 05:20：孤儿文件 dry_run 巡检（只记日志，人工确认后才手动清） */

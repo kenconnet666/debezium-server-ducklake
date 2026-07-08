@@ -35,6 +35,9 @@ public class DucklakeProperties {
         private String schemaIncludeList = "public";
         /** 排除表（正则，schema.table 形式），如内部状态表 */
         private String tableExcludeList = "";
+        /** Debezium 增量快照 signal 表（source channel；类型严格跟随的"重建+重拉"兜底经由它触发，
+         *  连接器的快照水位标记也写在此表；行由连接器内部消费不进变更流，维护任务定期 TRUNCATE） */
+        private String signalTable = "public.dbz_signal";
     }
 
     /** DuckLake 目标（catalog=PG 库，数据=S3 Parquet） */
@@ -81,12 +84,16 @@ public class DucklakeProperties {
         private boolean enabled = true;
         /** 快照保留窗口（time travel 窗口），过期后物理清理 */
         private int snapshotRetainDays = 30;
-        /** DDL 审计流里跟随删除湖列（默认 false=保留历史列，新行 NULL） */
-        private boolean followDropColumn = false;
-        /** 湖内 CDC 数据 schema 与审计 schema */
+        /** DDL 信号流里跟随删除湖列（默认 true=跟随真删；false=保留历史列，新行 NULL） */
+        private boolean followDropColumn = true;
+        /** 数据驱动的类型严格跟随（源库 ALTER COLUMN TYPE 后湖列类型严格对齐，逐级执行：
+         *  ALTER 直改 → 湖内整表 CAST 重写旧数据 → 删表重建并经 signal 增量快照重拉；
+         *  关闭则类型漂移仅告警，湖列保守不动） */
+        private boolean followTypeChange = true;
+        /** 湖内 CDC 数据 schema */
         private String cdcSchema = "cdc";
-        private String metaSchema = "meta";
-        /** DDL 审计源表（PG 侧 event trigger 写入，随 publication 复制过来） */
+        /** DDL 信号源表（PG 侧 event trigger 写入，随 publication 复制过来；阅后即焚，
+         *  由维护任务每日 TRUNCATE 防堆积——TRUNCATE 不产生复制事件） */
         private List<String> ddlAuditTables = List.of("sys_ddl_log");
     }
 }

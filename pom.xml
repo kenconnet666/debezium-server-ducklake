@@ -19,10 +19,26 @@
 
     <dependencies>
 
-        <!-- 共享基座：EasyQuery/WebMVC/actuator/ApiResult/统一异常/工具（core 已瘦身，无鉴权过滤链拖带） -->
+        <!-- 2026-07-08 与 core 解耦：本模块只做 CDC 入湖，不需要 EasyQuery/动态数据源/OSS 等业务基座。
+             依赖全部直接声明，版本仍由根 pom 统一管理（Boot BOM / debezium-bom / netty-bom / dependencyManagement） -->
         <dependency>
-            <groupId>io.github.lionheartlattice</groupId>
-            <artifactId>core</artifactId>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <!-- Debezium PG 连接与 offset storage 的 JDBC 驱动（connector 亦有传递，显式声明防版本漂移） -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <scope>compile</scope>
         </dependency>
 
         <!-- Debezium Embedded Engine（纯库，非 Quarkus Server）；版本由 root 的 debezium-bom 统一管理 -->

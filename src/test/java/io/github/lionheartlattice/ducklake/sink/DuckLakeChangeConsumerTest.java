@@ -188,16 +188,18 @@ class DuckLakeChangeConsumerTest {
                 event(new SourceRecord(Map.of(), Map.of(), "zadmin.public.sys_ddl_log", ddlSchema, ddlRow))
         ), committer());
 
+        // 信号被 DdlApplier 消费(计数推进)
+        assertThat(syncState.getDdlAudited().count()).isEqualTo(1);
         try (Statement s = conn.createStatement()) {
-            // 进了审计表
-            try (ResultSet rs = s.executeQuery(
-                    "SELECT count(*) FROM lake.meta.ddl_history WHERE object_identity='public.t9'")) {
-                rs.next();
-                assertThat(rs.getLong(1)).isEqualTo(1);
-            }
             // 没有被当业务表建出 cdc.public_sys_ddl_log
             try (ResultSet rs = s.executeQuery(
                     "SELECT count(*) FROM information_schema.tables WHERE table_catalog='lake' AND table_name='public_sys_ddl_log'")) {
+                rs.next();
+                assertThat(rs.getLong(1)).isZero();
+            }
+            // 纯跟随不留档:湖里不存在 ddl_history 留档表(2026-07-08 裁撤)
+            try (ResultSet rs = s.executeQuery(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_catalog='lake' AND table_name='ddl_history'")) {
                 rs.next();
                 assertThat(rs.getLong(1)).isZero();
             }
@@ -221,15 +223,69 @@ class DuckLakeChangeConsumerTest {
         }
     }
 
-    /** 不可自愈的 SQL 错误(列类型收窄后溢出):3 次重试耗尽,抛出交给进程级重启 */
+    /** 类型漂移(湖列被收窄)由严格跟随自愈:漂移检测 → ALTER 回事件类型 → 大值正常落湖 */
     @Test
-    void persistentSqlFailureGivesUpAfterThreeAttempts() throws Exception {
+    void typeDriftSelfHealsByStrictFollow() throws Exception {
         consumer.handleBatch(List.of(rowEvent("zadmin.public.t4", 1, "a", "c", 500)), committer());
         try (Statement s = conn.createStatement()) {
-            s.execute("ALTER TABLE lake.cdc.public_t4 ALTER COLUMN id TYPE SMALLINT");
+            s.execute("ALTER TABLE lake.cdc.public_t4 ALTER COLUMN id TYPE SMALLINT"); // 制造湖列收窄漂移
+        }
+        // 缓存里 id 仍是 BIGINT,首批直写溢出失败 → 清缓存重试 → 漂移被发现 → ALTER 跟随 → 自愈
+        consumer.handleBatch(List.of(rowEvent("zadmin.public.t4", 4_000_000_000L, "big", "c", 501)), committer());
+
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.cdc.public_t4 WHERE id=4000000000")) {
+            rs.next();
+            assertThat(rs.getLong(1)).isEqualTo(1);
+        }
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT data_type FROM information_schema.columns "
+                     + "WHERE table_catalog='lake' AND table_name='public_t4' AND column_name='id'")) {
+            rs.next();
+            assertThat(rs.getString(1)).isEqualTo("BIGINT"); // 列型已严格跟回事件类型
+        }
+    }
+
+    /** 类型无法就地转换(湖列 VARCHAR 存非数值,事件要 BIGINT):标记重建+重试批干净事务里 DROP 重建 */
+    @Test
+    void unconvertibleTypeDriftRebuildsTableOnRetry() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            // 预置"湖列与事件类型不可转"的表:id 是 VARCHAR 且存着非数值(ALTER/CAST 必失败)
+            s.execute("CREATE TABLE lake.cdc.public_t7 (id VARCHAR, name VARCHAR, __op VARCHAR, "
+                    + "__deleted VARCHAR, __lsn BIGINT, __source_ts_ms BIGINT)");
+            s.execute("INSERT INTO lake.cdc.public_t7 VALUES ('abc', 'old', 'c', 'false', 1, 1)");
+        }
+        // 事件 id 为 BIGINT → 漂移 → ALTER 失败 → CAST 重写失败('abc') → 标记重建+signal(源库不可达仅 log)
+        // → 本批重试 → 干净事务 DROP 重建 → 当批行按新类型写入
+        consumer.handleBatch(List.of(rowEvent("zadmin.public.t7", 42, "new", "c", 700)), committer());
+
+        assertThat(syncState.getBatchFailures().count()).isEqualTo(1); // 首次失败,重试即成功
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*), max(id) FROM lake.cdc.public_t7")) {
+            rs.next();
+            assertThat(rs.getLong(1)).isEqualTo(1);   // 旧数据已让位(由增量快照重灌,单测不覆盖)
+            assertThat(rs.getLong(2)).isEqualTo(42L); // 当批行按 BIGINT 写入
+        }
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT data_type FROM information_schema.columns "
+                     + "WHERE table_catalog='lake' AND table_name='public_t7' AND column_name='id'")) {
+            rs.next();
+            assertThat(rs.getString(1)).isEqualTo("BIGINT");
+        }
+    }
+
+    /** 不可自愈的 SQL 错误(湖对象被换成视图等异常形态):3 次重试耗尽,抛出交给进程级重启 */
+    @Test
+    void persistentSqlFailureGivesUpAfterThreeAttempts() throws Exception {
+        consumer.handleBatch(List.of(rowEvent("zadmin.public.t5", 1, "a", "c", 600)), committer());
+        try (Statement s = conn.createStatement()) {
+            // 表被换成同名视图:列集合/类型与事件完全一致(不触发任何跟随),但 INSERT 永远失败
+            s.execute("DROP TABLE lake.cdc.public_t5");
+            s.execute("CREATE VIEW lake.cdc.public_t5 AS SELECT 1::BIGINT AS id, 'x' AS name, "
+                    + "'c' AS __op, 'false' AS __deleted, 1::BIGINT AS __lsn, 1::BIGINT AS __source_ts_ms");
         }
         assertThatThrownBy(() -> consumer.handleBatch(
-                List.of(rowEvent("zadmin.public.t4", 4_000_000_000L, "boom", "c", 501)), committer()))
+                List.of(rowEvent("zadmin.public.t5", 2, "boom", "c", 601)), committer()))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("落湖连续 3 次失败");
         assertThat(syncState.getBatchFailures().count()).isEqualTo(3);

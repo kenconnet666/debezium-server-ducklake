@@ -91,9 +91,8 @@ public class DuckLakeEngine {
             s.execute("SET ducklake_max_retry_count=%d".formatted(lake.getMaxRetryCount()));
             s.execute("SET ducklake_retry_wait_ms=100");
             s.execute("SET ducklake_retry_backoff=1.5");
-            // 湖内 schema 就位
+            // 湖内 schema 就位(2026-07-08 起仅 cdc:meta.ddl_history 留档已随"纯跟随"改造裁撤)
             s.execute("CREATE SCHEMA IF NOT EXISTS " + props.getMaintenance().getCdcSchema());
-            s.execute("CREATE SCHEMA IF NOT EXISTS " + props.getMaintenance().getMetaSchema());
         }
         // ⚠️ DuckDB JDBC 默认 autoCommit=false(违背 JDBC 惯例,部署实测):连接会隐式带着
         // 打开的事务,后续显式事务控制全乱。统一显式置 true,批写入用 JDBC 事务 API 临时关闭。

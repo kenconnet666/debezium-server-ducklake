@@ -36,17 +36,8 @@ import static org.awaitility.Awaitility.await;
  * DDL 审计流(RENAME COLUMN 湖侧真 rename)→ /watermark 接口。
  */
 @Testcontainers(disabledWithoutDocker = true)
-// Redis 是备用连接(暂无业务逻辑依赖),集成测试不起 Redis 容器,按类排除其装配
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = "spring.autoconfigure.exclude="
-                + "org.redisson.spring.starter.RedissonAutoConfigurationV2,"
-                + "org.redisson.spring.starter.RedissonAutoConfigurationV4,"
-                + "org.springframework.boot.data.redis.autoconfigure.DataRedisAutoConfiguration,"
-                + "org.springframework.boot.data.redis.autoconfigure.DataRedisReactiveAutoConfiguration,"
-                + "org.springframework.boot.data.redis.autoconfigure.DataRedisRepositoriesAutoConfiguration,"
-                + "org.springframework.boot.data.redis.autoconfigure.health.DataRedisHealthContributorAutoConfiguration,"
-                + "org.springframework.boot.data.redis.autoconfigure.health.DataRedisReactiveHealthContributorAutoConfiguration,"
-                + "org.springframework.boot.data.redis.autoconfigure.observation.LettuceObservationAutoConfiguration")
+// redis 栈已整体归属 sys(2026-07-08),本模块依赖链无 redis——无需任何排除
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class DucklakeApplicationIntegrationTest {
 
@@ -114,19 +105,20 @@ class DucklakeApplicationIntegrationTest {
                     + "WHEN TAG IN ('ALTER TABLE', 'DROP TABLE') EXECUTE FUNCTION fn_capture_drop()");
 
             s.execute("CREATE TABLE cdc_test (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
-                    + "name text NOT NULL, amount numeric(12,2) DEFAULT 0)");
+                    + "name text NOT NULL, big_content text, amount numeric(12,2) DEFAULT 0)");
             s.execute("ALTER TABLE cdc_test REPLICA IDENTITY FULL");
             s.execute("INSERT INTO cdc_test (name, amount) VALUES ('alpha', 10.50), ('beta', 20.00), ('gamma', 99.99)");
+
+            // Debezium 增量快照 signal 表(类型严格跟随的重建+重拉兜底;连接器写快照水位也在此表)
+            s.execute("CREATE TABLE dbz_signal (id varchar(42) PRIMARY KEY, type varchar(32) NOT NULL, data varchar(2048))");
+            s.execute("GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON public.dbz_signal TO dbuser_cdc");
+            s.execute("GRANT TRUNCATE ON public.sys_ddl_log TO dbuser_cdc");
         }
     }
 
     /** 全部连接指向 PG 容器;湖数据落 @TempDir(覆盖 dev profile 的本机地址) */
     @DynamicPropertySource
     static void wire(DynamicPropertyRegistry r) {
-        r.add("spring.datasource.dynamic.primary.url", PG::getJdbcUrl);
-        r.add("spring.datasource.dynamic.primary.username", () -> "postgres");
-        r.add("spring.datasource.dynamic.primary.password", () -> "test");
-
         r.add("zadmin.ducklake.source.hostname", PG::getHost);
         r.add("zadmin.ducklake.source.port", PG::getFirstMappedPort);
         r.add("zadmin.ducklake.source.user", () -> "dbuser_cdc");
@@ -143,14 +135,6 @@ class DucklakeApplicationIntegrationTest {
         r.add("zadmin.ducklake.lake.s3-access-key", () -> "dummy");
         r.add("zadmin.ducklake.lake.s3-secret-key", () -> "dummy");
         r.add("zadmin.ducklake.maintenance.enabled", () -> "false");
-
-        // oss.* 是 core S3Config 的必填配置(无条件装配);同样惰性,不触达
-        r.add("oss.endpoint", () -> "127.0.0.1:1");
-        r.add("oss.access-key", () -> "dummy");
-        r.add("oss.secret-key", () -> "dummy");
-        r.add("oss.bucket-name", () -> "lake");
-        r.add("oss.region", () -> "us-east-1");
-        r.add("oss.path-style-access", () -> "true");
     }
 
     // ---------- 用例(有序:快照 → 增量 → DDL → 接口) ----------
@@ -181,21 +165,47 @@ class DucklakeApplicationIntegrationTest {
 
     @Test
     @Order(3)
-    void renameColumnIsAppliedToLakeViaDdlAuditStream() throws Exception {
+    void ddlFollowsRenameDropAndStrictTypeChange() throws Exception {
+        // ① RENAME COLUMN → 湖侧真 rename(rename 前旧行在新列名下可读)
         try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
              Statement s = c.createStatement()) {
             s.execute("ALTER TABLE cdc_test RENAME COLUMN amount TO price");
             s.execute("INSERT INTO cdc_test (name, price) VALUES ('after_rename', 3.14)");
         }
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
-            // 湖列已改名(rename 前的旧行在新列名下可读——DuckLake 元数据级 rename)
-            assertThat(lakeCount("SELECT count(*) FROM information_schema.columns "
-                    + "WHERE table_catalog='lake' AND table_name='public_cdc_test' AND column_name='price'")).isEqualTo(1L);
+            assertThat(lakeColumnType("price")).isNotNull();
             assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='after_rename'")).isEqualTo(1L);
         });
-        // DDL 全量审计落 meta.ddl_history
-        assertThat(lakeCount("SELECT count(*) FROM meta.ddl_history WHERE query_text LIKE '%RENAME COLUMN%'"))
-                .isGreaterThanOrEqualTo(1L);
+
+        // ② DROP COLUMN → 湖列跟随真删(followDropColumn 默认 true)
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("ALTER TABLE cdc_test DROP COLUMN big_content");
+            s.execute("INSERT INTO cdc_test (name, price) VALUES ('after_dropcol', 1.00)");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='after_dropcol'")).isEqualTo(1L);
+            assertThat(lakeColumnType("big_content")).isNull();
+        });
+
+        // ③ 类型严格跟随:加 int 列 → 湖 INTEGER;源 ALTER 成 bigint → 湖 BIGINT,
+        //    并插入超 INT32 的值(4000000000)——跟随未生效则绑定溢出批失败,测试必超时
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("ALTER TABLE cdc_test ADD COLUMN hits int");
+            s.execute("INSERT INTO cdc_test (name, price, hits) VALUES ('with_hits', 1.00, 100)");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+                assertThat(lakeColumnType("hits")).isEqualTo("INTEGER"));
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("ALTER TABLE cdc_test ALTER COLUMN hits TYPE bigint");
+            s.execute("INSERT INTO cdc_test (name, price, hits) VALUES ('after_widen', 1.00, 4000000000)");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
+            assertThat(lakeColumnType("hits")).isEqualTo("BIGINT");
+            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE hits=4000000000")).isEqualTo(1L);
+        });
     }
 
     @Test
@@ -211,5 +221,12 @@ class DucklakeApplicationIntegrationTest {
 
     private Long lakeCount(String sql) throws Exception {
         return engine.queryScalar(sql, Long.class);
+    }
+
+    /** 湖表 public_cdc_test 指定列的 data_type(列不存在返回 null) */
+    private String lakeColumnType(String column) throws Exception {
+        return engine.queryScalar("SELECT data_type FROM information_schema.columns "
+                + "WHERE table_catalog='lake' AND table_name='public_cdc_test' AND column_name='" + column + "'",
+                String.class);
     }
 }

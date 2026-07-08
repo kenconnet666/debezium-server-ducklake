@@ -107,6 +107,59 @@ class TypeMapperTest {
         }
     }
 
+    /** normalize 假设钉死在真引擎上:各类型建表回读 information_schema,归一后须与 duckType 产出一致 */
+    @Test
+    void normalizeDuckTypeRoundTripsThroughInformationSchema() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE t_norm (a SMALLINT, b INTEGER, c BIGINT, d FLOAT, e DOUBLE, f BOOLEAN, "
+                    + "g BLOB, h VARCHAR, i DECIMAL(38,6), j DATE, k TIME, l TIMESTAMP, m TIMESTAMPTZ, n JSON, o UUID)");
+        }
+        java.util.Map<String, String> expect = java.util.Map.ofEntries(
+                java.util.Map.entry("a", "SMALLINT"), java.util.Map.entry("b", "INTEGER"),
+                java.util.Map.entry("c", "BIGINT"), java.util.Map.entry("d", "FLOAT"),
+                java.util.Map.entry("e", "DOUBLE"), java.util.Map.entry("f", "BOOLEAN"),
+                java.util.Map.entry("g", "BLOB"), java.util.Map.entry("h", "VARCHAR"),
+                java.util.Map.entry("i", "DECIMAL(38,6)"), java.util.Map.entry("j", "DATE"),
+                java.util.Map.entry("k", "TIME"), java.util.Map.entry("l", "TIMESTAMP"),
+                java.util.Map.entry("m", "TIMESTAMPTZ"), java.util.Map.entry("n", "JSON"),
+                java.util.Map.entry("o", "UUID"));
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='t_norm'")) {
+            int seen = 0;
+            while (rs.next()) {
+                String col = rs.getString(1);
+                assertThat(TypeMapper.normalizeDuckType(rs.getString(2)))
+                        .as("列 %s 的 information_schema 形态归一", col)
+                        .isEqualTo(expect.get(col));
+                seen++;
+            }
+            assertThat(seen).isEqualTo(expect.size());
+        }
+    }
+
+    /**
+     * Debezium isostring 模式的真实输出:无时区族一律带 'Z' 后缀(实测 IsoDate='2024-02-29Z')。
+     * 回归防线:2026-07-08 该形态曾致 DateTimeParseException → 批重放 → 引擎 crash loop(26 次重启)。
+     */
+    @Test
+    void isoStringWithTrailingZoneSuffixBindsCorrectly() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE t_zsuffix (dt DATE, tm TIME, ts TIMESTAMP)");
+        }
+        try (PreparedStatement ps = conn.prepareStatement("INSERT INTO t_zsuffix VALUES (?,?,?)")) {
+            TypeMapper.bind(ps, 1, logical("io.debezium.time.IsoDate"), "2024-02-29Z");
+            TypeMapper.bind(ps, 2, logical("io.debezium.time.IsoTime"), "23:59:59.999999Z");
+            TypeMapper.bind(ps, 3, logical("io.debezium.time.IsoTimestamp"), "2026-01-02T03:04:05.678901Z");
+            ps.execute();
+        }
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery("SELECT * FROM t_zsuffix")) {
+            assertThat(rs.next()).isTrue();
+            assertThat(rs.getObject(1, LocalDate.class)).isEqualTo(LocalDate.of(2024, 2, 29));
+            assertThat(rs.getObject(2, java.time.LocalTime.class)).isEqualTo(java.time.LocalTime.of(23, 59, 59, 999_999_000));
+            assertThat(rs.getObject(3, LocalDateTime.class)).isEqualTo(LocalDateTime.of(2026, 1, 2, 3, 4, 5, 678_901_000));
+        }
+    }
+
     @Test
     void bindNullSetsSqlNull() throws SQLException {
         try (Statement s = conn.createStatement()) {

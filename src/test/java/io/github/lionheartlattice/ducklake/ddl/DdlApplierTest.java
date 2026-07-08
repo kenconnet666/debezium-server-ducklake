@@ -22,8 +22,9 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * DdlApplier 单测(真 DuckDB 内存库):真 rename 判定(同事务无 sql_drop)、
- * DROP+ADD 不误判、幂等重放、followDropColumn 开关、全量审计落表、缓存失效回调。
+ * DdlApplier 单测(真 DuckDB 内存库):真 rename 判定(同事务无 sql_drop)、DROP+ADD 不误判且
+ * 默认跟随真删、followDropColumn=false 保留历史列、墓碑事件过滤(阅后即焚兜底)、幂等重放、
+ * 缓存失效回调。2026-07-08 起纯跟随不留档(meta.ddl_history 已裁撤)。
  */
 class DdlApplierTest {
 
@@ -44,6 +45,7 @@ class DdlApplierTest {
             .field("xid", Schema.OPTIONAL_INT64_SCHEMA)
             .field("occurred_at", Schema.OPTIONAL_STRING_SCHEMA)
             .field("__lsn", Schema.OPTIONAL_INT64_SCHEMA)
+            .field("__op", Schema.OPTIONAL_STRING_SCHEMA)
             .build();
 
     @BeforeAll
@@ -52,7 +54,6 @@ class DdlApplierTest {
         try (Statement s = conn.createStatement()) {
             s.execute("ATTACH ':memory:' AS lake");
             s.execute("CREATE SCHEMA lake.cdc");
-            s.execute("CREATE SCHEMA lake.meta");
         }
     }
 
@@ -72,11 +73,17 @@ class DdlApplierTest {
     private static long idSeq = 0;
 
     private static Struct row(String ev, String tag, String objectType, String identity, String query, long xid) {
+        return rowWithOp(ev, tag, objectType, identity, query, xid, "c");
+    }
+
+    private static Struct rowWithOp(String ev, String tag, String objectType, String identity,
+                                    String query, long xid, String op) {
         return new Struct(DDL_SCHEMA)
                 .put("id", ++idSeq).put("ev", ev).put("tag", tag)
                 .put("object_type", objectType).put("object_identity", identity)
                 .put("query_text", query).put("xid", xid)
-                .put("occurred_at", "2026-07-07T10:00:00+08:00").put("__lsn", idSeq);
+                .put("occurred_at", "2026-07-07T10:00:00+08:00").put("__lsn", idSeq)
+                .put("__op", op);
     }
 
     private void apply(List<Struct> run) throws SQLException {
@@ -114,24 +121,25 @@ class DdlApplierTest {
     }
 
     @Test
-    void dropAddInSameXidIsNotMisjudgedAsRename() throws Exception {
+    void dropAddIsNotMisjudgedAsRenameAndFollowsDropByDefault() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE TABLE lake.cdc.public_r3 (id BIGINT, note VARCHAR)");
         }
-        // DROP COLUMN + ADD COLUMN(同 xid 有 sql_drop):默认 followDropColumn=false → 湖列保守不动
+        // DROP COLUMN + ADD COLUMN(同 xid 有 sql_drop):不做 rename;followDropColumn 默认 true → 跟随真删
         apply(List.of(
                 row("ddl_command_end", "ALTER TABLE", "table", "public.r3",
                         "ALTER TABLE r3 DROP COLUMN note, ADD COLUMN remark text", 120),
                 row("sql_drop", "ALTER TABLE", "table column", "public.r3.note",
                         "ALTER TABLE r3 DROP COLUMN note, ADD COLUMN remark text", 120)));
 
-        assertThat(columns("public_r3")).containsExactly("id", "note"); // 未 rename、未删列
-        assertThat(syncState.getDdlApplied().count()).isZero();
+        assertThat(columns("public_r3")).containsExactly("id"); // note 已跟删;remark 由数据驱动 ensureTable 建
+        assertThat(invalidated).containsExactly("cdc.public_r3");
+        assertThat(syncState.getDdlApplied().count()).isEqualTo(1);
     }
 
     @Test
-    void followDropColumnDeletesLakeColumnWhenEnabled() throws Exception {
-        props.getMaintenance().setFollowDropColumn(true);
+    void followDropColumnDisabledKeepsHistoricalColumn() throws Exception {
+        props.getMaintenance().setFollowDropColumn(false);
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE TABLE lake.cdc.public_r4 (id BIGINT, legacy VARCHAR)");
         }
@@ -141,25 +149,22 @@ class DdlApplierTest {
                 row("sql_drop", "ALTER TABLE", "table column", "public.r4.legacy",
                         "ALTER TABLE r4 DROP COLUMN legacy", 130)));
 
-        assertThat(columns("public_r4")).containsExactly("id");
-        assertThat(invalidated).containsExactly("cdc.public_r4");
+        assertThat(columns("public_r4")).containsExactly("id", "legacy"); // 历史列保留,新行该列 NULL
+        assertThat(syncState.getDdlApplied().count()).isZero();
     }
 
     @Test
-    void everyEventIsAuditedVerbatim() throws Exception {
-        long before = countHistory();
-        apply(List.of(
-                row("ddl_command_end", "CREATE TABLE", "table", "public.audit_t", "CREATE TABLE audit_t(id bigint)", 140),
-                row("ddl_command_end", "CREATE INDEX", "index", "public.audit_t_pkey", "CREATE TABLE audit_t(id bigint)", 140)));
-
-        assertThat(countHistory() - before).isEqualTo(2);
-        assertThat(syncState.getDdlAudited().count()).isEqualTo(2);
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT query_text, xid FROM lake.meta.ddl_history WHERE object_identity='public.audit_t'")) {
-            rs.next();
-            assertThat(rs.getString(1)).isEqualTo("CREATE TABLE audit_t(id bigint)");
-            assertThat(rs.getLong(2)).isEqualTo(140);
+    void tombstoneEventsAreIgnored() throws Exception {
+        // 信号表被 DELETE 清理产生的墓碑(__op=d)不得当作 DDL 信号重放(常规清理走 TRUNCATE 无事件)
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE lake.cdc.public_r5 (id BIGINT, note VARCHAR)");
         }
+        apply(List.of(rowWithOp("ddl_command_end", "ALTER TABLE", "table", "public.r5",
+                "ALTER TABLE r5 RENAME COLUMN note TO remark", 140, "d")));
+
+        assertThat(columns("public_r5")).containsExactly("id", "note"); // 未被重放
+        assertThat(syncState.getDdlApplied().count()).isZero();
+        assertThat(syncState.getDdlAudited().count()).isZero(); // 墓碑不计入信号消费数
     }
 
     @Test
@@ -183,13 +188,5 @@ class DdlApplierTest {
             }
         }
         return cols;
-    }
-
-    private static long countHistory() throws SQLException {
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.meta.ddl_history")) {
-            rs.next();
-            return rs.getLong(1);
-        }
     }
 }

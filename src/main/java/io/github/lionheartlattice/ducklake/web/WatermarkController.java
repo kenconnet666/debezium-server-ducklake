@@ -1,6 +1,5 @@
 package io.github.lionheartlattice.ducklake.web;
 
-import io.github.lionheartlattice.core.entity.parent.ApiResult;
 import io.github.lionheartlattice.ducklake.metrics.SyncState;
 import io.github.lionheartlattice.ducklake.sink.DuckLakeEngine;
 import lombok.RequiredArgsConstructor;

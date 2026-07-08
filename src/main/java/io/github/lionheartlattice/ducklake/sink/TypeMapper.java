@@ -105,15 +105,15 @@ final class TypeMapper {
                     return;
                 }
                 case ISO_DATE -> {
-                    ps.setObject(idx, LocalDate.parse(value.toString()));
+                    ps.setObject(idx, LocalDate.parse(stripTrailingZ(value)));
                     return;
                 }
                 case ISO_TIME -> {
-                    ps.setObject(idx, LocalTime.parse(value.toString()));
+                    ps.setObject(idx, LocalTime.parse(stripTrailingZ(value)));
                     return;
                 }
                 case ISO_TIMESTAMP -> {
-                    ps.setObject(idx, LocalDateTime.parse(value.toString()));
+                    ps.setObject(idx, LocalDateTime.parse(stripTrailingZ(value)));
                     return;
                 }
                 case ZONED_TIMESTAMP -> {
@@ -147,6 +147,26 @@ final class TypeMapper {
             case BYTES -> ps.setBytes(idx, value instanceof ByteBuffer bb ? toBytes(bb) : (byte[]) value);
             default -> ps.setString(idx, value.toString());
         }
+    }
+
+    /**
+     * information_schema.columns.data_type 的形态归一到 {@link #duckType} 的产出形态,
+     * 供湖列现型与事件类型比对(实测差异仅时区时间戳一处)。
+     */
+    static String normalizeDuckType(String infoSchemaType) {
+        String t = infoSchemaType == null ? "" : infoSchemaType.toUpperCase();
+        return "TIMESTAMP WITH TIME ZONE".equals(t) ? "TIMESTAMPTZ" : t;
+    }
+
+    /**
+     * isostring 模式下无时区族(IsoDate/IsoTime/IsoTimestamp)的输出带 'Z' 后缀(如 {@code 2024-02-29Z}),
+     * 而 LocalDate/LocalTime/LocalDateTime.parse 不接受尾部 zone 标记——解析前剥掉。
+     * 全类型矩阵实测毒丸:不剥则 DateTimeParseException → 批失败重放 → 引擎 crash loop。
+     * 带时区族(ZonedTimestamp)走 OffsetDateTime.parse 原生支持 'Z',不经此函数。
+     */
+    private static String stripTrailingZ(Object value) {
+        String s = value.toString();
+        return s.endsWith("Z") ? s.substring(0, s.length() - 1) : s;
     }
 
     private static byte[] toBytes(ByteBuffer buffer) {

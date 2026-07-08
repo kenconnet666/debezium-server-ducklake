@@ -137,6 +137,11 @@ public class DebeziumEngineRunner implements SmartLifecycle {
         }
         p.setProperty("snapshot.mode", eng.getSnapshotMode());
 
+        // --- 增量快照 signal(source channel):类型严格跟随的"重建+重拉"兜底经此触发,
+        //     连接器也在该表写快照水位标记;signal 行内部消费不进变更流 ---
+        p.setProperty("signal.enabled.channels", "source");
+        p.setProperty("signal.data.collection", src.getSignalTable());
+
         // --- 攒批（Data Inlining 下小批无小文件代价，间隔可以比 Iceberg 时代更激进） ---
         p.setProperty("max.batch.size", String.valueOf(eng.getMaxBatchSize()));
         p.setProperty("max.queue.size", String.valueOf(eng.getMaxQueueSize()));

@@ -8,12 +8,9 @@ spring:
   threads:
     virtual:
       enabled: true
-  # Redis(Redisson,core 传递带入)已作为备用连接接入:连接参数在各 profile 的 ducklake.yml。
-  # 曾因 netty 4.1/4.2 混装在 Lettuce 装配时 CNFE(SocketProtocolFamily),
-  # 已在 root pom 以 netty-bom(先于 debezium-bom)统一 4.2 根治;集成测试无 Redis,仍按类排除装配。
-
-easy-query:
-  build: false   # 与 a_start 同款:数据源由 core 的 MultiDataSourceConfiguration 动态注册
+  # Redis 不进入本模块依赖链(2026-07-08 redis 栈整体自 core 迁至 sys):无需排除任何 redis 自动配置。
+  # (历史:曾经 core 传递接入过备用连接;netty 4.1/4.2 混装 CNFE 已在 root pom 以 netty-bom 统一 4.2
+  #  根治,该统一保留——AWS SDK 等仍受益)
 
 server:
   port: ${SERVER_PORT:19992}

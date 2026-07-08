@@ -1,33 +1,4 @@
 # prod = 全环境变量注入(与 a_start prod 同款风格)
-spring:
-  data:
-    redis: # 备用连接(暂无业务使用):全环境变量注入,与 a_start prod 同款风格
-      host: ${SPRING_DATA_REDIS_HOST}
-      port: ${SPRING_DATA_REDIS_PORT:6379}
-      password: ${SPRING_DATA_REDIS_PASSWORD:${STACK_PASSWORD}}
-      database: ${SPRING_DATA_REDIS_DATABASE:0}
-      timeout: 5s
-  datasource:
-    dynamic:
-      primary:
-        type: com.zaxxer.hikari.HikariDataSource
-        url: ${DUCKLAKE_PRIMARY_URL:jdbc:postgresql://postgres:5432/postgres?currentSchema=public}
-        username: ${DUCKLAKE_PRIMARY_USER:dbuser_zadmin}
-        password: ${STACK_PASSWORD}
-        driver-class-name: org.postgresql.Driver
-    hikari:
-      primary:
-        maximum-pool-size: 4
-        minimum-idle: 1
-
-oss:
-  endpoint: ${OSS_ENDPOINT:zrustfs:9000}
-  access-key: ${RUSTFS_ACCESS_KEY:admin}
-  secret-key: ${STACK_PASSWORD}
-  bucket-name: ${OSS_BUCKET:lake}
-  region: us-east-1
-  path-style-access: true
-
 zadmin:
   ducklake:
     source:

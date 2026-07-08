@@ -21,17 +21,18 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * DDL 审计流消费：PG event trigger（ddl_command_end + sql_drop）写入 sys_ddl_log，
- * 该表随 publication 被 Debezium 当普通表抓走，到这里翻译应用到湖侧。
+ * DDL 信号流消费：PG event trigger（ddl_command_end + sql_drop）写入 sys_ddl_log，
+ * 该表随 publication 被 Debezium 当普通表抓走，到这里翻译应用到湖侧——**纯跟随，不留档**
+ * （2026-07-08 起湖侧 meta.ddl_history 审计已裁撤；信号表本身由维护任务每日 TRUNCATE 阅后即焚）。
  * <p>
  * 判定原理（PG 目录语义，确定性非启发式）：RENAME COLUMN 是 pg_attribute 原地改名、
  * <b>不触发 sql_drop</b>；DROP+ADD 必触发。故按事务号 xid 分组后，
  * "ALTER TABLE 且同事务无 sql_drop 且语句含 RENAME COLUMN" ⇒ 真 rename，湖侧同步
- * ALTER TABLE ... RENAME COLUMN（这是数据驱动 schema 演进做不到、必须靠 DDL 流补齐的唯一动作）。
+ * ALTER TABLE ... RENAME COLUMN（这是数据驱动 schema 演进做不到、必须靠 DDL 信号补齐的唯一动作）。
  * <p>
- * 其余 DDL 一律只进湖侧审计表（meta.ddl_history）：加列交给数据驱动 ensureTable 幂等处理；
- * 删列默认保留湖列（历史可查，followDropColumn=true 才跟删）；建表延迟到首批数据；
- * 快照重放旧 DDL 时靠"列存在性检查"天然幂等。
+ * 其余跟随分工：加列与类型安全放宽交给数据驱动 ensureTable 幂等处理；删列默认跟随真删
+ * （followDropColumn=false 时保留湖列留历史）；建表延迟到首批数据；快照重放旧 DDL 时
+ * 靠"列存在性检查"天然幂等。
  */
 @Slf4j
 @Component
@@ -51,12 +52,22 @@ public class DdlApplier {
      *                         以回调而非直引消费者，避免 consumer↔applier 循环依赖
      */
     public void apply(Connection conn, List<Struct> run, Consumer<String> cacheInvalidator) throws SQLException {
-        ensureHistoryTable(conn);
-        audit(conn, run);
+        // 只认插入(c)与快照读(r)——信号表若被 DELETE 清理会产生墓碑(d)事件,不得当作信号重放
+        // (常规清理走 TRUNCATE 不产生事件,此过滤是对误用 DELETE 的兜底)
+        List<Struct> signals = run.stream()
+                .filter(r -> {
+                    String op = str(r, "__op");
+                    return op == null || "c".equals(op) || "r".equals(op);
+                })
+                .toList();
+        if (signals.isEmpty()) {
+            return;
+        }
+        syncState.getDdlAudited().increment(signals.size());
 
         // 按源事务 xid 分组（同一条 ALTER 产生的 ddl_command_end 与 sql_drop 共享 xid）
         Map<Long, List<Struct>> byXid = new LinkedHashMap<>();
-        for (Struct row : run) {
+        for (Struct row : signals) {
             byXid.computeIfAbsent(asLong(row, "xid"), k -> new ArrayList<>()).add(row);
         }
 
@@ -74,8 +85,8 @@ public class DdlApplier {
                 } else if ("ALTER TABLE".equals(tag) && hasDrop && props.getMaintenance().isFollowDropColumn()) {
                     applyDropColumns(conn, group.getValue(), cacheInvalidator);
                 }
-                // 其余（CREATE/DROP TABLE/类型变更等）：仅审计。建表延迟到首批数据到达;
-                // 类型收窄等破坏性变更需人工处理（湖列保守不动，审计表可追溯）
+                // 其余（CREATE/DROP TABLE 等）：建表延迟到首批数据到达；DROP TABLE 湖表保留历史快照;
+                // 类型变更由数据驱动的 ensureTable 安全放宽跟随（TypeMapper.isSafeWidening 白名单）
             }
         }
     }
@@ -106,7 +117,7 @@ public class DdlApplier {
         }
     }
 
-    /** followDropColumn=true 时跟随删列（默认关闭：湖保留历史列） */
+    /** followDropColumn=true（默认）时跟随删列；false 时湖保留历史列 */
     private void applyDropColumns(Connection conn, List<Struct> group,
                                   Consumer<String> cacheInvalidator) throws SQLException {
         for (Struct row : group) {
@@ -129,39 +140,6 @@ public class DdlApplier {
                 syncState.getDdlApplied().increment();
                 log.warn("湖侧跟随删列: {}.{}", lakeTable, col);
             }
-        }
-    }
-
-    /** 全部 DDL 事件原样落湖审计表（含 query_text 原文，可追溯/可重放） */
-    private void audit(Connection conn, List<Struct> run) throws SQLException {
-        String sql = "INSERT INTO " + DuckLakeEngine.LAKE + "." + props.getMaintenance().getMetaSchema()
-                + ".ddl_history (id, ev, tag, object_type, object_identity, query_text, xid, occurred_at, lsn) "
-                + "VALUES (?,?,?,?,?,?,?,?,?)";
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            for (Struct row : run) {
-                ps.setObject(1, asLong(row, "id"));
-                ps.setString(2, str(row, "ev"));
-                ps.setString(3, str(row, "tag"));
-                ps.setString(4, str(row, "object_type"));
-                ps.setString(5, str(row, "object_identity"));
-                ps.setString(6, str(row, "query_text"));
-                ps.setObject(7, asLong(row, "xid"));
-                ps.setString(8, str(row, "occurred_at"));
-                ps.setObject(9, asLong(row, "__lsn"));
-                ps.addBatch();
-            }
-            ps.executeBatch();
-        }
-        syncState.getDdlAudited().increment(run.size());
-    }
-
-    /** 每次调用都 IF NOT EXISTS(不做"已建"缓存:批回滚会把建表一并回掉,缓存标志会脏——与消费者列缓存同教训) */
-    private void ensureHistoryTable(Connection conn) throws SQLException {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE IF NOT EXISTS " + DuckLakeEngine.LAKE + "."
-                    + props.getMaintenance().getMetaSchema() + ".ddl_history ("
-                    + "id BIGINT, ev VARCHAR, tag VARCHAR, object_type VARCHAR, object_identity VARCHAR, "
-                    + "query_text VARCHAR, xid BIGINT, occurred_at VARCHAR, lsn BIGINT)");
         }
     }
 

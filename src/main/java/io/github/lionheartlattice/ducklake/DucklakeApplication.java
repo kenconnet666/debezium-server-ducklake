@@ -3,7 +3,6 @@ package io.github.lionheartlattice.ducklake;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
-import org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
@@ -17,12 +16,12 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  *   <li>湖维护定时任务（flush_inlined/merge/expire/cleanup，@Scheduled，零 Spark）</li>
  *   <li>同步水位线接口 /api/ducklake/watermark 与 Micrometer 指标</li>
  * </ul>
- * 形制与 a_start 对齐：扫 io.github.lionheartlattice 全包（core 的 EasyQuery/Web/异常处理可用）、
- * 排除 DataSourceAutoConfiguration（数据源由 core 的 MultiDataSourceConfiguration 按 yml 动态注册）。
- * 定时任务是本模块新增能力（全仓此前无 @EnableScheduling）。
+ * 2026-07-08 与 core 解耦：只扫本模块包，依赖全部直接声明（版本由根 pom 统一管理）。
+ * 模块内不存在 DataSource/EasyQuery——PG 走 Debezium 复制协议与 offset JDBC，湖走内嵌 DuckDB 直连，
+ * 均不经 Spring 数据源体系，故无需再排除 DataSourceAutoConfiguration。
  */
-@SpringBootApplication(scanBasePackages = "io.github.lionheartlattice", exclude = {DataSourceAutoConfiguration.class})
-@ConfigurationPropertiesScan(basePackages = "io.github.lionheartlattice")
+@SpringBootApplication
+@ConfigurationPropertiesScan
 @EnableScheduling
 public class DucklakeApplication {
 
