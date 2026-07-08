@@ -43,12 +43,18 @@ class DuckLakeChangeConsumerTest {
 
     @BeforeAll
     static void openDuckDb() throws SQLException {
-        conn = DriverManager.getConnection("jdbc:duckdb:");
+        // 命名内存 instance 复刻生产结构(主 catalog 恒为 memory,:memory:<name> 只是共享键)。
+        // 名字刻意不用 ducklake:集成测试的 Spring 缓存上下文持有同名 instance 且已 ATTACH lake,
+        // 同 JVM 复用会撞 "lake already attached"(surefire 单 fork 实测)。
+        // 并复刻 USE lake 会话——曾因会话差异漏掉"staging 落湖"缺陷(两段名 main.x
+        // 在 USE lake 下解析成 lake.main.x),bench/单测环境必须与生产会话状态一致
+        conn = DriverManager.getConnection("jdbc:duckdb::memory:consumer_test");
         try (Statement s = conn.createStatement()) {
             // 消费者的 SQL 全部以 lake.<schema>.<table> 三段名引用;ATTACH 一个内存库顶名即可
             s.execute("ATTACH ':memory:' AS " + DuckLakeEngine.LAKE);
             s.execute("CREATE SCHEMA lake.cdc");
             s.execute("CREATE SCHEMA lake.meta");
+            s.execute("USE " + DuckLakeEngine.LAKE);
         }
         props = new DucklakeProperties();
         props.getEngine().setRetrySleepBaseMs(1); // 测试不真等退避
@@ -301,6 +307,20 @@ class DuckLakeChangeConsumerTest {
             rs.next();
             assertThat(rs.getString(1)).isNull();
             assertThat(rs.getBoolean(2)).isTrue();
+        }
+    }
+
+    @Test
+    void stagingStaysInMemoryCatalogNeverLeaksIntoLake() throws Exception {
+        // 回归:USE lake 会话下 staging 若用两段名会静默建进湖(每批多 3 次 catalog 提交)。
+        // 断言写批后湖 catalog 里没有任何 stg_seg_* 残留(含事务内周期)
+        consumer.handleBatch(List.of(rowEvent("zadmin.public.t9", 1, "a", "c", 900)), committer());
+
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM information_schema.tables "
+                     + "WHERE table_catalog = '" + DuckLakeEngine.LAKE + "' AND table_name LIKE 'stg_seg_%'")) {
+            rs.next();
+            assertThat(rs.getLong(1)).as("staging 表泄漏进湖 catalog").isZero();
         }
     }
 

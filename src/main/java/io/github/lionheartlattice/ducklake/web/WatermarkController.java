@@ -44,6 +44,12 @@ public class WatermarkController {
         data.put("eventsTotal", (long) syncState.getEvents().count());
         data.put("batchesTotal", (long) syncState.getBatches().count());
         data.put("ddlAuditedTotal", (long) syncState.getDdlAudited().count());
+        // 最近一批分段延迟(ms;-1=尚无数据批):batchLag ≈ deliverLag + stage + lakeTx + 锁等待/重试残差。
+        // 服务端真口径,双端皆本进程时钟,替代 docker exec+curl 轮询探针(那套有 100-400ms 测量水分)
+        data.put("deliverLagMs", syncState.getLastDeliverLagMs().get());
+        data.put("stageMs", syncState.getLastStageMs().get());
+        data.put("lakeTxMs", syncState.getLastLakeTxMs().get());
+        data.put("batchLagMs", syncState.getLastBatchLagMs().get());
         return ApiResult.success(data);
     }
 

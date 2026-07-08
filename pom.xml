@@ -127,6 +127,28 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- Arrow(仅 WritePathBenchmark 的流式插入对照;生产代码不依赖):
+             c-data 提供 ArrowArrayStream 与 duckdb registerArrowStream 对接,
+             memory-unsafe 避免引入 netty-buffer(与根 pom netty 4.2 锁版隔离) -->
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-vector</artifactId>
+            <version>${arrow.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-c-data</artifactId>
+            <version>${arrow.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-memory-unsafe</artifactId>
+            <version>${arrow.version}</version>
+            <scope>test</scope>
+        </dependency>
+
     </dependencies>
 
     <build>
@@ -134,6 +156,14 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <!-- Arrow 在 JDK25 需要:nio 反射开放 + sun.misc.Unsafe 内存访问放行(JEP 498) -->
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow</argLine>
+                </configuration>
             </plugin>
         </plugins>
     </build>

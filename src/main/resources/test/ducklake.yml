@@ -23,7 +23,11 @@ zadmin:
       s3-access-key: ${RUSTFS_ACCESS_KEY:admin}
       s3-secret-key: ${STACK_PASSWORD}
       s3-ssl: false
-      memory-limit: 512MB
+      # 容器 3072MB = JVM ~700 + 本值 1536 + 余量;512/768MB 均实测 OOM crash loop
+      # (大批重放+常驻占用顶格,2026-07-08),须给足"常驻+批工作集"两份
+      memory-limit: 1536MB
+      # 8 线程(自动核数)在本容器内存下实测 OOM(每线程写出缓冲是乘法);2=已验证稳定值,
+      # 要自动核数(0)须先把容器内存预算提到 ≥2.5G
       threads: 2
     engine:
       snapshot-mode: initial

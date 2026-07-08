@@ -23,8 +23,9 @@ import java.util.concurrent.TimeUnit;
  * <p>
  * 要点：
  * <ul>
- *   <li>Debezium 3.2 起 AsyncEmbeddedEngine 是唯一实现，API 不变；record.processing.* 保持默认
- *       （ORDERED 单线程处理）与单写者铁律一致，不开事件级并行。</li>
+ *   <li>Debezium 3.2 起 AsyncEmbeddedEngine 是唯一实现，API 不变；record.processing.* 保持默认：
+ *       processing 线程数由引擎按核数/负载动态分配（SMT 转换可并行），record.processing.order=ORDERED
+ *       保证按原序交付 handleBatch——转换并行 + 交付有序，与单写者铁律兼容，无需显式调参。</li>
  *   <li>offset 经 debezium-storage-jdbc 存 PG（ducklake_catalog 库，与 DuckLake catalog 同库不同表），
  *       不落本地文件；⚠️ 配置 key 是 3.2+ 的 offset.storage.jdbc.connection.* 新形式。</li>
  *   <li>PG 连接器不需要 schema history（结构随流内 Relation message 刷新）。</li>

@@ -56,11 +56,22 @@ public class DucklakeProperties {
         private String s3AccessKey;
         private String s3SecretKey;
         private boolean s3Ssl = false;
-        /** 内嵌 DuckDB 资源上限（与容器内存限额联动） */
-        private String memoryLimit = "512MB";
+        /** 内嵌 DuckDB 资源上限（与容器内存限额联动：容器 3072MB = JVM ~700 + 本值 + 余量。
+         *  ⚠️ 512/768MB 均实测 OOM crash loop（大批重放 + DuckDB 常驻占用顶格,反复
+         *  could not allocate 76.5MiB;76.5MiB≈120 万行 inlined 存量单列物化尺寸,
+         *  常驻 ~700MB 成因仍在观察——本值须给足"常驻 + 批工作集"两份） */
+        private String memoryLimit = "1536MB";
+        /** DuckDB 引擎并行线程数;<=0 = 不 SET,用引擎默认(自动=可用核数)。
+         *  ⚠️ 并行度×每线程写出缓冲(per_thread_output 下 row group 列缓冲+S3 上传 buffer)是乘法:
+         *  8 线程(自动)在 1.75G 容器实测把 768MB 也吃满(732.4/732.4)持续 OOM——自动核数需
+         *  容器内存预算 ≥2.5G 才可用;默认 2 = 已验证稳定的并行度 */
         private int threads = 2;
-        /** Data Inlining 行数阈值：≥ 引擎单批上限时高频小批直接落 catalog，零小文件（0=不启用） */
-        private int dataInliningRowLimit = 4096;
+        /** Data Inlining 行数阈值。⚠️ 只对**小批**有利：bench 实测 8192 行批 inlined 提交比
+         *  parquet 直写慢 60×（0.355 vs 0.006 ms/行——inlined 是 catalog PG 行式写），
+         *  官方"插入 5×"仅指单行/几十行免小文件的场景；平衡点 ≈ 每批固定成本差(约 40ms)/行成本差
+         *  ≈ 百行级。512：零星/小流免小文件（碎文件由 Tier0 压实兜底），大批走 parquet 向量化直写。
+         *  0=不启用 */
+        private int dataInliningRowLimit = 512;
         /** DuckLake 提交冲突内建重试（单写者下冲突罕见，防维护任务与写入偶发交叠） */
         private int maxRetryCount = 20;
     }
@@ -74,8 +85,9 @@ public class DucklakeProperties {
         private int maxBatchSize = 8192;
         private int maxQueueSize = 32768;
         /** 队列空后发现新事件的唤醒间隔——连续消费模型的唯一延迟参数,仅空闲时燃烧
-         *  (持续有流时 poll 立即返回,不经过此参数)。空闲首条端到端延迟 ≈ 本值 + 单批写入耗时 */
-        private long pollIntervalMs = 50;
+         *  (持续有流时 poll 立即返回,不经过此参数)。空闲首条端到端延迟 ≈ 本值 + 单批写入耗时;
+         *  空闲期仅一个 condition await,调低近乎零成本 */
+        private long pollIntervalMs = 10;
         private long offsetFlushIntervalMs = 10_000;
         /** initial=首启全量快照后转流式；no_data=只流式不快照 */
         private String snapshotMode = "initial";

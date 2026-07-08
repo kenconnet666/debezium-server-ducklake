@@ -1,5 +1,19 @@
 package io.github.lionheartlattice.ducklake.sink;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.Float8Vector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.duckdb.DuckDBAppender;
 import org.duckdb.DuckDBConnection;
 import org.junit.jupiter.api.AfterAll;
@@ -214,6 +228,310 @@ class WritePathBenchmark {
         duck.setAutoCommit(true);
         try (Statement s = duck.createStatement()) {
             s.execute("DELETE FROM staging");
+        }
+    }
+
+    // ---------- ④ 会话开关对阶段二(CAST 投影 + 湖事务)的影响 ----------
+    /**
+     * 贴近生产两阶段路径(全 VARCHAR staging + CAST 投影)对比 threads × preserve_insertion_order：
+     * 语义上当前态由 __lsn 窗口函数决定、不依赖物理行序,preserve_insertion_order 可关;
+     * 本地 DATA_PATH 只反映 CAST/压缩的并行差异,S3 上传侧收益需服务器验证。
+     */
+    @Test
+    @Order(4)
+    void sessionKnobs() throws SQLException {
+        final int knobBatches = 10;
+        try (Statement s = duck.createStatement()) {
+            s.execute("CREATE TABLE stg_knobs (id VARCHAR, name VARCHAR, payload VARCHAR, tag VARCHAR, "
+                    + "val VARCHAR, ok VARCHAR, __op VARCHAR, __lsn VARCHAR, __source_ts_ms VARCHAR)");
+        }
+        String[][] combos = {{"2", "true"}, {"2", "false"}, {"4", "true"}, {"4", "false"}};
+        for (String[] c : combos) {
+            String table = "bench_knob_t" + c[0] + ("true".equals(c[1]) ? "_ord" : "_noord");
+            createTable(table);
+            try (Statement s = duck.createStatement()) {
+                s.execute("SET threads=" + c[0]);
+                s.execute("SET preserve_insertion_order=" + c[1]);
+            }
+            runKnob(table, 0);                            // warmup
+            long t0 = System.nanoTime();
+            for (int b = 1; b <= knobBatches; b++) {
+                runKnob(table, b);
+            }
+            report("t=%s 保序=%s".formatted(c[0], c[1]), System.nanoTime() - t0, knobBatches * BATCH_ROWS);
+            assertThat(rowCount(table)).isEqualTo((knobBatches + 1) * BATCH_ROWS);
+        }
+    }
+
+    // ---------- ⑤ 单行批固定成本：staging 路径 vs prepared 直插(hybrid 决策依据) ----------
+    /**
+     * 零星/小流场景每批只有 1~几行,批耗时由固定成本主导。对比两条路径的每批固定成本
+     * (staging=CREATE OR REPLACE+Appender+INSERT SELECT+DROP 共 5 语句 vs prepared 直插 1 语句),
+     * 差值即 hybrid(小段回落直插)在本地 DuckDB 侧的可回收延迟;生产另有 catalog PG 往返放大批成本。
+     */
+    @Test
+    @Order(5)
+    void singleRowBatchFixedCost() throws SQLException {
+        final int rounds = 50;
+        createTable("bench_one_stg");
+        createTable("bench_one_prep");
+
+        // staging 全流程(与生产 stageSegment/insertFromStaging/dropStagings 同构)
+        singleRowViaStaging("bench_one_stg", -1);         // warmup
+        long t0 = System.nanoTime();
+        for (int b = 0; b < rounds; b++) {
+            singleRowViaStaging("bench_one_stg", b);
+        }
+        long stagingNs = System.nanoTime() - t0;
+
+        // prepared 直插(hybrid 小段回落路径)
+        singleRowViaPrepared("bench_one_prep", -1);       // warmup
+        t0 = System.nanoTime();
+        for (int b = 0; b < rounds; b++) {
+            singleRowViaPrepared("bench_one_prep", b);
+        }
+        long preparedNs = System.nanoTime() - t0;
+
+        System.out.printf("[BENCH] 单行批固定成本: staging=%.1f ms/批  prepared直插=%.1f ms/批  差=%.1f ms/批%n",
+                stagingNs / 1e6 / rounds, preparedNs / 1e6 / rounds, (stagingNs - preparedNs) / 1e6 / rounds);
+        assertThat(rowCount("bench_one_stg")).isEqualTo(rounds + 1);
+        assertThat(rowCount("bench_one_prep")).isEqualTo(rounds + 1);
+    }
+
+    private void singleRowViaStaging(String table, int batchNo) throws SQLException {
+        try (Statement s = duck.createStatement()) {
+            s.execute("CREATE OR REPLACE TABLE main.stg_one (id VARCHAR, name VARCHAR, payload VARCHAR, tag VARCHAR, "
+                    + "val VARCHAR, ok VARCHAR, __op VARCHAR, __lsn VARCHAR, __source_ts_ms VARCHAR)");
+        }
+        DuckDBConnection dc = duck.unwrap(DuckDBConnection.class);
+        try (DuckDBAppender ap = dc.createAppender("main", "stg_one")) {
+            ap.beginRow();
+            ap.append(String.valueOf(batchNo));
+            ap.append("name-" + batchNo);
+            ap.append(payload(batchNo));
+            ap.append("tag1");
+            ap.append("0.5");
+            ap.append("true");
+            ap.append("c");
+            ap.append(String.valueOf(batchNo));
+            ap.append(String.valueOf(1_783_000_000_000L + batchNo));
+            ap.endRow();
+        }
+        duck.setAutoCommit(false);
+        try (Statement s = duck.createStatement()) {
+            s.execute("INSERT INTO lake.cdc." + table + " SELECT CAST(id AS BIGINT), name, payload, tag, "
+                    + "CAST(val AS DOUBLE), CAST(ok AS BOOLEAN), __op, CAST(__lsn AS BIGINT), "
+                    + "CAST(__source_ts_ms AS BIGINT) FROM stg_one");
+        }
+        duck.commit();
+        duck.setAutoCommit(true);
+        try (Statement s = duck.createStatement()) {
+            s.execute("DROP TABLE IF EXISTS main.stg_one");
+        }
+    }
+
+    private void singleRowViaPrepared(String table, int batchNo) throws SQLException {
+        duck.setAutoCommit(false);
+        try (PreparedStatement ps = duck.prepareStatement(
+                "INSERT INTO lake.cdc." + table + " VALUES (?,?,?,?,?,?,?,?,?)")) {
+            ps.setLong(1, batchNo);
+            ps.setString(2, "name-" + batchNo);
+            ps.setString(3, payload(batchNo));
+            ps.setString(4, "tag1");
+            ps.setDouble(5, 0.5);
+            ps.setBoolean(6, true);
+            ps.setString(7, "c");
+            ps.setLong(8, batchNo);
+            ps.setLong(9, 1_783_000_000_000L + batchNo);
+            ps.addBatch();
+            ps.executeBatch();
+        }
+        duck.commit();
+        duck.setAutoCommit(true);
+    }
+
+    private void runKnob(String table, int batchNo) throws SQLException {
+        DuckDBConnection dc = duck.unwrap(DuckDBConnection.class);
+        try (DuckDBAppender ap = dc.createAppender("main", "stg_knobs")) {
+            for (int i = 0; i < BATCH_ROWS; i++) {
+                long id = (long) batchNo * BATCH_ROWS + i;
+                ap.beginRow();
+                ap.append(String.valueOf(id));
+                ap.append("name-" + id);
+                ap.append(payload(id));
+                ap.append("tag" + (id % 7));
+                ap.append(String.valueOf(id * 0.01));
+                ap.append(String.valueOf((id & 1) == 0));
+                ap.append("c");
+                ap.append(String.valueOf(id));
+                ap.append(String.valueOf(1_783_000_000_000L + id));
+                ap.endRow();
+            }
+        }
+        duck.setAutoCommit(false);
+        try (Statement s = duck.createStatement()) {
+            s.execute("INSERT INTO lake.cdc." + table + " SELECT CAST(id AS BIGINT), name, payload, tag, "
+                    + "CAST(val AS DOUBLE), CAST(ok AS BOOLEAN), __op, CAST(__lsn AS BIGINT), "
+                    + "CAST(__source_ts_ms AS BIGINT) FROM stg_knobs");
+        }
+        duck.commit();
+        duck.setAutoCommit(true);
+        try (Statement s = duck.createStatement()) {
+            s.execute("DELETE FROM stg_knobs");
+        }
+    }
+
+    // ---------- ⑦ Data Inlining 提交成本:parquet 直写 vs inlined(写 catalog) + flush 代价 ----------
+    /**
+     * 同一 Appender+staging 路径、同批行数(8192),对比 inlining 开/关的批提交耗时——
+     * 回答"内联阈值设多大合适":inlined 提交免 parquet 物化(生产更免 S3 PUT),
+     * 代价是行进 catalog PG 与之后 flush_inlined_data 的二次落盘(此处一并计时)。
+     */
+    @Test
+    @Order(7)
+    void inliningCommitCost() throws SQLException {
+        try (Statement s = duck.createStatement()) {
+            s.execute("CREATE TABLE IF NOT EXISTS stg_knobs (id VARCHAR, name VARCHAR, payload VARCHAR, tag VARCHAR, "
+                    + "val VARCHAR, ok VARCHAR, __op VARCHAR, __lsn VARCHAR, __source_ts_ms VARCHAR)");
+        }
+        createTable("bench_inl_off");
+        runKnob("bench_inl_off", 0);                      // warmup
+        long t0 = System.nanoTime();
+        for (int b = 1; b <= BATCHES; b++) {
+            runKnob("bench_inl_off", b);
+        }
+        report("inlining关(parquet直写)", System.nanoTime() - t0, BATCHES * BATCH_ROWS);
+
+        try (Statement s = duck.createStatement()) {
+            s.execute("SET ducklake_default_data_inlining_row_limit=16384");
+        }
+        createTable("bench_inl_on");
+        runKnob("bench_inl_on", 0);                       // warmup
+        t0 = System.nanoTime();
+        for (int b = 1; b <= BATCHES; b++) {
+            runKnob("bench_inl_on", b);
+        }
+        report("inlining开(16384)", System.nanoTime() - t0, BATCHES * BATCH_ROWS);
+
+        long tf = System.nanoTime();
+        try (Statement s = duck.createStatement()) {
+            s.execute("CALL ducklake_flush_inlined_data('lake')");
+        }
+        System.out.printf("[BENCH] flush_inlined_data(≤%,d 行): %,.0f ms%n",
+                (BATCHES + 1) * BATCH_ROWS, (System.nanoTime() - tf) / 1e6);
+        assertThat(rowCount("bench_inl_off")).isEqualTo((BATCHES + 1) * BATCH_ROWS);
+        assertThat(rowCount("bench_inl_on")).isEqualTo((BATCHES + 1) * BATCH_ROWS);
+    }
+
+    // ---------- ⑥ Arrow C Data 流式注册插入(ADBC/Arrow 路线对照) ----------
+    /**
+     * 构造 Arrow VectorSchemaRoot(列式,零拷贝进 DuckDB)→ registerArrowStream → INSERT SELECT。
+     * 与 ③ 的差异:数据在 Java 侧就已是列式向量,DuckDB 经 C Data 接口直读,免 Appender 逐行 JNI;
+     * 代价是上游需要攒批构造 RecordBatch(生产接入=架构级改动,此处仅量化收益上限)。
+     */
+    @Test
+    @Order(6)
+    void arrowStreamInsert() throws Exception {
+        createTable("bench_arrow");
+        try (BufferAllocator alloc = new RootAllocator()) {
+            runArrow(alloc, 0);                           // warmup
+            long t0 = System.nanoTime();
+            for (int b = 1; b <= BATCHES; b++) {
+                runArrow(alloc, b);
+            }
+            report("Arrow 流式注册插入", System.nanoTime() - t0, BATCHES * BATCH_ROWS);
+        }
+        assertThat(rowCount("bench_arrow")).isEqualTo((BATCHES + 1) * BATCH_ROWS);
+    }
+
+    private void runArrow(BufferAllocator alloc, int batchNo) throws Exception {
+        Schema schema = new Schema(java.util.List.of(
+                Field.nullable("id", new ArrowType.Int(64, true)),
+                Field.nullable("name", ArrowType.Utf8.INSTANCE),
+                Field.nullable("payload", ArrowType.Utf8.INSTANCE),
+                Field.nullable("tag", ArrowType.Utf8.INSTANCE),
+                Field.nullable("val", new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)),
+                Field.nullable("ok", ArrowType.Bool.INSTANCE),
+                Field.nullable("__op", ArrowType.Utf8.INSTANCE),
+                Field.nullable("__lsn", new ArrowType.Int(64, true)),
+                Field.nullable("__source_ts_ms", new ArrowType.Int(64, true))));
+        // root 生命周期交给 reader→stream 链(stream 释放时经 reader.close 关 root),外层不重复 close
+        VectorSchemaRoot root = VectorSchemaRoot.create(schema, alloc);
+        root.allocateNew();
+        BigIntVector id = (BigIntVector) root.getVector("id");
+        VarCharVector name = (VarCharVector) root.getVector("name");
+        VarCharVector payloadV = (VarCharVector) root.getVector("payload");
+        VarCharVector tag = (VarCharVector) root.getVector("tag");
+        Float8Vector val = (Float8Vector) root.getVector("val");
+        BitVector ok = (BitVector) root.getVector("ok");
+        VarCharVector op = (VarCharVector) root.getVector("__op");
+        BigIntVector lsn = (BigIntVector) root.getVector("__lsn");
+        BigIntVector ts = (BigIntVector) root.getVector("__source_ts_ms");
+        for (int i = 0; i < BATCH_ROWS; i++) {
+            long v = (long) batchNo * BATCH_ROWS + i;
+            id.setSafe(i, v);
+            name.setSafe(i, ("name-" + v).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            payloadV.setSafe(i, payload(v).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            tag.setSafe(i, ("tag" + (v % 7)).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            val.setSafe(i, v * 0.01);
+            ok.setSafe(i, (v & 1) == 0 ? 1 : 0);
+            op.setSafe(i, new byte[]{'c'});
+            lsn.setSafe(i, v);
+            ts.setSafe(i, 1_783_000_000_000L + v);
+        }
+        root.setRowCount(BATCH_ROWS);
+
+        DuckDBConnection dc = duck.unwrap(DuckDBConnection.class);
+        String view = "arrow_in_" + batchNo;
+        try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(alloc)) {
+            Data.exportArrayStream(alloc, new OneShotReader(alloc, root), stream);
+            dc.registerArrowStream(view, stream);
+            duck.setAutoCommit(false);
+            try (Statement s = duck.createStatement()) {
+                s.execute("INSERT INTO lake.cdc.bench_arrow SELECT * FROM " + view);
+            }
+            duck.commit();
+            duck.setAutoCommit(true);
+        }
+    }
+
+    /** 单 RecordBatch 的 ArrowReader:loadNextBatch 首次 true 交出 root,其后流结束 */
+    private static final class OneShotReader extends ArrowReader {
+        private final VectorSchemaRoot root;
+        private boolean served;
+
+        OneShotReader(BufferAllocator alloc, VectorSchemaRoot root) {
+            super(alloc);
+            this.root = root;
+        }
+
+        @Override
+        public VectorSchemaRoot getVectorSchemaRoot() {
+            return root;
+        }
+
+        @Override
+        public boolean loadNextBatch() {
+            if (served) {
+                return false;
+            }
+            served = true;
+            return true;
+        }
+
+        @Override
+        public long bytesRead() {
+            return 0;
+        }
+
+        @Override
+        protected void closeReadSource() {
+            root.close();
+        }
+
+        @Override
+        protected Schema readSchema() {
+            return root.getSchema();
         }
     }
 }

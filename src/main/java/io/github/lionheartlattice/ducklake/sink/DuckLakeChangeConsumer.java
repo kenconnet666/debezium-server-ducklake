@@ -76,10 +76,11 @@ public class DuckLakeChangeConsumer
         // 有限重试吸收湖端瞬时故障（rustfs 抖动/catalog PG 切主）；写入已整批回滚，重做安全。
         // 全部失败才抛出 → 引擎致命退出 → Runner 回调让进程退出 → 容器重启后从上个 offset 重放
         // （at-least-once，查询层按 __lsn 幂等去重）。
-        long maxSourceTs = -1;
-        for (int attempt = 1; maxSourceTs < 0; attempt++) {
+        long deliveredAt = System.currentTimeMillis();
+        WriteStats stats = null;
+        for (int attempt = 1; stats == null; attempt++) {
             try {
-                maxSourceTs = engine.withLock(conn -> writeBatchInTx(conn, records));
+                stats = engine.withLock(conn -> writeBatchInTx(conn, records));
             } catch (SQLException e) {
                 syncState.getBatchFailures().increment();
                 if (attempt >= 3) {
@@ -96,11 +97,17 @@ public class DuckLakeChangeConsumer
             committer.markProcessed(r);
         }
         committer.markBatchFinished();
-        syncState.batchCommitted(records.size(), maxSourceTs);
+        syncState.batchCommitted(records.size(), stats.maxSourceTs(),
+                stats.maxSourceTs() > 0 ? deliveredAt - stats.maxSourceTs() : -1,
+                stats.stageMs(), stats.lakeTxMs());
     }
 
     /** 一个连续段：同表同结构的事件序列（段边界 = 换表或换结构） */
     private record Segment(String topic, Schema schema, List<Struct> rows) {
+    }
+
+    /** 单次成功写批的水位与分段耗时（deliver 滞后由调用方以交付时刻减 maxSourceTs 得出） */
+    private record WriteStats(long maxSourceTs, long stageMs, long lakeTxMs) {
     }
 
     /**
@@ -117,7 +124,8 @@ public class DuckLakeChangeConsumer
      * 事务用 JDBC API 控制（DuckDB JDBC 对 SQL 字面 BEGIN 与 autoCommit 状态机的交互有坑，
      * 实测手写 BEGIN 会报 "cannot start a transaction within a transaction"）。
      */
-    private long writeBatchInTx(Connection conn, List<ChangeEvent<SourceRecord, SourceRecord>> records) throws SQLException {
+    private WriteStats writeBatchInTx(Connection conn, List<ChangeEvent<SourceRecord, SourceRecord>> records) throws SQLException {
+        long t0 = System.currentTimeMillis();
         // ---- 切段（连续同表同结构），顺带收集水位 ----
         List<Segment> segments = new ArrayList<>();
         long maxSourceTs = 0;
@@ -154,6 +162,7 @@ public class DuckLakeChangeConsumer
                 stageSegment(conn, segments.get(i), i);
             }
         }
+        long t1 = System.currentTimeMillis();
 
         // ---- 阶段二：单湖事务内按段序应用 ----
         conn.setAutoCommit(false);
@@ -167,7 +176,7 @@ public class DuckLakeChangeConsumer
                 }
             }
             conn.commit();
-            return maxSourceTs;
+            return new WriteStats(maxSourceTs, t1 - t0, System.currentTimeMillis() - t1);
         } catch (SQLException | RuntimeException e) {
             try {
                 conn.rollback();
@@ -190,10 +199,13 @@ public class DuckLakeChangeConsumer
         return props.getMaintenance().getDdlAuditTables().contains(TableRef.parse(topic).table());
     }
 
-    /** 阶段一：段数据经 Appender 灌入 main.stg_seg_<idx>（全 VARCHAR 列，autocommit 下执行） */
+    /** 阶段一：段数据经 Appender 灌入本地内存库 stg_seg_<idx>（全 VARCHAR 列，autocommit 下执行）。
+     *  ⚠️ 一律三段名/三参 appender 显式指到内存 catalog——worker 会话 USE lake 下
+     *  两段名 main.x 解析为 lake.main.x，staging 会静默落湖（功能正确但每批多 3 次 catalog 提交） */
     private void stageSegment(Connection conn, Segment seg, int idx) throws SQLException {
         List<Field> fields = seg.schema().fields();
-        StringBuilder ddl = new StringBuilder("CREATE OR REPLACE TABLE main.stg_seg_").append(idx).append(" (");
+        StringBuilder ddl = new StringBuilder("CREATE OR REPLACE TABLE ")
+                .append(DuckLakeEngine.MEM).append(".main.stg_seg_").append(idx).append(" (");
         for (int i = 0; i < fields.size(); i++) {
             ddl.append(i > 0 ? ", " : "").append('"').append(fields.get(i).name()).append("\" VARCHAR");
         }
@@ -202,7 +214,7 @@ public class DuckLakeChangeConsumer
             s.execute(ddl.toString());
         }
         DuckDBConnection dc = conn.unwrap(DuckDBConnection.class);
-        try (DuckDBAppender ap = dc.createAppender("main", "stg_seg_" + idx)) {
+        try (DuckDBAppender ap = dc.createAppender(DuckLakeEngine.MEM, "main", "stg_seg_" + idx)) {
             for (Struct row : seg.rows()) {
                 ap.beginRow();
                 for (Field f : fields) {
@@ -225,7 +237,7 @@ public class DuckLakeChangeConsumer
                 .map(f -> TypeMapper.castExpr(f.name(), TypeMapper.duckType(f.schema()))).toList());
         try (Statement s = conn.createStatement()) {
             s.execute("INSERT INTO " + DuckLakeEngine.LAKE + "." + lakeTable + " (" + cols + ") "
-                    + "SELECT " + proj + " FROM main.stg_seg_" + idx);
+                    + "SELECT " + proj + " FROM " + DuckLakeEngine.MEM + ".main.stg_seg_" + idx);
         }
         log.debug("append {} rows -> {}", seg.rows().size(), lakeTable);
     }
@@ -234,7 +246,7 @@ public class DuckLakeChangeConsumer
     private void dropStagings(Connection conn, int count) {
         try (Statement s = conn.createStatement()) {
             for (int i = 0; i < count; i++) {
-                s.execute("DROP TABLE IF EXISTS main.stg_seg_" + i);
+                s.execute("DROP TABLE IF EXISTS " + DuckLakeEngine.MEM + ".main.stg_seg_" + i);
             }
         } catch (SQLException e) {
             log.debug("staging 清理失败(无碍,下批 CREATE OR REPLACE 覆盖): {}", e.getMessage());
