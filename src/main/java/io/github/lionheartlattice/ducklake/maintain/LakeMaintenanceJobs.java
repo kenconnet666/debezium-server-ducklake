@@ -58,17 +58,17 @@ public class LakeMaintenanceJobs {
         call("CALL ducklake_flush_inlined_data('%s')".formatted(DuckLakeEngine.LAKE), "flush_inlined_data");
         long smallFiles = countActiveFilesUnder(MB);
         if (smallFiles >= TIER0_MIN_FILES) {
-            mergeTier("Tier0(碎片→5MB)", "5MB", null, MB, 20);
+            mergeTier("Tier0(碎片归并)", null, MB, 20);
         }
     }
 
-    /** 每小时：Tier1 小文件 → 中文件 */
+    /** 每小时：Tier1 小文件归并 */
     @Scheduled(fixedDelay = 3_600_000, initialDelay = 900_000)
     public void hourly() {
         if (!props.getMaintenance().isEnabled()) {
             return;
         }
-        mergeTier("Tier1(1-10MB→32MB)", "32MB", MB, 10 * MB, 20);
+        mergeTier("Tier1(1-10MB 归并)", MB, 10 * MB, 20);
     }
 
     /** 每日 04:40：Tier2 压实 + 过期旧快照（保留窗口 = time travel 窗口）+ 物理清理 + 信号表防堆积 */
@@ -77,7 +77,7 @@ public class LakeMaintenanceJobs {
         if (!props.getMaintenance().isEnabled()) {
             return;
         }
-        mergeTier("Tier2(10-64MB→128MB)", "128MB", 10 * MB, 64 * MB, 10);
+        mergeTier("Tier2(10-64MB 归并)", 10 * MB, 64 * MB, 10);
         int days = props.getMaintenance().getSnapshotRetainDays();
         call("CALL ducklake_expire_snapshots('%s', older_than => now() - INTERVAL %d DAYS)"
                 .formatted(DuckLakeEngine.LAKE, days), "expire_snapshots");
@@ -95,16 +95,22 @@ public class LakeMaintenanceJobs {
         monthlyFullMerge();
     }
 
-    /** 全量归并本体（public 供集成测试跨包直接驱动）：target/max=100GB，不限分批 */
+    /** 全量归并本体（public 供集成测试跨包直接驱动）：所有文件(含已很大的)参与，不限分批 */
     public void monthlyFullMerge() {
-        mergeTier("Tier3-monthly(全量归并→100GB)", "100GB", null, 100L * 1024 * MB, null);
+        mergeTier("Tier3-monthly(全量归并)", null, 100L * 1024 * MB, null);
     }
 
     /**
-     * 一级压实：SET target_file_size + 参数化 merge_adjacent_files，同一锁段内顺序执行。
-     * set_option 持久化在 catalog，故每级调用前都显式设置，互不残留。
+     * 一级压实：SET target_file_size(统一 100GB,产物尽量大——流式写与文件大小解耦,内存安全)
+     * + 参数化 merge_adjacent_files，同一锁段内顺序执行。
+     * <p>
+     * ⚠️ 写放大的防线是 <b>max_file_size 的分层过滤</b>而非 target：各级只吃自己区间的输入
+     * (碎片<1MB / 1-10MB / 10-64MB / 全量)，上一级产物越过区间线后不再被同级重复重写——
+     * 每个字节一生只被重写 O(层数) 次。若各级都放开 max，将退化回"每 5 分钟重写全湖"
+     * (旧策略实测放大数千倍,见 README 第十六轮)。
      */
-    private void mergeTier(String label, String targetSize, Long minBytes, Long maxBytes, Integer maxCompacted) {
+    private void mergeTier(String label, Long minBytes, Long maxBytes, Integer maxCompacted) {
+        String targetSize = "100GB";
         StringBuilder merge = new StringBuilder("CALL ducklake_merge_adjacent_files('")
                 .append(DuckLakeEngine.LAKE).append('\'');
         if (minBytes != null) {

@@ -68,9 +68,14 @@ public class DucklakeProperties {
     /** Debezium Embedded Engine 调参 */
     @Data
     public static class Engine {
-        private int maxBatchSize = 2048;
-        private int maxQueueSize = 16000;
-        private long pollIntervalMs = 500;
+        /** 连续消费模型：批串行处理，上一批写湖期间到达的事件在队列自然堆积成下一批——
+         *  批大小自动 = 单批写入耗时内的流量(负反馈自稳,自动抗大流量)。上限放大让高流量时
+         *  "自然批"能长到真实尺寸(更少湖事务/snapshot);毒丸批重放粒度随之变大,可接受 */
+        private int maxBatchSize = 8192;
+        private int maxQueueSize = 32768;
+        /** 队列空后发现新事件的唤醒间隔——连续消费模型的唯一延迟参数,仅空闲时燃烧
+         *  (持续有流时 poll 立即返回,不经过此参数)。空闲首条端到端延迟 ≈ 本值 + 单批写入耗时 */
+        private long pollIntervalMs = 50;
         private long offsetFlushIntervalMs = 10_000;
         /** initial=首启全量快照后转流式；no_data=只流式不快照 */
         private String snapshotMode = "initial";
