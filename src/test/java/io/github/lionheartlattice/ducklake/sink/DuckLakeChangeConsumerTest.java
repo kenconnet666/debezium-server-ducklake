@@ -291,6 +291,19 @@ class DuckLakeChangeConsumerTest {
         assertThat(syncState.getBatchFailures().count()).isEqualTo(3);
     }
 
+    /** null 字段经 Appender-staging 路径(append null String)落湖必须是真 NULL,非空串 */
+    @Test
+    void nullFieldSurvivesStagingPathAsSqlNull() throws Exception {
+        consumer.handleBatch(List.of(rowEvent("zadmin.public.t8", 1, null, "c", 800)), committer());
+
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT name, name IS NULL FROM lake.cdc.public_t8")) {
+            rs.next();
+            assertThat(rs.getString(1)).isNull();
+            assertThat(rs.getBoolean(2)).isTrue();
+        }
+    }
+
     @Test
     void topicParsingHandlesTwoAndThreeSegments() {
         assertThat(DuckLakeChangeConsumer.TableRef.parse("zadmin.public.sys_user"))

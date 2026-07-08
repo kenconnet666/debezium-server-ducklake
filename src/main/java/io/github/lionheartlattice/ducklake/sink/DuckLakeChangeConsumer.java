@@ -11,6 +11,8 @@ import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.duckdb.DuckDBAppender;
+import org.duckdb.DuckDBConnection;
 import org.springframework.stereotype.Component;
 
 import java.sql.Connection;
@@ -97,43 +99,72 @@ public class DuckLakeChangeConsumer
         syncState.batchCommitted(records.size(), maxSourceTs);
     }
 
+    /** 一个连续段：同表同结构的事件序列（段边界 = 换表或换结构） */
+    private record Segment(String topic, Schema schema, List<Struct> rows) {
+    }
+
     /**
-     * 在单个 DuckDB 事务内按序写入整批；返回本批最大源提交时刻(ms)。
+     * 两阶段写入整批；返回本批最大源提交时刻(ms)。
+     * <p>
+     * <b>阶段一（湖事务外）</b>：数据段经 DuckDB Appender 物化到本地 main 库的 staging 表
+     * （全 VARCHAR 列，microbench 实测行成本 0.004ms vs prepared-batch 0.85ms，降两个数量级）。
+     * DuckDB 单事务只能写一个 attached 库，staging(memory) 写入必须在湖事务外——
+     * 也因此湖事务开始于 staging 物化之后，快照隔离下对 staging 数据可见。
+     * <b>阶段二（单湖事务）</b>：按段序 INSERT INTO lake ... SELECT 带 CAST 投影 FROM staging；
+     * DDL 信号段在同一事务内按原序应用——批原子性与 DDL/DML 先后语义与旧路径完全一致。
+     * 失败回滚重试时阶段一 CREATE OR REPLACE 覆盖残留，天然幂等。
+     * <p>
      * 事务用 JDBC API 控制（DuckDB JDBC 对 SQL 字面 BEGIN 与 autoCommit 状态机的交互有坑，
      * 实测手写 BEGIN 会报 "cannot start a transaction within a transaction"）。
      */
     private long writeBatchInTx(Connection conn, List<ChangeEvent<SourceRecord, SourceRecord>> records) throws SQLException {
+        // ---- 切段（连续同表同结构），顺带收集水位 ----
+        List<Segment> segments = new ArrayList<>();
         long maxSourceTs = 0;
+        List<Struct> run = new ArrayList<>();
+        String runTopic = null;
+        Schema runSchema = null;
+        for (ChangeEvent<SourceRecord, SourceRecord> event : records) {
+            SourceRecord record = event.value();
+            if (record.value() == null) {
+                continue; // tombstone 兜底跳过（rewrite 模式下正常不出现）
+            }
+            Struct value = (Struct) record.value();
+            String topic = record.topic();
+            if (runTopic != null && (!runTopic.equals(topic) || runSchema != value.schema())) {
+                segments.add(new Segment(runTopic, runSchema, List.copyOf(run)));
+                run.clear();
+            }
+            runTopic = topic;
+            runSchema = value.schema();
+            run.add(value);
+
+            Long ts = fieldAsLong(value, "__source_ts_ms");
+            if (ts != null && ts > maxSourceTs) {
+                maxSourceTs = ts;
+            }
+        }
+        if (!run.isEmpty()) {
+            segments.add(new Segment(runTopic, runSchema, List.copyOf(run)));
+        }
+
+        // ---- 阶段一：湖事务外，数据段物化到 main.stg_seg_<i> ----
+        for (int i = 0; i < segments.size(); i++) {
+            if (!isDdlSignal(segments.get(i).topic())) {
+                stageSegment(conn, segments.get(i), i);
+            }
+        }
+
+        // ---- 阶段二：单湖事务内按段序应用 ----
         conn.setAutoCommit(false);
         try {
-            List<Struct> run = new ArrayList<>();
-            String runTopic = null;
-            Schema runSchema = null;
-
-            for (ChangeEvent<SourceRecord, SourceRecord> event : records) {
-                SourceRecord record = event.value();
-                if (record.value() == null) {
-                    continue; // tombstone 兜底跳过（rewrite 模式下正常不出现）
+            for (int i = 0; i < segments.size(); i++) {
+                Segment seg = segments.get(i);
+                if (isDdlSignal(seg.topic())) {
+                    ddlApplier.apply(conn, seg.rows(), this::invalidateColumns);
+                } else {
+                    insertFromStaging(conn, seg, i);
                 }
-                Struct value = (Struct) record.value();
-                String topic = record.topic();
-
-                // 段边界：换表或换结构（同表 DDL 前后的新旧结构不混批）
-                if (runTopic != null && (!runTopic.equals(topic) || runSchema != value.schema())) {
-                    flushRun(conn, runTopic, runSchema, run);
-                    run.clear();
-                }
-                runTopic = topic;
-                runSchema = value.schema();
-                run.add(value);
-
-                Long ts = fieldAsLong(value, "__source_ts_ms");
-                if (ts != null && ts > maxSourceTs) {
-                    maxSourceTs = ts;
-                }
-            }
-            if (!run.isEmpty()) {
-                flushRun(conn, runTopic, runSchema, run);
             }
             conn.commit();
             return maxSourceTs;
@@ -151,34 +182,63 @@ public class DuckLakeChangeConsumer
                 conn.setAutoCommit(true);
             } catch (SQLException ignored) {
             }
+            dropStagings(conn, segments.size());
         }
     }
 
-    /** 写出一个连续段：DDL 审计流走 DdlApplier，业务流 append 进 cdc.<schema>_<table> */
-    private void flushRun(Connection conn, String topic, Schema schema, List<Struct> run) throws SQLException {
-        TableRef ref = TableRef.parse(topic);
-        if (props.getMaintenance().getDdlAuditTables().contains(ref.table())) {
-            ddlApplier.apply(conn, run, this::invalidateColumns);
-            return;
-        }
-        String lakeTable = props.getMaintenance().getCdcSchema() + "." + ref.pgSchema() + "_" + ref.table();
-        ensureTable(conn, lakeTable, schema);
+    private boolean isDdlSignal(String topic) {
+        return props.getMaintenance().getDdlAuditTables().contains(TableRef.parse(topic).table());
+    }
 
-        List<Field> fields = schema.fields();
-        String cols = String.join(", ", fields.stream().map(f -> '"' + f.name() + '"').toList());
-        String marks = String.join(", ", fields.stream().map(f -> "?").toList());
-        String sql = "INSERT INTO " + DuckLakeEngine.LAKE + "." + lakeTable + " (" + cols + ") VALUES (" + marks + ")";
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            for (Struct row : run) {
-                for (int i = 0; i < fields.size(); i++) {
-                    Field f = fields.get(i);
-                    TypeMapper.bind(ps, i + 1, f.schema(), row.get(f));
-                }
-                ps.addBatch();
-            }
-            ps.executeBatch();
+    /** 阶段一：段数据经 Appender 灌入 main.stg_seg_<idx>（全 VARCHAR 列，autocommit 下执行） */
+    private void stageSegment(Connection conn, Segment seg, int idx) throws SQLException {
+        List<Field> fields = seg.schema().fields();
+        StringBuilder ddl = new StringBuilder("CREATE OR REPLACE TABLE main.stg_seg_").append(idx).append(" (");
+        for (int i = 0; i < fields.size(); i++) {
+            ddl.append(i > 0 ? ", " : "").append('"').append(fields.get(i).name()).append("\" VARCHAR");
         }
-        log.debug("append {} rows -> {}", run.size(), lakeTable);
+        ddl.append(')');
+        try (Statement s = conn.createStatement()) {
+            s.execute(ddl.toString());
+        }
+        DuckDBConnection dc = conn.unwrap(DuckDBConnection.class);
+        try (DuckDBAppender ap = dc.createAppender("main", "stg_seg_" + idx)) {
+            for (Struct row : seg.rows()) {
+                ap.beginRow();
+                for (Field f : fields) {
+                    ap.append(TypeMapper.stagingText(f.schema(), row.get(f)));
+                }
+                ap.endRow();
+            }
+        }
+    }
+
+    /** 阶段二：staging → 湖表（湖事务内；CAST 投影由 TypeMapper 编码规则配对生成） */
+    private void insertFromStaging(Connection conn, Segment seg, int idx) throws SQLException {
+        TableRef ref = TableRef.parse(seg.topic());
+        String lakeTable = props.getMaintenance().getCdcSchema() + "." + ref.pgSchema() + "_" + ref.table();
+        ensureTable(conn, lakeTable, seg.schema());
+
+        List<Field> fields = seg.schema().fields();
+        String cols = String.join(", ", fields.stream().map(f -> '"' + f.name() + '"').toList());
+        String proj = String.join(", ", fields.stream()
+                .map(f -> TypeMapper.castExpr(f.name(), TypeMapper.duckType(f.schema()))).toList());
+        try (Statement s = conn.createStatement()) {
+            s.execute("INSERT INTO " + DuckLakeEngine.LAKE + "." + lakeTable + " (" + cols + ") "
+                    + "SELECT " + proj + " FROM main.stg_seg_" + idx);
+        }
+        log.debug("append {} rows -> {}", seg.rows().size(), lakeTable);
+    }
+
+    /** staging 清理（事务外 best-effort；内存 instance 的表，进程重启自然消失） */
+    private void dropStagings(Connection conn, int count) {
+        try (Statement s = conn.createStatement()) {
+            for (int i = 0; i < count; i++) {
+                s.execute("DROP TABLE IF EXISTS main.stg_seg_" + i);
+            }
+        } catch (SQLException e) {
+            log.debug("staging 清理失败(无碍,下批 CREATE OR REPLACE 覆盖): {}", e.getMessage());
+        }
     }
 
     /** 首见建表；schema 出现新字段则 ALTER ADD COLUMN，已有字段类型漂移则按白名单安全放宽
