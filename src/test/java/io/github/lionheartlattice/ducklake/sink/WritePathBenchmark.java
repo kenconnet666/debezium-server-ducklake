@@ -44,9 +44,11 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -771,6 +773,105 @@ class WritePathBenchmark {
             throw new RuntimeException(e);
         }
         return null;
+    }
+
+    // ---------- ⑪ 一 instance 多连接预编码流水线(验证用户方案:编码 COPY 与 worker add_files 分离并发) ----------
+    /**
+     * 验证:一个 DuckDB instance + 多连接做预编码流水线——编码连接 COPY staging→parquet
+     * (不写 catalog/不占单写者锁)与 worker 连接 add_files(写 catalog/单写者)并发,worker 卸载
+     * 编码后只做注册。测流水线稳态吞吐、确认多连接并发无冲突。架构计划 §6.3 池化落地验证。
+     * 用 DuckDB COPY 编码(非 parquet-mr),无 hadoop 依赖。
+     */
+    @Test
+    @Order(11)
+    void oneInstancePipelineAddFiles() throws Exception {
+        String url = "jdbc:duckdb::memory:pipebench";
+        Connection anchor = DriverManager.getConnection(url);
+        Connection enc = DriverManager.getConnection(url);
+        Connection wkr = DriverManager.getConnection(url);
+        try {
+            anchor.setAutoCommit(true);
+            enc.setAutoCommit(true);
+            wkr.setAutoCommit(true);
+            try (Statement s = anchor.createStatement()) {
+                for (String ext : new String[]{"ducklake", "postgres"}) {
+                    s.execute("INSTALL " + ext);
+                    s.execute("LOAD " + ext);
+                }
+                s.execute(("ATTACH IF NOT EXISTS 'ducklake:postgres:dbname=ducklake_catalog host=%s port=%d user=postgres password=bench' AS lake (DATA_PATH '%s/')")
+                        .formatted(PG.getHost(), PG.getFirstMappedPort(), lakeDir.toString().replace('\\', '/')));
+                s.execute("CREATE SCHEMA IF NOT EXISTS lake.pipe");
+                s.execute("CREATE TABLE lake.pipe.bench_pipe (id BIGINT, name VARCHAR, payload VARCHAR, tag VARCHAR, "
+                        + "val DOUBLE, ok BOOLEAN, __op VARCHAR, __lsn BIGINT, __source_ts_ms BIGINT)");
+            }
+            int n = 12;
+            BlockingQueue<String> q = new LinkedBlockingQueue<>();
+            ExecutorService pool = Executors.newFixedThreadPool(2);
+            long t0 = System.nanoTime();
+            Future<?> encoder = pool.submit(() -> {
+                try {
+                    for (int b = 1; b <= n; b++) {
+                        try (Statement s = enc.createStatement()) {
+                            s.execute("CREATE OR REPLACE TABLE main.stg_pipe_" + b + " (id BIGINT, name VARCHAR, payload VARCHAR, "
+                                    + "tag VARCHAR, val DOUBLE, ok BOOLEAN, __op VARCHAR, __lsn BIGINT, __source_ts_ms BIGINT)");
+                        }
+                        DuckDBConnection dc = enc.unwrap(DuckDBConnection.class);
+                        try (DuckDBAppender ap = dc.createAppender("main", "stg_pipe_" + b)) {
+                            for (int i = 0; i < BATCH_ROWS; i++) {
+                                long id = (long) b * BATCH_ROWS + i;
+                                ap.beginRow();
+                                ap.append(id);
+                                ap.append("name-" + id);
+                                ap.append(payload(id));
+                                ap.append("tag" + (id % 7));
+                                ap.append(id * 0.01);
+                                ap.append((id & 1) == 0);
+                                ap.append("c");
+                                ap.append(id);
+                                ap.append(1_783_000_000_000L + id);
+                                ap.endRow();
+                            }
+                        }
+                        String pq = lakeDir.toString().replace('\\', '/') + "/pipe_" + b + ".parquet";
+                        try (Statement s = enc.createStatement()) {
+                            s.execute("COPY (SELECT * FROM main.stg_pipe_" + b + ") TO '" + pq + "' (FORMAT parquet)");
+                            s.execute("DROP TABLE main.stg_pipe_" + b);
+                        }
+                        q.put(pq);
+                    }
+                    q.put("__DONE__");
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            Future<?> writer = pool.submit(() -> {
+                try {
+                    String pq;
+                    while (!"__DONE__".equals(pq = q.take())) {
+                        try (Statement s = wkr.createStatement()) {
+                            s.execute("CALL ducklake_add_data_files('lake','bench_pipe','" + pq + "', schema=>'pipe')");
+                        }
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            encoder.get();
+            writer.get();
+            double totalMs = (System.nanoTime() - t0) / 1e6;
+            pool.shutdown();
+            System.out.printf("[BENCH] 一instance多连接流水线: %d 批 %.0fms = %.1f ms/批  %,.0f 行/秒  (现状串行 48.6ms/批 168k)%n",
+                    n, totalMs, totalMs / n, n * BATCH_ROWS / (totalMs / 1000));
+            try (Statement s = wkr.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.pipe.bench_pipe")) {
+                rs.next();
+                assertThat(rs.getLong(1)).isEqualTo((long) n * BATCH_ROWS);
+            }
+        } finally {
+            wkr.close();
+            enc.close();
+            anchor.close();
+        }
     }
 
     /** 单 RecordBatch 的 ArrowReader:loadNextBatch 首次 true 交出 root,其后流结束 */
