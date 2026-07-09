@@ -77,6 +77,26 @@ public class DuckLakeChangeConsumer
         // 全部失败才抛出 → 引擎致命退出 → Runner 回调让进程退出 → 容器重启后从上个 offset 重放
         // （at-least-once，查询层按 __lsn 幂等去重）。
         long deliveredAt = System.currentTimeMillis();
+        // 诊断:空转模式只确认不写湖,测纯解码+交付吞吐——定位吞吐天花板是解码瓶颈还是写侧瓶颈
+        if (props.getEngine().isDryRun()) {
+            long maxTs = 0;
+            for (ChangeEvent<SourceRecord, SourceRecord> event : records) {
+                SourceRecord rec = event.value();
+                if (rec != null && rec.value() instanceof Struct v) {
+                    Long ts = fieldAsLong(v, "__source_ts_ms");
+                    if (ts != null && ts > maxTs) {
+                        maxTs = ts;
+                    }
+                }
+            }
+            for (ChangeEvent<SourceRecord, SourceRecord> r : records) {
+                committer.markProcessed(r);
+            }
+            committer.markBatchFinished();
+            syncState.batchCommitted(records.size(), maxTs,
+                    maxTs > 0 ? deliveredAt - maxTs : -1, 0, 0);
+            return;
+        }
         WriteStats stats = null;
         for (int attempt = 1; stats == null; attempt++) {
             try {

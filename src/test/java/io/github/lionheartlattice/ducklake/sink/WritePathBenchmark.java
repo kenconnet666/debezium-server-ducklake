@@ -14,6 +14,14 @@ import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.avro.SchemaBuilder;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.parquet.avro.AvroParquetWriter;
+import org.apache.parquet.conf.PlainParquetConfiguration;
+import org.apache.parquet.hadoop.ParquetWriter;
+import org.apache.parquet.hadoop.metadata.CompressionCodecName;
+import org.apache.parquet.io.LocalOutputFile;
 import org.duckdb.DuckDBAppender;
 import org.duckdb.DuckDBConnection;
 import org.junit.jupiter.api.AfterAll;
@@ -34,6 +42,11 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -493,6 +506,271 @@ class WritePathBenchmark {
             duck.commit();
             duck.setAutoCommit(true);
         }
+    }
+
+    // ---------- ⑧ parquet 直写(COPY 模拟 JVM 产物) + ducklake_add_data_files 注册(旁路路线 POC) ----------
+    /**
+     * POC:对比"INSERT SELECT 进湖"与"COPY TO parquet + ducklake_add_data_files 注册"的湖侧开销。
+     * 用 DuckDB COPY 造 parquet(编码开销与 JVM parquet-mr 直写同量级),核心测 add_data_files 的
+     * 注册纯开销(读 footer stats + 写 catalog)是否比 INSERT SELECT 的 catalog 提交更省。
+     * 若注册反而更慢,"parquet 直写+注册"路线当场否决,不必引 parquet-mr 全家桶。细分:copyMs/addMs。
+     */
+    @Test
+    @Order(8)
+    void parquetAddFilesVsInsertSelect() throws Exception {
+        try (Statement s = duck.createStatement()) {
+            s.execute("CREATE TABLE IF NOT EXISTS stg_addf (id VARCHAR, name VARCHAR, payload VARCHAR, tag VARCHAR, "
+                    + "val VARCHAR, ok VARCHAR, __op VARCHAR, __lsn VARCHAR, __source_ts_ms VARCHAR)");
+        }
+        String proj = "CAST(id AS BIGINT) AS id, name, payload, tag, CAST(val AS DOUBLE) AS val, "
+                + "CAST(ok AS BOOLEAN) AS ok, __op, CAST(__lsn AS BIGINT) AS __lsn, "
+                + "CAST(__source_ts_ms AS BIGINT) AS __source_ts_ms";
+
+        // 对照 A: Appender staging + INSERT SELECT(现状路径)
+        createTable("bench_ins");
+        fillStgAddf(0);
+        insertBatch(proj);                                // warmup
+        long t0 = System.nanoTime();
+        for (int b = 1; b <= BATCHES; b++) {
+            fillStgAddf(b);
+            insertBatch(proj);
+        }
+        report("INSERT SELECT(现状)", System.nanoTime() - t0, BATCHES * BATCH_ROWS);
+
+        // 实验 B: COPY 造 parquet + add_data_files 注册
+        createTable("bench_addf");
+        long copyNs = 0, addNs = 0;
+        fillStgAddf(0);
+        copyAddBatch(proj, 0);                            // warmup
+        long tB = System.nanoTime();
+        for (int b = 1; b <= BATCHES; b++) {
+            fillStgAddf(b);
+            long[] split = copyAddBatch(proj, b);
+            copyNs += split[0];
+            addNs += split[1];
+        }
+        report("COPY+add_data_files", System.nanoTime() - tB, BATCHES * BATCH_ROWS);
+        System.out.printf("[BENCH]   细分: COPY造parquet=%.1f ms/批  add_data_files注册=%.1f ms/批%n",
+                copyNs / 1e6 / BATCHES, addNs / 1e6 / BATCHES);
+
+        assertThat(rowCount("bench_ins")).isEqualTo((BATCHES + 1) * BATCH_ROWS);
+        assertThat(rowCount("bench_addf")).isEqualTo((BATCHES + 1) * BATCH_ROWS);
+    }
+
+    private void fillStgAddf(int batchNo) throws SQLException {
+        DuckDBConnection dc = duck.unwrap(DuckDBConnection.class);
+        try (DuckDBAppender ap = dc.createAppender("main", "stg_addf")) {
+            for (int i = 0; i < BATCH_ROWS; i++) {
+                long id = (long) batchNo * BATCH_ROWS + i;
+                ap.beginRow();
+                ap.append(String.valueOf(id));
+                ap.append("name-" + id);
+                ap.append(payload(id));
+                ap.append("tag" + (id % 7));
+                ap.append(String.valueOf(id * 0.01));
+                ap.append(String.valueOf((id & 1) == 0));
+                ap.append("c");
+                ap.append(String.valueOf(id));
+                ap.append(String.valueOf(1_783_000_000_000L + id));
+                ap.endRow();
+            }
+        }
+    }
+
+    private void insertBatch(String proj) throws SQLException {
+        duck.setAutoCommit(false);
+        try (Statement s = duck.createStatement()) {
+            s.execute("INSERT INTO lake.cdc.bench_ins SELECT " + proj + " FROM stg_addf");
+        }
+        duck.commit();
+        duck.setAutoCommit(true);
+        try (Statement s = duck.createStatement()) {
+            s.execute("DELETE FROM stg_addf");
+        }
+    }
+
+    /** @return {copyNs, addNs}——COPY 造 parquet 与 add_data_files 注册各自耗时 */
+    private long[] copyAddBatch(String proj, int batchNo) throws SQLException {
+        String pq = lakeDir.toString().replace('\\', '/') + "/addf_" + batchNo + ".parquet";
+        long c0 = System.nanoTime();
+        try (Statement s = duck.createStatement()) {
+            s.execute("COPY (SELECT " + proj + " FROM stg_addf) TO '" + pq + "' (FORMAT parquet)");
+        }
+        long c1 = System.nanoTime();
+        duck.setAutoCommit(false);
+        try (Statement s = duck.createStatement()) {
+            s.execute("CALL ducklake_add_data_files('lake', 'bench_addf', '" + pq + "', schema => 'cdc')");
+        }
+        duck.commit();
+        duck.setAutoCommit(true);
+        long c2 = System.nanoTime();
+        try (Statement s = duck.createStatement()) {
+            s.execute("DELETE FROM stg_addf");
+        }
+        return new long[]{c1 - c0, c2 - c1};
+    }
+
+    // ---------- ⑨ JVM parquet-mr 直写(真 JVM 编码) + add_data_files 注册(POC-B 完整旁路路线) ----------
+    /**
+     * POC-B:parquet-mr(AvroParquetWriter)在 JVM 侧真实编码 parquet(无 hadoop:LocalOutputFile+
+     * PlainParquetConfiguration+SNAPPY)+ ducklake_add_data_files 注册,对比现状 Appender+INSERT SELECT。
+     * 意义:parquet 编码在 JVM(可多线程/不占 DuckDB 单写者锁),DuckDB 只做轻量注册——测这条
+     * "数据面移出 DuckDB"路线的真实行成本与注册开销。细分:JVM写parquet / add_files注册。
+     */
+    @Test
+    @Order(9)
+    void jvmParquetWriteAddFiles() throws Exception {
+        createTable("bench_jvmpq");
+        org.apache.avro.Schema avro = SchemaBuilder.record("cdcrow").fields()
+                .name("id").type().longType().noDefault()
+                .name("name").type().stringType().noDefault()
+                .name("payload").type().stringType().noDefault()
+                .name("tag").type().stringType().noDefault()
+                .name("val").type().doubleType().noDefault()
+                .name("ok").type().booleanType().noDefault()
+                .name("__op").type().stringType().noDefault()
+                .name("__lsn").type().longType().noDefault()
+                .name("__source_ts_ms").type().longType().noDefault()
+                .endRecord();
+        long writeNs = 0, addNs = 0;
+        jvmParquetBatch(avro, 0);                         // warmup
+        long t0 = System.nanoTime();
+        for (int b = 1; b <= BATCHES; b++) {
+            long[] split = jvmParquetBatch(avro, b);
+            writeNs += split[0];
+            addNs += split[1];
+        }
+        report("JVM parquet直写+add_files", System.nanoTime() - t0, BATCHES * BATCH_ROWS);
+        System.out.printf("[BENCH]   细分: JVM写parquet=%.1f ms/批  add_data_files注册=%.1f ms/批%n",
+                writeNs / 1e6 / BATCHES, addNs / 1e6 / BATCHES);
+        assertThat(rowCount("bench_jvmpq")).isEqualTo((BATCHES + 1) * BATCH_ROWS);
+    }
+
+    /** @return {jvmWriteNs, addFilesNs} */
+    private long[] jvmParquetBatch(org.apache.avro.Schema avro, int batchNo) throws Exception {
+        String pq = lakeDir.toString().replace('\\', '/') + "/jvmpq_" + batchNo + ".parquet";
+        long w0 = System.nanoTime();
+        try (ParquetWriter<GenericRecord> w = AvroParquetWriter.<GenericRecord>builder(
+                        new LocalOutputFile(java.nio.file.Path.of(pq)))
+                .withSchema(avro)
+                .withConf(new PlainParquetConfiguration())
+                .withCompressionCodec(CompressionCodecName.SNAPPY)
+                .withRowGroupSize(128L * 1024 * 1024)
+                .build()) {
+            for (int i = 0; i < BATCH_ROWS; i++) {
+                long id = (long) batchNo * BATCH_ROWS + i;
+                GenericData.Record r = new GenericData.Record(avro);
+                r.put("id", id);
+                r.put("name", "name-" + id);
+                r.put("payload", payload(id));
+                r.put("tag", "tag" + (id % 7));
+                r.put("val", id * 0.01);
+                r.put("ok", (id & 1) == 0);
+                r.put("__op", "c");
+                r.put("__lsn", id);
+                r.put("__source_ts_ms", 1_783_000_000_000L + id);
+                w.write(r);
+            }
+        }
+        long w1 = System.nanoTime();
+        duck.setAutoCommit(false);
+        try (Statement s = duck.createStatement()) {
+            s.execute("CALL ducklake_add_data_files('lake', 'bench_jvmpq', '" + pq + "', schema => 'cdc')");
+        }
+        duck.commit();
+        duck.setAutoCommit(true);
+        long w2 = System.nanoTime();
+        return new long[]{w1 - w0, w2 - w1};
+    }
+
+    // ---------- ⑩ 多线程 parquet 编码(回答:JVM 单线程编码 48.9ms 慢,多线程能否弥补) ----------
+    /**
+     * N 线程各编码一个**完整** 8192 行 parquet(不切分单批,避免小文件),测并行编码加速比;
+     * add_files 批量注册。回答"多线程编码能否让 JVM 直写每批成本降到现状 48.6ms 以下"。
+     * 编码纯 CPU+本地 IO、各线程独立 writer 不共享、不碰 duck 连接,天然并行安全。
+     */
+    @Test
+    @Order(10)
+    void jvmParquetMultiThreadWrite() throws Exception {
+        createTable("bench_mt");
+        org.apache.avro.Schema avro = SchemaBuilder.record("cdcrow").fields()
+                .name("id").type().longType().noDefault()
+                .name("name").type().stringType().noDefault()
+                .name("payload").type().stringType().noDefault()
+                .name("tag").type().stringType().noDefault()
+                .name("val").type().doubleType().noDefault()
+                .name("ok").type().booleanType().noDefault()
+                .name("__op").type().stringType().noDefault()
+                .name("__lsn").type().longType().noDefault()
+                .name("__source_ts_ms").type().longType().noDefault()
+                .endRecord();
+        int threads = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            writeMtParquet(avro, 900);                    // warmup
+            long s0 = System.nanoTime();
+            for (int b = 0; b < threads; b++) {
+                writeMtParquet(avro, b);                  // 单线程:顺序编码 threads 个文件
+            }
+            double serialMs = (System.nanoTime() - s0) / 1e6;
+            long p0 = System.nanoTime();
+            List<Future<?>> fs = new ArrayList<>();
+            for (int b = 0; b < threads; b++) {
+                int bb = b + 100;
+                fs.add(pool.submit(() -> writeMtParquet(avro, bb)));  // 多线程:并行编码
+            }
+            for (Future<?> f : fs) {
+                f.get();
+            }
+            double parallelMs = (System.nanoTime() - p0) / 1e6;
+            long a0 = System.nanoTime();
+            duck.setAutoCommit(false);
+            try (Statement st = duck.createStatement()) {
+                for (int b = 0; b < threads; b++) {
+                    st.execute("CALL ducklake_add_data_files('lake','bench_mt','" + mtPath(b + 100) + "', schema=>'cdc')");
+                }
+            }
+            duck.commit();
+            duck.setAutoCommit(true);
+            double addMs = (System.nanoTime() - a0) / 1e6;
+            System.out.printf("[BENCH] parquet编码 %d 批: 单线程 %.1fms → 多线程(%d) %.1fms 加速 %.1fx%n",
+                    threads, serialMs, threads, parallelMs, serialMs / parallelMs);
+            System.out.printf("[BENCH]   多线程直写每批 ≈ 编码摊薄 %.1f + 注册 %.1f = %.1f ms/批  (现状 48.6, 单线程直写 71.4)%n",
+                    parallelMs / threads, addMs / threads, parallelMs / threads + addMs / threads);
+            assertThat(rowCount("bench_mt")).isEqualTo((long) threads * BATCH_ROWS);
+        } finally {
+            pool.shutdown();
+        }
+    }
+
+    private String mtPath(int batchNo) {
+        return lakeDir.toString().replace('\\', '/') + "/mt_" + batchNo + ".parquet";
+    }
+
+    private Void writeMtParquet(org.apache.avro.Schema avro, int batchNo) {
+        try (ParquetWriter<GenericRecord> w = AvroParquetWriter.<GenericRecord>builder(
+                        new LocalOutputFile(java.nio.file.Path.of(mtPath(batchNo))))
+                .withSchema(avro).withConf(new PlainParquetConfiguration())
+                .withCompressionCodec(CompressionCodecName.SNAPPY)
+                .withRowGroupSize(128L * 1024 * 1024).build()) {
+            for (int i = 0; i < BATCH_ROWS; i++) {
+                long id = (long) batchNo * BATCH_ROWS + i;
+                GenericData.Record r = new GenericData.Record(avro);
+                r.put("id", id);
+                r.put("name", "name-" + id);
+                r.put("payload", payload(id));
+                r.put("tag", "tag" + (id % 7));
+                r.put("val", id * 0.01);
+                r.put("ok", (id & 1) == 0);
+                r.put("__op", "c");
+                r.put("__lsn", id);
+                r.put("__source_ts_ms", 1_783_000_000_000L + id);
+                w.write(r);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        return null;
     }
 
     /** 单 RecordBatch 的 ArrowReader:loadNextBatch 首次 true 交出 root,其后流结束 */

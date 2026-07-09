@@ -149,6 +149,34 @@
             <scope>test</scope>
         </dependency>
 
+        <!-- parquet-java(仅 WritePathBenchmark 的 JVM 直写 POC;生产不依赖):
+             hadoop-* 在 parquet 1.14+ 是 provided,不传递;bench 用 LocalOutputFile+
+             PlainParquetConfiguration+SNAPPY(snappy-java 纯 Java),全程无 hadoop 运行时 -->
+        <dependency>
+            <groupId>org.apache.parquet</groupId>
+            <artifactId>parquet-avro</artifactId>
+            <version>${parquet.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- 仅为编译期:AvroParquetWriter.builder 的 hadoop Path 重载解析需要 org.apache.hadoop.fs.Path
+                 类字节码。hadoop-client-api 是单一 shaded jar(含 fs.Path、无传递依赖地狱),运行时
+                 bench 走 LocalOutputFile+PlainParquetConfiguration 不实际调用 hadoop -->
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-client-api</artifactId>
+            <version>3.4.1</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- AvroParquetWriter.build() 仍强制建 hadoop Configuration(需 shaded woodstox XML 解析);
+                 client-runtime 是 shaded 单 jar 补齐运行时。证明 parquet-avro 写路径无法真正脱 hadoop
+                 (生产化须换 parquet-floor 或 Carpet);此处仅为 bench 跑通拿吞吐数字 -->
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-client-runtime</artifactId>
+            <version>3.4.1</version>
+            <scope>test</scope>
+        </dependency>
+
     </dependencies>
 
     <build>

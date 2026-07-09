@@ -93,6 +93,10 @@ public class DucklakeProperties {
         private String snapshotMode = "initial";
         /** 批写失败重试的退避基数(实际等待 = 基数 << 重试次数;测试可调小) */
         private long retrySleepBaseMs = 2000;
+        /** 诊断开关:handleBatch 空转(只确认 offset、不写湖)——测 Debezium 纯解码+交付吞吐天花板,
+         *  区分"吞吐上限是解码瓶颈(no-op 也就这么快)还是写侧瓶颈(no-op 快很多)"。
+         *  ⚠️ 生产必须 false:开启则数据不落湖、offset 照推进=永久丢数据,仅压测诊断用 */
+        private boolean dryRun = false;
     }
 
     /** 湖维护（全部为进程内 SQL CALL；孤儿清理永远 dry_run，人工确认后才手动清） */
