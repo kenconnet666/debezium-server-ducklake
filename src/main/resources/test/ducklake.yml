@@ -31,6 +31,9 @@ zadmin:
       threads: 2
     engine:
       snapshot-mode: initial
+      # 零流量防 WAL 扣留的完整闭环(见 DucklakeProperties 注释):周期 UPSERT 心跳表造真实事件
+      # 触发 LSN flush。前置(已建):public.dbz_heartbeat 单行表 + GRANT INSERT,UPDATE TO dbuser_cdc
+      heartbeat-action-query: "INSERT INTO public.dbz_heartbeat (id, ts) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET ts = now()"
     maintenance:
       enabled: true
       snapshot-retain-days: 30

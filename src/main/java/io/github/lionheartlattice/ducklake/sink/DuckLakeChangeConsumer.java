@@ -73,9 +73,37 @@ public class DuckLakeChangeConsumer
             committer.markBatchFinished();
             return;
         }
+        // 心跳记录仅确认 offset+推水位,不进湖:空闲期靠它周期确认 slot——否则 publication 内表
+        // 空闲时 confirmed_flush_lsn 冻结,实例级 WAL(含维护任务写 catalog 自产的)被无限扣留
+        long heartbeatTs = -1;
+        List<ChangeEvent<SourceRecord, SourceRecord>> data = new ArrayList<>(records.size());
+        for (ChangeEvent<SourceRecord, SourceRecord> r : records) {
+            String topic = r.value() != null ? r.value().topic() : null;
+            if (topic != null && topic.startsWith("__debezium-heartbeat")) {
+                Object v = r.value().value();
+                if (v instanceof Struct hb) {
+                    Long ts = fieldAsLong(hb, "ts_ms");
+                    if (ts != null && ts > heartbeatTs) {
+                        heartbeatTs = ts;
+                    }
+                }
+            } else {
+                data.add(r);
+            }
+        }
+        if (data.isEmpty()) {
+            for (ChangeEvent<SourceRecord, SourceRecord> r : records) {
+                committer.markProcessed(r);
+            }
+            committer.markBatchFinished();
+            if (heartbeatTs > 0) {
+                syncState.heartbeat(heartbeatTs);
+            }
+            return;
+        }
         // 有限重试吸收湖端瞬时故障（rustfs 抖动/catalog PG 切主）；写入已整批回滚，重做安全。
         // 全部失败才抛出 → 引擎致命退出 → Runner 回调让进程退出 → 容器重启后从上个 offset 重放
-        // （at-least-once，查询层按 __lsn 幂等去重）。
+        // （at-least-once，查询层按 __lsn 幂等去重）。data=剥离心跳后的数据事件
         long deliveredAt = System.currentTimeMillis();
         // 诊断:空转模式只确认不写湖,测纯解码+交付吞吐——定位吞吐天花板是解码瓶颈还是写侧瓶颈
         if (props.getEngine().isDryRun()) {
@@ -100,7 +128,7 @@ public class DuckLakeChangeConsumer
         WriteStats stats = null;
         for (int attempt = 1; stats == null; attempt++) {
             try {
-                stats = engine.withLock(conn -> writeBatchInTx(conn, records));
+                stats = engine.withLock(conn -> writeBatchInTx(conn, data));
             } catch (SQLException e) {
                 syncState.getBatchFailures().increment();
                 if (attempt >= 3) {
@@ -112,13 +140,14 @@ public class DuckLakeChangeConsumer
                 Thread.sleep(sleepMs);
             }
         }
-        // 湖事务已提交 → 才允许引擎推进 offset
+        // 湖事务已提交 → 才允许引擎推进 offset（含本批剥离出的心跳记录,一并 mark）
         for (ChangeEvent<SourceRecord, SourceRecord> r : records) {
             committer.markProcessed(r);
         }
         committer.markBatchFinished();
-        syncState.batchCommitted(records.size(), stats.maxSourceTs(),
-                stats.maxSourceTs() > 0 ? deliveredAt - stats.maxSourceTs() : -1,
+        long ackTs = Math.max(stats.maxSourceTs(), heartbeatTs); // 心跳与数据取较新者推进水位
+        syncState.batchCommitted(data.size(), ackTs,
+                ackTs > 0 ? deliveredAt - ackTs : -1,
                 stats.stageMs(), stats.lakeTxMs());
     }
 

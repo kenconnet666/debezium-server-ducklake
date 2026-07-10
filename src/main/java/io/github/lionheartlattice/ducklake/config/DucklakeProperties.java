@@ -89,6 +89,21 @@ public class DucklakeProperties {
          *  空闲期仅一个 condition await,调低近乎零成本 */
         private long pollIntervalMs = 10;
         private long offsetFlushIntervalMs = 10_000;
+        /** 心跳间隔(ms)：空闲期让连接器周期生成心跳事件（topic 前缀 __debezium-heartbeat），
+         *  借此向 PG 确认 slot 位置。没有它，publication 内表空闲时 confirmed_flush_lsn 冻结，
+         *  而 WAL 是实例级——其他库(含本模块维护任务写 catalog 自产的)的 WAL 被 slot 无限扣留
+         *  （2026-07-10 实测：业务表空闲数小时即扣 2.6MB，无上限累积）。
+         *  消费者按前缀识别心跳，只确认 offset+推水位、不写湖。0=禁用。
+         *  ⚠️ 单独配本值只覆盖"低流量"：pgoutput 服务端过滤下，publication 零事件时 walsender
+         *  不发任何消息、心跳无从挂靠（LSN flush mode 'connector' 只在事件处理时确认，实测
+         *  confirmed_flush_lsn 仍冻结）——零流量场景必须配 heartbeatActionQuery */
+        private long heartbeatIntervalMs = 60_000;
+        /** 心跳动作 SQL（Debezium 官方防"零流量 WAL 无限扣留"的完整方案）：连接器每个心跳周期
+         *  以 source.user 身份对源库执行本 SQL——UPSERT 心跳表产生真实 WAL 事件流回连接器，
+         *  触发 LSN flush。空=禁用。前置：心跳表存在且在 publication 内、source.user 有写权限
+         *  （见 test yml 配置与建表 SQL）；心跳表变更作为普通表落湖（单行 upsert，每天 1440 行
+         *  append，量可忽略且让 lastBatchAt 监控口径"永远有活"不误报） */
+        private String heartbeatActionQuery = "";
         /** initial=首启全量快照后转流式；no_data=只流式不快照 */
         private String snapshotMode = "initial";
         /** 批写失败重试的退避基数(实际等待 = 基数 << 重试次数;测试可调小) */

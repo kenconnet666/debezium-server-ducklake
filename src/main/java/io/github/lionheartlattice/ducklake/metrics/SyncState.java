@@ -63,6 +63,12 @@ public class SyncState {
         ddlAudited = Counter.builder("ducklake_ddl_audited_total").description("已入湖审计的 DDL 事件数").register(registry);
     }
 
+    /** 心跳推进"已反映时刻"：空闲期无数据批,靠心跳声明"源库截至此刻无变更"——
+     *  watermark 的 lastSourceEventTs 不被空闲拖旧;不计 events/batches */
+    public void heartbeat(long heartbeatTsMs) {
+        lastSourceTsMs.accumulateAndGet(heartbeatTsMs, Math::max);
+    }
+
     /** 批成功后推进水位线并记录分段延迟（快照/无数据批的 maxSourceTsMs≤0,分段值只在有源时刻时有意义） */
     public void batchCommitted(int eventCount, long maxSourceTsMs, long deliverLagMs, long stageMs, long lakeTxMs) {
         events.increment(eventCount);

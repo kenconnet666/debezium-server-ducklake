@@ -143,6 +143,17 @@ public class DebeziumEngineRunner implements SmartLifecycle {
         p.setProperty("signal.enabled.channels", "source");
         p.setProperty("signal.data.collection", src.getSignalTable());
 
+        // --- 心跳:空闲期周期确认 slot(防实例级 WAL 被冻结的 confirmed_flush_lsn 无限扣留,
+        //     含本模块维护任务写 catalog 自产的 WAL);消费者按前缀识别,只确认+推水位不入湖。
+        //     action query 是零流量场景的必要闭环:主动 UPSERT 心跳表造真实 WAL 事件触发 LSN flush
+        //     (LSN flush mode 'connector' 只在事件处理时确认,pgoutput 服务端过滤下零事件=零确认) ---
+        if (eng.getHeartbeatIntervalMs() > 0) {
+            p.setProperty("heartbeat.interval.ms", String.valueOf(eng.getHeartbeatIntervalMs()));
+            if (!eng.getHeartbeatActionQuery().isBlank()) {
+                p.setProperty("heartbeat.action.query", eng.getHeartbeatActionQuery());
+            }
+        }
+
         // --- 攒批（Data Inlining 下小批无小文件代价，间隔可以比 Iceberg 时代更激进） ---
         p.setProperty("max.batch.size", String.valueOf(eng.getMaxBatchSize()));
         p.setProperty("max.queue.size", String.valueOf(eng.getMaxQueueSize()));
