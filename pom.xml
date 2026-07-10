@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.lionheartlattice</groupId>
+        <artifactId>zadmin</artifactId>
+        <version>${revision}</version>
+    </parent>
+    <properties>
+        <java.version>${java.sdk.version}</java.version>
+    </properties>
+
+    <artifactId>debezium-server-ducklake</artifactId>
+    <name>debezium-server-ducklake</name>
+    <description>PG18 流式 CDC 入湖 DuckLake（Debezium Embedded Engine + 内嵌 DuckDB），独立启动、唯一湖写入者</description>
+    <packaging>jar</packaging>
+
+    <dependencies>
+
+        <!-- 2026-07-08 与 core 解耦：本模块只做 CDC 入湖，不需要 EasyQuery/动态数据源/OSS 等业务基座。
+             依赖全部直接声明，版本仍由根 pom 统一管理（Boot BOM / debezium-bom / netty-bom / dependencyManagement） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <!-- Debezium PG 连接与 offset storage 的 JDBC 驱动（connector 亦有传递，显式声明防版本漂移） -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <scope>compile</scope>
+        </dependency>
+
+        <!-- Debezium Embedded Engine（纯库，非 Quarkus Server）；版本由 root 的 debezium-bom 统一管理 -->
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-embedded</artifactId>
+            <exclusions>
+                <!-- kafka connect-runtime 传递的 log4j 系 SLF4J 绑定与 Boot 的 logback 冲突，排除 -->
+                <exclusion>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-slf4j-impl</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-slf4j2-impl</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-reload4j</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connector-postgres</artifactId>
+        </dependency>
+        <!-- offset 存 PG（JdbcOffsetBackingStore）；PG 连接器无需 schema history -->
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-storage-jdbc</artifactId>
+        </dependency>
+
+        <!-- 内嵌 DuckDB（ducklake/httpfs 扩展运行时 INSTALL/LOAD，非 Maven 依赖） -->
+        <dependency>
+            <groupId>org.duckdb</groupId>
+            <artifactId>duckdb_jdbc</artifactId>
+        </dependency>
+
+        <!-- /actuator/prometheus 端点（VM job=ducklake 抓取）；仓内首个暴露 Prometheus 指标的模块 -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <!-- ⚠️ Boot 4 默认 Jackson 3(tools.jackson)，spring-boot-jackson 对 Jackson 2 的依赖
+             全部 optional 声明；Maven nearest-wins 让 Kafka Connect/Debezium 传递来的 Jackson 2
+             (JsonConverter/offset 序列化要用)也被判 optional，repackage 不进 fat jar →
+             启动 NoClassDefFoundError: com.fasterxml.jackson.annotation.JsonInclude$Value(实测)。
+             显式非 optional 声明拉回 runtime classpath；版本由 Boot BOM 的 jackson-bom 托管。 -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <!-- databind 的传递声明同样被 nearest-optional 覆盖，必须单列 -->
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+
+        <!-- 测试：单元测试对真 DuckDB 内存库跑（零外部依赖）；
+             集成测试用 Testcontainers 起 PG18（湖数据走本地 DATA_PATH，无需 S3） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- Testcontainers 2.x(Boot 4 BOM 托管 2.0.5):artifact 全带 testcontainers- 前缀 -->
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- starter-test 不传递 awaitility(仅 BOM 管版本),集成测试轮询断言要用 -->
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Arrow(仅 WritePathBenchmark 的流式插入对照;生产代码不依赖):
+             c-data 提供 ArrowArrayStream 与 duckdb registerArrowStream 对接,
+             memory-unsafe 避免引入 netty-buffer(与根 pom netty 4.2 锁版隔离) -->
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-vector</artifactId>
+            <version>${arrow.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-c-data</artifactId>
+            <version>${arrow.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-memory-unsafe</artifactId>
+            <version>${arrow.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- parquet-java(仅 WritePathBenchmark 的 JVM 直写 POC;生产不依赖):
+             hadoop-* 在 parquet 1.14+ 是 provided,不传递;bench 用 LocalOutputFile+
+             PlainParquetConfiguration+SNAPPY(snappy-java 纯 Java),全程无 hadoop 运行时 -->
+        <dependency>
+            <groupId>org.apache.parquet</groupId>
+            <artifactId>parquet-avro</artifactId>
+            <version>${parquet.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- 仅为编译期:AvroParquetWriter.builder 的 hadoop Path 重载解析需要 org.apache.hadoop.fs.Path
+                 类字节码。hadoop-client-api 是单一 shaded jar(含 fs.Path、无传递依赖地狱),运行时
+                 bench 走 LocalOutputFile+PlainParquetConfiguration 不实际调用 hadoop -->
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-client-api</artifactId>
+            <version>3.4.1</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- AvroParquetWriter.build() 仍强制建 hadoop Configuration(需 shaded woodstox XML 解析);
+                 client-runtime 是 shaded 单 jar 补齐运行时。证明 parquet-avro 写路径无法真正脱 hadoop
+                 (生产化须换 parquet-floor 或 Carpet);此处仅为 bench 跑通拿吞吐数字 -->
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-client-runtime</artifactId>
+            <version>3.4.1</version>
+            <scope>test</scope>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <!-- Arrow 在 JDK25 需要:nio 反射开放 + sun.misc.Unsafe 内存访问放行(JEP 498) -->
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow</argLine>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

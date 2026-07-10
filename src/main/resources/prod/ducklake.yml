@@ -1,0 +1,28 @@
+# prod = 全环境变量注入(与 a_start prod 同款风格)
+zadmin:
+  ducklake:
+    source:
+      hostname: ${DUCKLAKE_PG_HOST}
+      port: ${DUCKLAKE_PG_PORT:5432}
+      user: ${DUCKLAKE_CDC_USER:dbuser_cdc}
+      password: ${STACK_PASSWORD}
+      dbname: ${DUCKLAKE_PG_DB:postgres}
+      slot-name: ${DUCKLAKE_SLOT:dbz_ducklake}
+      publication-name: dbz_publication
+    lake:
+      catalog-host: ${DUCKLAKE_PG_HOST}
+      catalog-port: ${DUCKLAKE_PG_PORT:5432}
+      catalog-db: ducklake_catalog
+      catalog-user: ${DUCKLAKE_CATALOG_USER:dbuser_zadmin}
+      catalog-password: ${STACK_PASSWORD}
+      data-path: ${DUCKLAKE_DATA_PATH:s3://lake/ducklake/}
+      s3-endpoint: ${OSS_ENDPOINT:zrustfs:9000}
+      s3-access-key: ${RUSTFS_ACCESS_KEY:admin}
+      s3-secret-key: ${STACK_PASSWORD}
+      s3-ssl: false
+      # 512/768MB 均实测 OOM crash loop(大批重放+常驻占用顶格,2026-07-08)
+      memory-limit: ${DUCKLAKE_MEMORY_LIMIT:1536MB}
+      # 0=自动核数(需容器内存 ≥2.5G);2=已验证稳定值(8 线程在 1.75G 容器实测 OOM)
+      threads: ${DUCKLAKE_THREADS:2}
+    maintenance:
+      enabled: true
