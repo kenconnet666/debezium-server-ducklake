@@ -8,9 +8,6 @@ spring:
   threads:
     virtual:
       enabled: true
-  # Redis 不进入本模块依赖链(2026-07-08 redis 栈整体自 core 迁至 sys):无需排除任何 redis 自动配置。
-  # (历史:曾经 core 传递接入过备用连接;netty 4.1/4.2 混装 CNFE 已在 root pom 以 netty-bom 统一 4.2
-  #  根治,该统一保留——AWS SDK 等仍受益)
 
 server:
   port: ${SERVER_PORT:19992}
@@ -22,13 +19,13 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,prometheus   # /api/ducklake/actuator/prometheus 供 VM 抓取(job=ducklake)
+        include: health,info,prometheus   # /api/ducklake/actuator/prometheus 供 Prometheus/VictoriaMetrics 抓取
 
 ---
 spring:
   config:
     activate:
-      on-profile: dev
+      on-profile: dev      # 本机开发(单机 docker 栈直连)
     import:
       - optional:classpath:/dev/ducklake.yml
 
@@ -36,22 +33,6 @@ spring:
 spring:
   config:
     activate:
-      on-profile: test
-    import:
-      - optional:classpath:/test/ducklake.yml
-
----
-spring:
-  config:
-    activate:
-      on-profile: standalone   # 单机 compose 形态(.doc/.standalone,容器名直连)
-    import:
-      - optional:classpath:/standalone/ducklake.yml
-
----
-spring:
-  config:
-    activate:
-      on-profile: prod
+      on-profile: prod     # 全环境变量驱动,推荐容器化部署使用
     import:
       - optional:classpath:/prod/ducklake.yml

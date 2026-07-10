@@ -4,23 +4,55 @@
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
-        <groupId>io.github.lionheartlattice</groupId>
-        <artifactId>zadmin</artifactId>
-        <version>${revision}</version>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.0.7</version>
+        <relativePath/>
     </parent>
+
+    <groupId>org.dpdns.zerodep</groupId>
+    <artifactId>debezium-server-ducklake</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <name>debezium-server-ducklake</name>
+    <description>PostgreSQL 流式 CDC 入湖 DuckLake（Debezium Embedded Engine + 内嵌 DuckDB）——单进程、零 Kafka、独立启动的湖写入者</description>
+    <packaging>jar</packaging>
+
     <properties>
-        <java.version>${java.sdk.version}</java.version>
+        <java.version>25</java.version>
+        <debezium.version>3.6.0.Final</debezium.version>
+        <duckdb.version>1.5.4.0</duckdb.version>
+        <!-- Arrow/parquet/hadoop 仅 WritePathBenchmark(test scope)使用,生产代码零依赖 -->
+        <arrow.version>18.3.0</arrow.version>
+        <parquet.version>1.15.0</parquet.version>
     </properties>
 
-    <artifactId>debezium-server-ducklake</artifactId>
-    <name>debezium-server-ducklake</name>
-    <description>PG18 流式 CDC 入湖 DuckLake（Debezium Embedded Engine + 内嵌 DuckDB），独立启动、唯一湖写入者</description>
-    <packaging>jar</packaging>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>io.debezium</groupId>
+                <artifactId>debezium-bom</artifactId>
+                <version>${debezium.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- kafka connect-runtime 传递的 plexus-utils 强制升 4.0.3:
+                 CVE-2025-67030(Expand.extractFile 目录穿越)修复版为 3.6.1/4.0.3,
+                 4.0.x 保留 plexus.util 基础包,connect-runtime 运行时兼容(实测) -->
+            <dependency>
+                <groupId>org.codehaus.plexus</groupId>
+                <artifactId>plexus-utils</artifactId>
+                <version>4.0.3</version>
+            </dependency>
+            <dependency>
+                <groupId>org.duckdb</groupId>
+                <artifactId>duckdb_jdbc</artifactId>
+                <version>${duckdb.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
 
-        <!-- 2026-07-08 与 core 解耦：本模块只做 CDC 入湖，不需要 EasyQuery/动态数据源/OSS 等业务基座。
-             依赖全部直接声明，版本仍由根 pom 统一管理（Boot BOM / debezium-bom / netty-bom / dependencyManagement） -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc</artifactId>
@@ -191,6 +223,20 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
                     <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow</argLine>
+                </configuration>
+            </plugin>
+            <plugin>
+                <!-- JDK 23+ 默认禁用隐式注解处理,Lombok 须显式声明 processor path -->
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <parameters>true</parameters>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </path>
+                    </annotationProcessorPaths>
                 </configuration>
             </plugin>
         </plugins>
