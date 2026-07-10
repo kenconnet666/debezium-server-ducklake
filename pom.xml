@@ -6,7 +6,7 @@
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
-        <version>4.0.7</version>
+        <version>4.1.0</version>
         <relativePath/>
     </parent>
 
@@ -21,9 +21,6 @@
         <java.version>25</java.version>
         <debezium.version>3.6.0.Final</debezium.version>
         <duckdb.version>1.5.4.0</duckdb.version>
-        <!-- Arrow/parquet/hadoop 仅 WritePathBenchmark(test scope)使用,生产代码零依赖 -->
-        <arrow.version>18.3.0</arrow.version>
-        <parquet.version>1.15.0</parquet.version>
     </properties>
 
     <dependencyManagement>
@@ -42,11 +39,6 @@
                 <groupId>org.codehaus.plexus</groupId>
                 <artifactId>plexus-utils</artifactId>
                 <version>4.0.3</version>
-            </dependency>
-            <dependency>
-                <groupId>org.duckdb</groupId>
-                <artifactId>duckdb_jdbc</artifactId>
-                <version>${duckdb.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>
@@ -107,6 +99,7 @@
         <dependency>
             <groupId>org.duckdb</groupId>
             <artifactId>duckdb_jdbc</artifactId>
+            <version>${duckdb.version}</version>
         </dependency>
 
         <!-- /actuator/prometheus 端点（VM job=ducklake 抓取）；仓内首个暴露 Prometheus 指标的模块 -->
@@ -159,56 +152,6 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- Arrow(仅 WritePathBenchmark 的流式插入对照;生产代码不依赖):
-             c-data 提供 ArrowArrayStream 与 duckdb registerArrowStream 对接,
-             memory-unsafe 避免引入 netty-buffer(与根 pom netty 4.2 锁版隔离) -->
-        <dependency>
-            <groupId>org.apache.arrow</groupId>
-            <artifactId>arrow-vector</artifactId>
-            <version>${arrow.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.arrow</groupId>
-            <artifactId>arrow-c-data</artifactId>
-            <version>${arrow.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.arrow</groupId>
-            <artifactId>arrow-memory-unsafe</artifactId>
-            <version>${arrow.version}</version>
-            <scope>test</scope>
-        </dependency>
-
-        <!-- parquet-java(仅 WritePathBenchmark 的 JVM 直写 POC;生产不依赖):
-             hadoop-* 在 parquet 1.14+ 是 provided,不传递;bench 用 LocalOutputFile+
-             PlainParquetConfiguration+SNAPPY(snappy-java 纯 Java),全程无 hadoop 运行时 -->
-        <dependency>
-            <groupId>org.apache.parquet</groupId>
-            <artifactId>parquet-avro</artifactId>
-            <version>${parquet.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <!-- 仅为编译期:AvroParquetWriter.builder 的 hadoop Path 重载解析需要 org.apache.hadoop.fs.Path
-                 类字节码。hadoop-client-api 是单一 shaded jar(含 fs.Path、无传递依赖地狱),运行时
-                 bench 走 LocalOutputFile+PlainParquetConfiguration 不实际调用 hadoop -->
-            <groupId>org.apache.hadoop</groupId>
-            <artifactId>hadoop-client-api</artifactId>
-            <version>3.4.1</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <!-- AvroParquetWriter.build() 仍强制建 hadoop Configuration(需 shaded woodstox XML 解析);
-                 client-runtime 是 shaded 单 jar 补齐运行时。证明 parquet-avro 写路径无法真正脱 hadoop
-                 (生产化须换 parquet-floor 或 Carpet);此处仅为 bench 跑通拿吞吐数字 -->
-            <groupId>org.apache.hadoop</groupId>
-            <artifactId>hadoop-client-runtime</artifactId>
-            <version>3.4.1</version>
-            <scope>test</scope>
-        </dependency>
-
     </dependencies>
 
     <build>
@@ -218,19 +161,11 @@
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
             <plugin>
-                <!-- Arrow 在 JDK25 需要:nio 反射开放 + sun.misc.Unsafe 内存访问放行(JEP 498) -->
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-surefire-plugin</artifactId>
-                <configuration>
-                    <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow</argLine>
-                </configuration>
-            </plugin>
-            <plugin>
-                <!-- JDK 23+ 默认禁用隐式注解处理,Lombok 须显式声明 processor path -->
+                <!-- JDK 23+ 默认禁用隐式注解处理,Lombok 须显式声明 processor path;
+                     parameters=true 由 Boot parent 默认提供,无需重复 -->
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <configuration>
-                    <parameters>true</parameters>
                     <annotationProcessorPaths>
                         <path>
                             <groupId>org.projectlombok</groupId>
