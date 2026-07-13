@@ -143,7 +143,7 @@ DuckDB 的 Parquet writer 按 row group 容量**预分配**列缓冲（与实际
 
 - 用 `prod` profile（全环境变量注入，变量清单见 `src/main/resources/prod/ducklake.yml` 与 compose 示例）
 - **单实例部署**：本服务是湖的唯一写入者（单写者设计规避 DuckLake 并发提交缺陷）；容器 `restart: always`——任何致命错误进程自杀交给容器重启，从上个 offset 重放，零丢失
-- JVM 参数照 `docker/Dockerfile`：ZGC + 紧凑对象头 + `--enable-native-access=ALL-UNNAMED`（DuckDB JNI）
+- JVM 参数照 `docker/ducklake/Dockerfile`：ZGC + 紧凑对象头 + `--enable-native-access=ALL-UNNAMED`（DuckDB JNI）
 - DuckDB 扩展缓存目录 `/root/.duckdb` 挂持久卷（否则每次重启重新下载扩展）
 
 ## 运维
@@ -152,9 +152,9 @@ DuckDB 的 Parquet writer 按 row group 容量**预分配**列缓冲（与实际
 
 | 任务 | 频率 | 内容 |
 |---|---|---|
-| quick | 5 分钟 | `flush_inlined_data`（元空间小批落盘 Parquet）+ 分层压实 Tier0-2（碎片/小文件合并） |
-| daily | 每日 | 快照过期清理 + 孤儿文件检测（dry-run 只报不删）+ 信号表 TRUNCATE |
-| monthly | 每月 | 全量归并（所有文件收敛到大文件） |
+| quick | 5 分钟 | `flush_inlined_data`（元空间小批落盘 Parquet）+ Tier0 压实（碎片合并） |
+| hourly | 每小时 | Tier1 压实（小文件合并） |
+| daily | 每日（默认 04:40，`maintenance.daily-cron` 可调） | **全量归并**（所有文件收敛到大文件）+ 快照过期清理 + 孤儿文件检测（dry-run 只报不删）+ 信号表 TRUNCATE |
 
 分层压实的 `max_file_size` 过滤是**防写放大的关键**：各级只吃自己区间的输入，每个字节一生只被重写 O(层数) 次。
 

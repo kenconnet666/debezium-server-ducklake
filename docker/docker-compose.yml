@@ -4,6 +4,8 @@
 #   2. docker compose -f docker/docker-compose.yml up -d --build
 #   3. 建表写数据,查 watermark: curl http://127.0.0.1:19992/api/ducklake/watermark
 # CDC 基建(角色/publication/DDL 审计/signal/心跳表)由 initdb 自动完成,up 即可用。
+# 布局约定:每个服务一个子目录——Dockerfile 放 <服务>/,持久化数据落 <服务>/data/
+# (bind mount,不用 named volume;数据与栈定义同处一树,备份/清理一个目录搞定)。
 # 生产部署请替换全部 changeme 密码。
 services:
   # ── 源库:postgres:18-bookworm + pig 扩展仓库(加插件一行 pig ext install <name> -v 18 -y)──
@@ -24,8 +26,8 @@ services:
       - "15432:5432"
     volumes:
       # postgres:18 起挂载点必须是 /var/lib/postgresql(数据在 18/docker 子目录),
-      # 挂 .../data 会被 entrypoint 拒绝(docker-library/postgres#1259)
-      - pgdata:/var/lib/postgresql
+      # 挂容器内 .../data 会被 entrypoint 拒绝(docker-library/postgres#1259)
+      - ./postgres/data:/var/lib/postgresql
       - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -47,7 +49,7 @@ services:
     ports:
       - "15434:5432"
     volumes:
-      - catalogdata:/var/lib/postgresql
+      - ./catalog-pg/data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lake_admin -d ducklake_catalog"]
       interval: 5s
@@ -61,7 +63,7 @@ services:
     ports:
       - "19000:9000"
     volumes:
-      - lakedata:/data
+      - ./rustfs/data:/data
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/health || exit 1"]
       interval: 5s
@@ -78,8 +80,9 @@ services:
 
   ducklake:
     build:
+      # context 是仓库根:Dockerfile 要 COPY target/*.jar
       context: ..
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/ducklake/Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -111,10 +114,4 @@ services:
           memory: 3072M
     volumes:
       # DuckDB 扩展缓存(首启 INSTALL ducklake/postgres/httpfs 需外网,持久化后重启秒加载)
-      - duckdb-ext:/root/.duckdb
-
-volumes:
-  pgdata:
-  catalogdata:
-  lakedata:
-  duckdb-ext:
+      - ./ducklake/data/duckdb-ext:/root/.duckdb

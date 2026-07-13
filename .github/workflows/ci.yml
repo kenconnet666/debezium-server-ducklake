@@ -1,5 +1,5 @@
 # CI：push/PR 全量验证（单测 + Testcontainers 集成测试,ubuntu runner 自带 Docker）
-# JDK 用 JetBrains Runtime(JBR) SDK 25——与生产运行时(docker/Dockerfile 的 JBR)同源;
+# JDK 用 JetBrains Runtime(JBR) SDK 25——与生产运行时(docker/ducklake/Dockerfile 的 JBR)同源;
 # 走 jdkfile 直链(cache-redirector 为 JetBrains 官方分发 CDN),不依赖 setup-java 的
 # 发行版目录对 JBR 25 的收录情况
 name: CI

@@ -31,3 +31,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### 本地栈持久化(docker compose bind mount) ###
+docker/*/data/

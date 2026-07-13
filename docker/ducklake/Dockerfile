@@ -1,5 +1,6 @@
 # debezium-server-ducklake 容器镜像:Debian 13 slim + JetBrains Runtime(JBR) 25
-# 构建: mvn package -DskipTests && docker build -f docker/Dockerfile -t debezium-server-ducklake .
+# 构建: mvn package -DskipTests && docker build -f docker/ducklake/Dockerfile -t debezium-server-ducklake .
+# (context 必须是仓库根——要 COPY target/*.jar)
 # 多架构(buildx): TARGETARCH=amd64/arm64 自动映射 JBR 的 x64/aarch64 变体
 FROM debian:trixie-slim
 
