@@ -233,7 +233,7 @@ DuckDB 的 Parquet writer 按 row group 容量**预分配**列缓冲（与实际
 
 | 参数 | 默认 | 矩阵结论 |
 |---|---|---|
-| `engine.max-batch-size` | 8192 | 32768 约 +8% 吞吐，但毒丸批重放粒度 ×4，不值得改默认；超大积压追赶可临时调大 |
+| `engine.max-batch-size` | 8192 | 32768 约 +8% 吞吐，但批重放粒度 ×4，不值得改默认；超大积压追赶可临时调大 |
 | `lake.threads` | 2 | 4 约 +6%（单机全家桶 CPU 已饱和，收益边际）；独立部署且内存充足可试 4 |
 | `engine.record-processing-threads` | -1（=核数） | 窄行负载下与单线程持平（SMT 本身轻）；宽行/高流量才是它的设计场景，保持默认 |
 | `lake.data-inlining-row-limit` | 512 | 关闭（0）对追赶 +3%（噪声级）；保留 512 换小批低延迟与零小文件 |
