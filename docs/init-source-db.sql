@@ -15,10 +15,12 @@ DO $$ BEGIN
 END $$;
 GRANT pg_read_all_data TO dbuser_cdc;
 
--- ② publication：FOR TABLES IN SCHEMA 让新建表自动纳入捕获
+-- ② publication：FOR ALL TABLES 整库发布——所有 schema 的表、含新建表自动纳入捕获
+--    （服务端默认整库同步:存量 initial 快照 + WAL 增量,湖表 <schema>_<表> 自动一一对应;
+--     需收窄范围时改用 FOR TABLES IN SCHEMA ... 并配 DUCKLAKE_SCHEMA_INCLUDE）
 DO $$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_publication WHERE pubname = 'dbz_publication') THEN
-    CREATE PUBLICATION dbz_publication FOR TABLES IN SCHEMA public;
+    CREATE PUBLICATION dbz_publication FOR ALL TABLES;
   END IF;
 END $$;
 
@@ -37,12 +39,15 @@ CREATE TABLE IF NOT EXISTS public.sys_ddl_log (
     xid bigint NOT NULL DEFAULT (pg_current_xact_id()::text::bigint),
     occurred_at timestamptz NOT NULL DEFAULT now());
 
+-- 审计范围与整库捕获对齐:全部用户 schema(排系统 schema 与临时 schema),审计表自身除外
 CREATE OR REPLACE FUNCTION fn_capture_ddl() RETURNS event_trigger
 LANGUAGE plpgsql SECURITY DEFINER AS $fn$
 DECLARE r record;
 BEGIN
   FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
-    IF r.schema_name = 'public' AND r.object_identity <> 'public.sys_ddl_log' THEN
+    IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+       AND r.schema_name NOT LIKE 'pg_temp%'
+       AND r.object_identity <> 'public.sys_ddl_log' THEN
       INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
       VALUES ('ddl_command_end', r.command_tag, r.object_type, r.object_identity, current_query());
     END IF;
@@ -54,7 +59,9 @@ LANGUAGE plpgsql SECURITY DEFINER AS $fn$
 DECLARE r record;
 BEGIN
   FOR r IN SELECT * FROM pg_event_trigger_dropped_objects() LOOP
-    IF r.schema_name = 'public' AND r.object_type IN ('table', 'table column')
+    IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+       AND r.schema_name NOT LIKE 'pg_temp%'
+       AND r.object_type IN ('table', 'table column')
        AND r.object_identity NOT LIKE 'public.sys_ddl_log%' THEN
       INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
       VALUES ('sql_drop', tg_tag, r.object_type, r.object_identity, current_query());

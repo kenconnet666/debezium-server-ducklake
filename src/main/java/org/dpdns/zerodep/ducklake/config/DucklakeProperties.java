@@ -29,10 +29,13 @@ public class DucklakeProperties {
         private String dbname = "postgres";
         /** 复制槽名（与现役 iceberg 链的 dbz_iceberg 槽相互独立，可并行影子期） */
         private String slotName = "dbz_ducklake";
-        /** 发布名（复用既有 FOR TABLES IN SCHEMA public 发布，新表自动纳入） */
+        /** 发布名（init 脚本建 FOR ALL TABLES 发布：整库所有 schema 的表、含新建表自动纳入） */
         private String publicationName = "dbz_publication";
-        /** 捕获的 schema */
-        private String schemaIncludeList = "public";
+        /** 捕获的 schema（Debezium schema.include.list）。默认空 = 不限制：整库全部用户
+         *  schema 自动捕获（pg_catalog/information_schema 等系统 schema 由 Debezium 内建排除），
+         *  首启 initial 快照拉全部存量 + 之后 WAL 流式增量，湖表名 <schema>_<表> 一一自动对应。
+         *  需收窄时填逗号分隔 schema 列表（正则） */
+        private String schemaIncludeList = "";
         /** 排除表（正则，schema.table 形式），如内部状态表 */
         private String tableExcludeList = "";
         /** Debezium 增量快照 signal 表（source channel；类型严格跟随的"重建+重拉"兜底经由它触发，

@@ -69,7 +69,7 @@ class DucklakeApplicationIntegrationTest {
             s.execute("GRANT pg_read_all_data TO dbuser_cdc");
             s.execute("CREATE ROLE dbuser_zadmin LOGIN PASSWORD 'test'");
             s.execute("GRANT CREATE ON SCHEMA public TO dbuser_zadmin");
-            s.execute("CREATE PUBLICATION dbz_publication FOR TABLES IN SCHEMA public");
+            s.execute("CREATE PUBLICATION dbz_publication FOR ALL TABLES");
             s.execute("CREATE DATABASE ducklake_catalog OWNER dbuser_zadmin");
 
             s.execute("""
@@ -78,13 +78,16 @@ class DucklakeApplicationIntegrationTest {
                         ev text NOT NULL, tag text, object_type text, object_identity text, query_text text,
                         xid bigint NOT NULL DEFAULT (pg_current_xact_id()::text::bigint),
                         occurred_at timestamptz NOT NULL DEFAULT now())""");
+            // 与 initdb/01-cdc.sh 对齐:审计全部用户 schema(排除法),不再限定 public
             s.execute("""
                     CREATE OR REPLACE FUNCTION fn_capture_ddl() RETURNS event_trigger
                     LANGUAGE plpgsql SECURITY DEFINER AS $fn$
                     DECLARE r record;
                     BEGIN
                       FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
-                        IF r.schema_name = 'public' AND r.object_identity <> 'public.sys_ddl_log' THEN
+                        IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                           AND r.schema_name NOT LIKE 'pg_temp%'
+                           AND r.object_identity <> 'public.sys_ddl_log' THEN
                           INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
                           VALUES ('ddl_command_end', r.command_tag, r.object_type, r.object_identity, current_query());
                         END IF;
@@ -96,7 +99,9 @@ class DucklakeApplicationIntegrationTest {
                     DECLARE r record;
                     BEGIN
                       FOR r IN SELECT * FROM pg_event_trigger_dropped_objects() LOOP
-                        IF r.schema_name = 'public' AND r.object_type IN ('table', 'table column')
+                        IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                           AND r.schema_name NOT LIKE 'pg_temp%'
+                           AND r.object_type IN ('table', 'table column')
                            AND r.object_identity NOT LIKE 'public.sys_ddl_log%' THEN
                           INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
                           VALUES ('sql_drop', tg_tag, r.object_type, r.object_identity, current_query());
@@ -112,6 +117,13 @@ class DucklakeApplicationIntegrationTest {
                     + "name text NOT NULL, big_content text, amount numeric(12,2) DEFAULT 0)");
             s.execute("ALTER TABLE cdc_test REPLICA IDENTITY FULL");
             s.execute("INSERT INTO cdc_test (name, amount) VALUES ('alpha', 10.50), ('beta', 20.00), ('gamma', 99.99)");
+
+            // 非 public schema:默认整库同步下应自动捕获并映射为湖表 cdc.app_orders(快照+增量)
+            s.execute("CREATE SCHEMA app");
+            s.execute("CREATE TABLE app.orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+                    + "sku text NOT NULL, qty int DEFAULT 1)");
+            s.execute("ALTER TABLE app.orders REPLICA IDENTITY FULL");
+            s.execute("INSERT INTO app.orders (sku, qty) VALUES ('sku-a', 2), ('sku-b', 3)");
 
             // Debezium 增量快照 signal 表(类型严格跟随的重建+重拉兜底;连接器写快照水位也在此表)
             s.execute("CREATE TABLE dbz_signal (id varchar(42) PRIMARY KEY, type varchar(32) NOT NULL, data varchar(2048))");
@@ -146,8 +158,11 @@ class DucklakeApplicationIntegrationTest {
     @Test
     @Order(1)
     void snapshotLandsInLake() {
-        await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() ->
-                assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test")).isEqualTo(3L));
+        await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test")).isEqualTo(3L);
+            // 默认整库:非 public schema 的存量随 initial 快照自动落湖,湖表名 <schema>_<表>
+            assertThat(lakeCount("SELECT count(*) FROM cdc.app_orders")).isEqualTo(2L);
+        });
         assertThat(syncState.getEngineRunning().get()).isEqualTo(1);
     }
 
@@ -268,6 +283,17 @@ class DucklakeApplicationIntegrationTest {
                 .contains("\"code\":\"0000\"")
                 .contains("\"engineRunning\":true")
                 .contains("\"lastSyncedAt\":\"2026-");
+    }
+
+    @Test
+    @Order(6)
+    void nonPublicSchemaStreamsAutomatically() throws Exception {
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("INSERT INTO app.orders (sku, qty) VALUES ('sku-live', 5)");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM cdc.app_orders WHERE sku='sku-live'")).isEqualTo(1L));
     }
 
     private Long lakeCount(String sql) throws Exception {

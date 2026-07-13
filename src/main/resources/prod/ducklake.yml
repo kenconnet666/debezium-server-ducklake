@@ -8,6 +8,10 @@ ducklake:
     dbname: ${DUCKLAKE_SOURCE_DBNAME:postgres}
     slot-name: ${DUCKLAKE_SLOT:dbz_ducklake}
     publication-name: ${DUCKLAKE_PUBLICATION:dbz_publication}
+    # 捕获范围:默认空=整库(全部用户 schema 的全部表,存量快照+增量都拉,湖表自动一一对应);
+    # 收窄时给逗号分隔列表(正则),如 "public,app"
+    schema-include-list: ${DUCKLAKE_SCHEMA_INCLUDE:}
+    table-exclude-list: ${DUCKLAKE_TABLE_EXCLUDE:}
   lake:
     catalog-host: ${DUCKLAKE_CATALOG_HOST:${DUCKLAKE_SOURCE_HOST}}
     catalog-port: ${DUCKLAKE_CATALOG_PORT:5432}

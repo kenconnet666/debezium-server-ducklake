@@ -132,7 +132,10 @@ public class DebeziumEngineRunner implements SmartLifecycle {
         p.setProperty("slot.name", src.getSlotName());
         p.setProperty("publication.name", src.getPublicationName());
         p.setProperty("publication.autocreate.mode", "disabled");
-        p.setProperty("schema.include.list", src.getSchemaIncludeList());
+        // 空=不设 include(整库全部用户 schema);空串直接下发会被当成"空列表"反而全排除
+        if (!src.getSchemaIncludeList().isBlank()) {
+            p.setProperty("schema.include.list", src.getSchemaIncludeList());
+        }
         if (!src.getTableExcludeList().isBlank()) {
             p.setProperty("table.exclude.list", src.getTableExcludeList());
         }

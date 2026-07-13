@@ -89,7 +89,28 @@ psrc "INSERT INTO $TBL(id,name,val,note) VALUES (2001,'ddl-probe',1.0,'new-col')
 wait_for "湖表出现 note 列(DDL 审计流跟随)" 120 "1" hascol
 wait_for "新列行落湖(事件 1151)" 60 "1151" lakecount
 
-echo "── 6. 心跳闭环(空闲 WAL 确认) ──"
+echo "── 6. 非 public schema 自动对应(默认整库同步) ──"
+SCHEMA_TBL="app_e2e.orders_$(date +%H%M%S)"
+LAKE_SCHEMA_TBL="app_e2e_${SCHEMA_TBL#app_e2e.}"
+schemacount() {
+  local tid
+  tid=$(pcat "SELECT table_id FROM ducklake_table WHERE table_name='$LAKE_SCHEMA_TBL' AND end_snapshot IS NULL")
+  [ -z "$tid" ] && { echo "<none>"; return; }
+  local parquet inlined itbl
+  parquet=$(pcat "SELECT COALESCE(sum(record_count),0) FROM ducklake_data_file WHERE table_id=$tid AND end_snapshot IS NULL")
+  inlined=0
+  for itbl in $(pcat "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE 'ducklake_inlined_data_${tid}\\_%'"); do
+    inlined=$((inlined + $(pcat "SELECT count(*) FROM \"$itbl\" WHERE end_snapshot IS NULL")))
+  done
+  echo $((parquet + inlined))
+}
+psrc "CREATE SCHEMA IF NOT EXISTS app_e2e" >/dev/null
+psrc "CREATE TABLE $SCHEMA_TBL(id int PRIMARY KEY, sku text)" >/dev/null
+psrc "INSERT INTO $SCHEMA_TBL SELECT g, 'sku-'||g FROM generate_series(1,100) g" >/dev/null
+wait_for "app_e2e schema 表自动落湖(cdc.$LAKE_SCHEMA_TBL,100 行)" 120 "100" schemacount
+psrc "DROP TABLE IF EXISTS $SCHEMA_TBL" >/dev/null
+
+echo "── 7. 心跳闭环(空闲 WAL 确认) ──"
 hb=$(psrc "SELECT count(*) FROM dbz_heartbeat")
 if [ "${hb:-0}" -ge 1 ]; then ok "dbz_heartbeat 已有心跳行(action query 生效)"; else
   echo "  … 等待一个心跳周期(65s)"; sleep 65
@@ -99,7 +120,7 @@ fi
 slot=$(psrc "SELECT active FROM pg_replication_slots WHERE slot_name='dbz_ducklake'")
 [ "$slot" = "t" ] && ok "复制槽 dbz_ducklake active" || bad "复制槽状态异常: ${slot:-不存在}"
 
-echo "── 7. 应用日志 ERROR 扫描 ──"
+echo "── 8. 应用日志 ERROR 扫描 ──"
 errs=$(docker compose logs ducklake 2>/dev/null | grep -c ' ERROR ' || true)
 if [ "${errs:-0}" = "0" ]; then ok "ducklake 日志无 ERROR"; else
   bad "ducklake 日志有 $errs 条 ERROR(样例如下)"

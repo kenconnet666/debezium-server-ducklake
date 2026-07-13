@@ -114,7 +114,9 @@ SELECT count(*) FROM lake.cdc.public_demo;
 |---|---|---|
 | `source.hostname/port/user/password/dbname` | — | PG 逻辑复制源（集群形态可填 HAProxy 读写口，故障转移自动跟随） |
 | `source.slot-name` | `dbz_ducklake` | 复制槽名 |
-| `source.publication-name` | `dbz_publication` | 发布名（`FOR TABLES IN SCHEMA` 让新表自动纳入） |
+| `source.publication-name` | `dbz_publication` | 发布名（init 脚本建 `FOR ALL TABLES`：整库所有 schema、新建表自动纳入） |
+| `source.schema-include-list` | 空 | **默认整库同步**：空=全部用户 schema（存量 initial 快照 + WAL 增量都拉，湖表 `<schema>_<表>` 自动一一对应）；需收窄填逗号分隔列表 |
+| `source.table-exclude-list` | 空 | 排除表（正则，`schema.table` 形式） |
 | `source.signal-table` | `public.dbz_signal` | 增量快照 signal 表（类型重建兜底经它触发） |
 | `lake.catalog-*` | — | DuckLake catalog 的 PG 连接（同时承载 Debezium offset 表） |
 | `lake.data-path` | `s3://lake/ducklake/` | 数据文件根路径（S3 或本地目录） |

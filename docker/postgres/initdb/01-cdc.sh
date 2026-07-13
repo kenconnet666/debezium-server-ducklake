@@ -9,8 +9,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     GRANT pg_read_all_data TO dbuser_cdc;
     COMMENT ON ROLE dbuser_cdc IS 'CDC user for debezium-server-ducklake';
 
-    -- ── publication:public schema 整库发布(新表自动纳入)──
-    CREATE PUBLICATION dbz_publication FOR TABLES IN SCHEMA public;
+    -- ── publication:FOR ALL TABLES 整库发布(所有 schema、含新建表自动纳入;需超户建)──
+    CREATE PUBLICATION dbz_publication FOR ALL TABLES;
 
     -- ── 观测扩展(shared_preload 由 compose command 行配好;pigsty 预装见 Dockerfile)──
     CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
@@ -38,12 +38,15 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-'
         xid             bigint NOT NULL DEFAULT (pg_current_xact_id()::text::bigint),
         occurred_at     timestamptz NOT NULL DEFAULT now());
 
+    -- 审计范围与整库捕获对齐:全部用户 schema(排系统 schema 与临时 schema),审计表自身除外
     CREATE OR REPLACE FUNCTION fn_capture_ddl() RETURNS event_trigger
     LANGUAGE plpgsql SECURITY DEFINER AS $fn$
     DECLARE r record;
     BEGIN
       FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
-        IF r.schema_name = 'public' AND r.object_identity <> 'public.sys_ddl_log' THEN
+        IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+           AND r.schema_name NOT LIKE 'pg_temp%'
+           AND r.object_identity <> 'public.sys_ddl_log' THEN
           INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
           VALUES ('ddl_command_end', r.command_tag, r.object_type, r.object_identity, current_query());
         END IF;
@@ -55,7 +58,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-'
     DECLARE r record;
     BEGIN
       FOR r IN SELECT * FROM pg_event_trigger_dropped_objects() LOOP
-        IF r.schema_name = 'public' AND r.object_type IN ('table', 'table column')
+        IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+           AND r.schema_name NOT LIKE 'pg_temp%'
+           AND r.object_type IN ('table', 'table column')
            AND r.object_identity NOT LIKE 'public.sys_ddl_log%' THEN
           INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
           VALUES ('sql_drop', tg_tag, r.object_type, r.object_identity, current_query());
