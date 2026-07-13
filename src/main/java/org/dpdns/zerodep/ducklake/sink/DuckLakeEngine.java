@@ -40,6 +40,13 @@ public class DuckLakeEngine {
     private static final String DUCKDB_URL = "jdbc:duckdb::memory:ducklake";
     /** ATTACH 后的湖别名，全模块 SQL 统一用 lake.<schema>.<table> 引用 */
     public static final String LAKE = "lake";
+
+    /** 湖内两段名 schema.table → "schema"."table"——湖 schema 可带用户前缀（如 my-public，
+     *  含连字符等非标识符字符），所有 SQL 拼接必须经引号化 */
+    public static String quoted(String lakeTable) {
+        int dot = lakeTable.indexOf('.');
+        return '"' + lakeTable.substring(0, dot) + "\".\"" + lakeTable.substring(dot + 1) + '"';
+    }
     /** 本地内存主 catalog。URL :memory:ducklake 的 "ducklake" 只是同 JVM 共享 instance 的
      *  缓存键，主 catalog 名恒为 memory（集成测试实测踩坑）。staging 表必须显式挂它下面：
      *  worker 连接 USE lake 后，两段名 main.x 会解析成 lake.main.x——staging 落进湖 =
@@ -128,8 +135,7 @@ public class DuckLakeEngine {
             } catch (SQLException e) {
                 log.warn("parquet_row_group_size 设置失败（当前版本不支持该选项,宽行大批有 OOM 风险）: {}", e.getMessage());
             }
-            // 湖内 schema 就位(2026-07-08 起仅 cdc:meta.ddl_history 留档已随"纯跟随"改造裁撤)
-            s.execute("CREATE SCHEMA IF NOT EXISTS " + props.getMaintenance().getCdcSchema());
+            // 湖内 schema 不再预建:镜像模式下湖 schema = <前缀><pg_schema>,由消费者首见按需建
         }
         // ③ 只读查询连接:同 instance 第三连接,lake 已由 worker ATTACH(instance 级)直接可见。
         //    USE lake 与 worker 会话对齐——queryScalar 的调用方习惯两段名(cdc.<t>),

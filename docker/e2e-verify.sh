@@ -17,14 +17,14 @@ ok()   { PASS=$((PASS+1)); echo "  ✓ $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 psrc() { docker compose exec -T postgres psql -qtA -U postgres -c "$1"; }
 pcat() { docker compose exec -T catalog-pg psql -qtA -U lake_admin -d ducklake_catalog -c "$1"; }
-# 测试表名唯一化;湖表命名规则:湖 schema=cdc,表名=<pg_schema>_<表名>
+# 测试表名唯一化;湖命名规则:镜像模式,湖 schema=<前缀><pg_schema>(默认无前缀),表名原样
 TBL="t_e2e_$(date +%H%M%S)"
-LAKE_TBL="public_${TBL}"
 
-# 湖侧事件行数(见文件头公式;表未注册时输出 <none>)
-lakecount() {
-  local tid parquet inlined itbl
-  tid=$(pcat "SELECT table_id FROM ducklake_table WHERE table_name='$LAKE_TBL' AND end_snapshot IS NULL")
+# 湖侧当前态行数(见文件头公式;表未注册时输出 <none>):$1=湖schema $2=表名
+lakecount_in() {
+  local sch=$1 tbl=$2 tid parquet inlined itbl
+  tid=$(pcat "SELECT t.table_id FROM ducklake_table t JOIN ducklake_schema s ON s.schema_id=t.schema_id
+              WHERE s.schema_name='$sch' AND t.table_name='$tbl' AND t.end_snapshot IS NULL")
   [ -z "$tid" ] && { echo "<none>"; return; }
   parquet=$(pcat "SELECT COALESCE((SELECT sum(record_count) FROM ducklake_data_file WHERE table_id=$tid AND end_snapshot IS NULL),0)
                        - COALESCE((SELECT sum(delete_count) FROM ducklake_delete_file WHERE table_id=$tid AND end_snapshot IS NULL),0)")
@@ -35,10 +35,13 @@ lakecount() {
   done
   echo $((parquet + inlined))
 }
+# 主测试表(public.$TBL)的当前态行数
+lakecount() { lakecount_in "public" "$TBL"; }
 # note 列在湖表活跃 schema 中存在?(DDL 跟随断言)
 hascol() {
   pcat "SELECT count(*) FROM ducklake_column c JOIN ducklake_table t ON t.table_id=c.table_id
-        WHERE t.table_name='$LAKE_TBL' AND t.end_snapshot IS NULL
+        JOIN ducklake_schema s ON s.schema_id=t.schema_id
+        WHERE s.schema_name='public' AND t.table_name='$TBL' AND t.end_snapshot IS NULL
           AND c.column_name='note' AND c.end_snapshot IS NULL"
 }
 # 轮询直到命令输出=期望值,最多 N 秒
@@ -92,26 +95,13 @@ wait_for "湖表出现 note 列(DDL 审计流跟随)" 120 "1" hascol
 wait_for "新列行落湖(当前态 951)" 60 "951" lakecount
 
 echo "── 6. 非 public schema 自动对应(默认整库同步) ──"
-SCHEMA_TBL="app_e2e.orders_$(date +%H%M%S)"
-LAKE_SCHEMA_TBL="app_e2e_${SCHEMA_TBL#app_e2e.}"
-schemacount() {
-  local tid
-  tid=$(pcat "SELECT table_id FROM ducklake_table WHERE table_name='$LAKE_SCHEMA_TBL' AND end_snapshot IS NULL")
-  [ -z "$tid" ] && { echo "<none>"; return; }
-  local parquet inlined itbl
-  parquet=$(pcat "SELECT COALESCE((SELECT sum(record_count) FROM ducklake_data_file WHERE table_id=$tid AND end_snapshot IS NULL),0)
-                       - COALESCE((SELECT sum(delete_count) FROM ducklake_delete_file WHERE table_id=$tid AND end_snapshot IS NULL),0)")
-  inlined=0
-  for itbl in $(pcat "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE 'ducklake_inlined_data_${tid}\\_%'"); do
-    inlined=$((inlined + $(pcat "SELECT count(*) FROM \"$itbl\" WHERE end_snapshot IS NULL")))
-  done
-  echo $((parquet + inlined))
-}
+SCHEMA_ONLY_TBL="orders_$(date +%H%M%S)"
+schemacount() { lakecount_in "app_e2e" "$SCHEMA_ONLY_TBL"; }
 psrc "CREATE SCHEMA IF NOT EXISTS app_e2e" >/dev/null
-psrc "CREATE TABLE $SCHEMA_TBL(id int PRIMARY KEY, sku text)" >/dev/null
-psrc "INSERT INTO $SCHEMA_TBL SELECT g, 'sku-'||g FROM generate_series(1,100) g" >/dev/null
-wait_for "app_e2e schema 表自动落湖(cdc.$LAKE_SCHEMA_TBL,100 行)" 120 "100" schemacount
-psrc "DROP TABLE IF EXISTS $SCHEMA_TBL" >/dev/null
+psrc "CREATE TABLE app_e2e.$SCHEMA_ONLY_TBL(id int PRIMARY KEY, sku text)" >/dev/null
+psrc "INSERT INTO app_e2e.$SCHEMA_ONLY_TBL SELECT g, 'sku-'||g FROM generate_series(1,100) g" >/dev/null
+wait_for "app_e2e schema 表自动镜像(lake.app_e2e.$SCHEMA_ONLY_TBL,100 行)" 120 "100" schemacount
+psrc "DROP TABLE IF EXISTS app_e2e.$SCHEMA_ONLY_TBL" >/dev/null
 
 echo "── 7. 心跳闭环(空闲 WAL 确认) ──"
 hb=$(psrc "SELECT count(*) FROM dbz_heartbeat")

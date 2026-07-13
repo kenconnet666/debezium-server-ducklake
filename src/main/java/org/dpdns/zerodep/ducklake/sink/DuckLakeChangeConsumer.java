@@ -297,7 +297,8 @@ public class DuckLakeChangeConsumer
      */
     private void insertFromStaging(Connection conn, Segment seg, int idx) throws SQLException {
         TableRef ref = TableRef.parse(seg.topic());
-        String lakeTable = props.getMaintenance().getCdcSchema() + "." + ref.pgSchema() + "_" + ref.table();
+        // 镜像命名:湖 schema = <前缀><pg_schema>,表名原样(lake."my-public".demo / lake.public.demo)
+        String lakeTable = props.getMaintenance().getSchemaPrefix() + ref.pgSchema() + "." + ref.table();
         ensureTable(conn, lakeTable, seg.schema());
 
         List<Field> fields = seg.schema().fields().stream()
@@ -306,7 +307,7 @@ public class DuckLakeChangeConsumer
         String proj = String.join(", ", fields.stream()
                 .map(f -> TypeMapper.castExpr(f.name(), TypeMapper.duckType(f.schema()))).toList());
         String stg = DuckLakeEngine.MEM + ".main.stg_seg_" + idx;
-        String lake = DuckLakeEngine.LAKE + "." + lakeTable;
+        String lake = DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable);
 
         if (seg.keyColumns().isEmpty()) {
             if (noKeyWarned.add(lakeTable)) {
@@ -360,14 +361,14 @@ public class DuckLakeChangeConsumer
         }
     }
 
-    /** 首见建表；schema 出现新字段则 ALTER ADD COLUMN，已有字段类型漂移则按白名单安全放宽
-     *  （与 DDL 信号流的 rename/删列应用幂等互补） */
+    /** 首见建表（湖 schema 一并按需建）；schema 出现新字段则 ALTER ADD COLUMN，
+     *  已有字段类型漂移则按白名单安全放宽（与 DDL 信号流的 rename/删列应用幂等互补） */
     private void ensureTable(Connection conn, String lakeTable, Schema schema) throws SQLException {
         // 类型无法就地转换的表:上一批已标记重建并触发增量快照,本批(干净事务)开头先 DROP,
         // 随后走建表分支按事件 schema 的新类型重建,当批数据正常写入
         if (pendingRebuild.remove(lakeTable)) {
             try (Statement s = conn.createStatement()) {
-                s.execute("DROP TABLE IF EXISTS " + DuckLakeEngine.LAKE + "." + lakeTable);
+                s.execute("DROP TABLE IF EXISTS " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable));
             }
             knownColumns.remove(lakeTable);
             syncState.getDdlApplied().increment();
@@ -375,8 +376,9 @@ public class DuckLakeChangeConsumer
         }
         Map<String, String> cols = knownColumns.get(lakeTable);
         if (cols == null) {
+            String lakeSchema = lakeTable.substring(0, lakeTable.indexOf('.'));
             StringBuilder ddl = new StringBuilder("CREATE TABLE IF NOT EXISTS ")
-                    .append(DuckLakeEngine.LAKE).append('.').append(lakeTable).append(" (");
+                    .append(DuckLakeEngine.LAKE).append('.').append(DuckLakeEngine.quoted(lakeTable)).append(" (");
             // 镜像语义:湖表列=源表列一一对应,unwrap 元列(__op/__lsn/...)只留在 staging 不进湖
             List<Field> fields = schema.fields().stream()
                     .filter(f -> !META_COLS.contains(f.name())).toList();
@@ -386,6 +388,8 @@ public class DuckLakeChangeConsumer
             }
             ddl.append(')');
             try (Statement s = conn.createStatement()) {
+                // 湖 schema 首见按需建(镜像 pg schema,可带前缀;事务回滚会连带回滚,缓存同 knownColumns 一并清)
+                s.execute("CREATE SCHEMA IF NOT EXISTS " + DuckLakeEngine.LAKE + ".\"" + lakeSchema + '"');
                 s.execute(ddl.toString());
             }
             cols = loadColumns(conn, lakeTable);
@@ -400,7 +404,7 @@ public class DuckLakeChangeConsumer
             String have = cols.get(f.name());
             if (have == null) {
                 try (Statement s = conn.createStatement()) {
-                    s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + lakeTable
+                    s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
                             + " ADD COLUMN IF NOT EXISTS \"" + f.name() + "\" " + want);
                 }
                 cols.put(f.name(), want);
@@ -430,7 +434,7 @@ public class DuckLakeChangeConsumer
             return;
         }
         try (Statement s = conn.createStatement()) {
-            s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + lakeTable
+            s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
                     + " ALTER COLUMN \"" + col + "\" SET DATA TYPE " + want);
             cols.put(col, want);
             syncState.getDdlApplied().increment();
@@ -483,14 +487,13 @@ public class DuckLakeChangeConsumer
         }
         String schemaName = lakeTable.substring(0, lakeTable.indexOf('.'));
         String tableName = lakeTable.substring(lakeTable.indexOf('.') + 1);
-        String tmp = tableName + "__typemig";
+        String qTmp = DuckLakeEngine.LAKE + ".\"" + schemaName + "\".\"" + tableName + "__typemig\"";
+        String qTable = DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable);
         try (Statement s = conn.createStatement()) {
-            s.execute("DROP TABLE IF EXISTS " + DuckLakeEngine.LAKE + "." + schemaName + "." + tmp);
-            s.execute("CREATE TABLE " + DuckLakeEngine.LAKE + "." + schemaName + "." + tmp
-                    + " AS SELECT " + proj + " FROM " + DuckLakeEngine.LAKE + "." + lakeTable);
-            s.execute("DROP TABLE " + DuckLakeEngine.LAKE + "." + lakeTable);
-            s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + schemaName + "." + tmp
-                    + " RENAME TO " + tableName);
+            s.execute("DROP TABLE IF EXISTS " + qTmp);
+            s.execute("CREATE TABLE " + qTmp + " AS SELECT " + proj + " FROM " + qTable);
+            s.execute("DROP TABLE " + qTable);
+            s.execute("ALTER TABLE " + qTmp + " RENAME TO \"" + tableName + '"');
         }
         Map<String, String> fresh = loadColumns(conn, lakeTable);
         cols.clear();
@@ -504,8 +507,9 @@ public class DuckLakeChangeConsumer
      * signal 行由连接器内部消费不进变更流；表由维护任务随 DDL 信号表一并 TRUNCATE。
      */
     private void requestIncrementalSnapshot(String lakeTable) {
-        // cdc.public_sys_user → public.sys_user（cdcSchema 前缀去掉后,首个 '_' 即 pg schema 分隔）
-        String pgTable = lakeTable.substring(lakeTable.indexOf('.') + 1).replaceFirst("_", ".");
+        // 镜像命名反向:<前缀><pg_schema>.<表> → <pg_schema>.<表>(剥掉配置前缀)
+        String prefix = props.getMaintenance().getSchemaPrefix();
+        String pgTable = lakeTable.startsWith(prefix) ? lakeTable.substring(prefix.length()) : lakeTable;
         DucklakeProperties.Source src = props.getSource();
         String url = "jdbc:postgresql://%s:%d/%s".formatted(src.getHostname(), src.getPort(), src.getDbname());
         String sql = "INSERT INTO " + src.getSignalTable() + " (id, type, data) VALUES (?, 'execute-snapshot', ?)";

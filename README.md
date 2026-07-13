@@ -15,7 +15,7 @@ PostgreSQL → [DuckLake](https://ducklake.select/) 的流式 CDC 入湖器。**
 
 - **零中间件**：不需要 Kafka / Kafka Connect / Quarkus Debezium Server，一个 Spring Boot 进程搞定采集与写入
 - **当前态镜像**：湖表 = 主库当前态，列一一对应、无任何元数据列——UPDATE 就地更新、DELETE 物理跟随（批量 upsert/delete，merge-on-read），查询直接 `SELECT` 即所见即主库，无需窗口函数去重
-- **默认整库同步**：`FOR ALL TABLES` publication + 不限 schema，存量 initial 快照 + WAL 增量都拉，湖表 `<schema>_<表>` 自动一一对应，新建表自动纳入
+- **默认整库同步**：`FOR ALL TABLES` publication + 不限 schema，存量 initial 快照 + WAL 增量都拉，湖 schema 直接镜像 PG schema（`lake.<schema>.<表>`，可配前缀），新建表自动纳入
 - **高吞吐写入路径**：DuckDB Appender 两阶段写（内存 staging 全 VARCHAR 物化 → 单湖事务按主键批量 DELETE + `INSERT SELECT` 向量化 CAST），实测行成本比 prepared-batch 低两个数量级
 - **自适应双模式**：小批（默认 ≤512 行）走 DuckLake Data Inlining 直写 catalog 元空间（最低延迟、零小文件）；大批自动走 Parquet 向量化直写——按批粒度自动切换，无需干预
 - **DDL 跟随**：源库 `RENAME COLUMN` / `DROP COLUMN` / `DROP TABLE` / **表与列的 `COMMENT` 注释**经 event trigger 审计流同步到湖表；新表建表/加列由事件 schema 驱动，两者幂等互补
@@ -88,13 +88,13 @@ mvn spring-boot:run
 湖表是**主库当前态镜像**：列与源表一一对应（无 `__*` 元数据列），UPDATE 就地更新、DELETE 物理跟随、`DROP TABLE` 跟随删湖表。查询当前态就是普通 `SELECT`：
 
 ```sql
-SELECT * FROM lake.cdc.public_demo;   -- 所见即主库当前态(滞后=复制延迟,毫秒-秒级)
+SELECT * FROM lake.public.demo;   -- 所见即主库当前态(滞后=复制延迟,毫秒-秒级)
 ```
 
 历史版本由 DuckLake snapshot 承担（默认保留 30 天，`maintenance.snapshot-retain-days` 可调）：
 
 ```sql
-SELECT * FROM lake.cdc.public_demo AT (TIMESTAMP '2026-07-12 08:00:00');  -- 时间旅行回看
+SELECT * FROM lake.public.demo AT (TIMESTAMP '2026-07-12 08:00:00');  -- 时间旅行回看
 ```
 
 表/列的 `COMMENT ON` 注释也自动跟随到湖（增量跟随：改造部署后新执行的 COMMENT 会同步；存量注释可重新执行一遍 COMMENT 语句补齐）。
@@ -111,7 +111,7 @@ SELECT * FROM lake.cdc.public_demo AT (TIMESTAMP '2026-07-12 08:00:00');  -- 时
 INSTALL ducklake; LOAD ducklake; INSTALL httpfs; LOAD httpfs;
 CREATE SECRET rfs (TYPE s3, KEY_ID 'admin', SECRET '...', ENDPOINT 'host:9000', URL_STYLE 'path', USE_SSL false);
 ATTACH 'ducklake:postgres:dbname=ducklake_catalog host=... user=... password=...' AS lake (READ_ONLY);
-SELECT count(*) FROM lake.cdc.public_demo;
+SELECT count(*) FROM lake.public.demo;
 ```
 
 建议为分析建独立的只读 PG 角色与 S3 只读凭据。
@@ -125,7 +125,7 @@ SELECT count(*) FROM lake.cdc.public_demo;
 | `source.hostname/port/user/password/dbname` | — | PG 逻辑复制源（集群形态可填 HAProxy 读写口，故障转移自动跟随） |
 | `source.slot-name` | `dbz_ducklake` | 复制槽名 |
 | `source.publication-name` | `dbz_publication` | 发布名（init 脚本建 `FOR ALL TABLES`：整库所有 schema、新建表自动纳入） |
-| `source.schema-include-list` | 空 | **默认整库同步**：空=全部用户 schema（存量 initial 快照 + WAL 增量都拉，湖表 `<schema>_<表>` 自动一一对应）；需收窄填逗号分隔列表 |
+| `source.schema-include-list` | 空 | **默认整库同步**：空=全部用户 schema（存量 initial 快照 + WAL 增量都拉，湖 schema 直接镜像 PG schema（`lake.<schema>.<表>`，可配前缀））；需收窄填逗号分隔列表 |
 | `source.table-exclude-list` | 空 | 排除表（正则，`schema.table` 形式） |
 | `source.signal-table` | `public.dbz_signal` | 增量快照 signal 表（类型重建兜底经它触发） |
 | `lake.catalog-*` | — | DuckLake catalog 的 PG 连接（同时承载 Debezium offset 表） |
@@ -140,6 +140,8 @@ SELECT count(*) FROM lake.cdc.public_demo;
 | `engine.heartbeat-action-query` | 空 | **强烈建议配置**：零流量时唯一能触发 LSN 确认的机制（prod profile 已带默认 UPSERT 语句） |
 | `engine.dry-run` | `false` | 诊断：空转不写湖测纯解码吞吐。⚠️ 生产必须 false（offset 照推进=丢数据） |
 | `maintenance.enabled` | `true` | 湖维护调度总开关 |
+| `maintenance.schema-prefix` | 空 | 湖 schema 前缀：空=纯镜像（源 `public.demo` → 湖 `lake.public.demo`）；多个源库实例共享同一湖时各配前缀隔离（如 `erp-` → `lake."erp-public".demo`） |
+| `maintenance.follow-drop-table` | `true` | 源 DROP TABLE/DROP SCHEMA 跟随真删湖表（false=湖表保留） |
 | `maintenance.follow-drop-column` | `true` | DDL 删列跟随真删（false=湖保留历史列） |
 | `maintenance.follow-type-change` | `true` | 类型严格跟随三级策略 |
 | `maintenance.snapshot-retain-days` | `30` | 快照保留窗口（time travel），过期物理清理 |

@@ -145,8 +145,12 @@ public class DucklakeProperties {
          *  ALTER 直改 → 湖内整表 CAST 重写旧数据 → 删表重建并经 signal 增量快照重拉；
          *  关闭则类型漂移仅告警，湖列保守不动） */
         private boolean followTypeChange = true;
-        /** 湖内 CDC 数据 schema */
-        private String cdcSchema = "cdc";
+        /** 湖 schema 前缀：湖 schema = 前缀 + 源 PG schema（表名原样），默认空 = 纯镜像
+         *  （源 public.demo → 湖 lake.public.demo，查询语感与主库一致）。
+         *  配置前缀（如 "my-"）→ 湖 lake."my-public".demo——多个源库实例共享同一湖 catalog 时
+         *  以不同前缀隔离命名空间（单写者约束是表级的，schema 不同天然不冲突）。
+         *  前缀可含连字符等字符（内部 SQL 已全面引号化） */
+        private String schemaPrefix = "";
         /** DDL 信号源表（PG 侧 event trigger 写入，随 publication 复制过来；阅后即焚，
          *  由维护任务每日 TRUNCATE 防堆积——TRUNCATE 不产生复制事件） */
         private List<String> ddlAuditTables = List.of("sys_ddl_log");

@@ -132,7 +132,7 @@ public class DdlApplier {
             if (lakeTable == null) {
                 return;
             }
-            target = "TABLE " + DuckLakeEngine.LAKE + "." + lakeTable;
+            target = "TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable);
         } else {
             int lastDot = identity.lastIndexOf('.');
             String col = identity.substring(lastDot + 1);
@@ -140,7 +140,7 @@ public class DdlApplier {
             if (lakeTable == null) {
                 return;
             }
-            target = "COLUMN " + DuckLakeEngine.LAKE + "." + lakeTable + ".\"" + col + "\"";
+            target = "COLUMN " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable) + ".\"" + col + "\"";
         }
         try (Statement s = conn.createStatement()) {
             s.execute("COMMENT ON " + target + " IS " + value);
@@ -169,7 +169,7 @@ public class DdlApplier {
                 continue;
             }
             try (Statement s = conn.createStatement()) {
-                s.execute("DROP TABLE IF EXISTS " + DuckLakeEngine.LAKE + "." + lakeTable);
+                s.execute("DROP TABLE IF EXISTS " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable));
             }
             cacheInvalidator.accept(lakeTable);
             syncState.getDdlApplied().increment();
@@ -192,7 +192,7 @@ public class DdlApplier {
         }
         if (columnExists(conn, lakeTable, oldCol) && !columnExists(conn, lakeTable, newCol)) {
             try (Statement s = conn.createStatement()) {
-                s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + lakeTable
+                s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
                         + " RENAME COLUMN \"" + oldCol + "\" TO \"" + newCol + "\"");
             }
             cacheInvalidator.accept(lakeTable);
@@ -220,7 +220,7 @@ public class DdlApplier {
             String lakeTable = lakeTableOf(identity.substring(0, lastDot));
             if (lakeTable != null && columnExists(conn, lakeTable, col)) {
                 try (Statement s = conn.createStatement()) {
-                    s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + lakeTable + " DROP COLUMN \"" + col + "\"");
+                    s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable) + " DROP COLUMN \"" + col + "\"");
                 }
                 cacheInvalidator.accept(lakeTable);
                 syncState.getDdlApplied().increment();
@@ -229,13 +229,13 @@ public class DdlApplier {
         }
     }
 
-    /** public.sys_user → cdc.public_sys_user（与消费者的表命名规则一致） */
+    /** public.sys_user → <前缀>public.sys_user（镜像命名，与消费者的表命名规则一致） */
     private String lakeTableOf(String pgIdentity) {
         String[] parts = pgIdentity.split("\\.");
         if (parts.length < 2) {
             return null;
         }
-        return props.getMaintenance().getCdcSchema() + "." + parts[0] + "_" + parts[1];
+        return props.getMaintenance().getSchemaPrefix() + parts[0] + "." + parts[1];
     }
 
     private boolean columnExists(Connection conn, String lakeTable, String column) throws SQLException {

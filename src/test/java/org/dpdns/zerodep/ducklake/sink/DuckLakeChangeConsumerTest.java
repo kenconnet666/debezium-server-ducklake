@@ -50,10 +50,10 @@ class DuckLakeChangeConsumerTest {
         // 在 USE lake 下解析成 lake.main.x),bench/单测环境必须与生产会话状态一致
         conn = DriverManager.getConnection("jdbc:duckdb::memory:consumer_test");
         try (Statement s = conn.createStatement()) {
-            // 消费者的 SQL 全部以 lake.<schema>.<table> 三段名引用;ATTACH 一个内存库顶名即可
+            // 消费者的 SQL 全部以 lake.<schema>.<table> 三段名引用;ATTACH 一个内存库顶名即可。
+            // 湖 schema 由消费者按需建(镜像 pg schema);public 预建仅供"预置表"类用例直接建表用
             s.execute("ATTACH ':memory:' AS " + DuckLakeEngine.LAKE);
-            s.execute("CREATE SCHEMA lake.cdc");
-            s.execute("CREATE SCHEMA lake.meta");
+            s.execute("CREATE SCHEMA IF NOT EXISTS lake.public");
             s.execute("USE " + DuckLakeEngine.LAKE);
         }
         props = new DucklakeProperties();
@@ -144,14 +144,14 @@ class DuckLakeChangeConsumerTest {
         ), committer());
 
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.cdc.public_t1")) {
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.public.t1")) {
             rs.next();
             assertThat(rs.getLong(1)).as("I-U-D 链终态应为空表").isZero();
         }
         // 湖表列=源表列一一对应,不含任何 __* 元列
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery("SELECT count(*) FROM information_schema.columns "
-                     + "WHERE table_catalog='lake' AND table_name='public_t1' AND column_name LIKE '\\_\\_%' ESCAPE '\\'")) {
+                     + "WHERE table_catalog='lake' AND table_schema='public' AND table_name='t1' AND column_name LIKE '\\_\\_%' ESCAPE '\\'")) {
             rs.next();
             assertThat(rs.getLong(1)).as("湖表不应含元列").isZero();
         }
@@ -159,7 +159,7 @@ class DuckLakeChangeConsumerTest {
         consumer.handleBatch(List.of(rowEvent("zadmin.public.t1", 2, "b", "c", 103)), committer());
         consumer.handleBatch(List.of(rowEvent("zadmin.public.t1", 2, "b9", "u", 104)), committer());
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT count(*), max(name) FROM lake.cdc.public_t1")) {
+             ResultSet rs = s.executeQuery("SELECT count(*), max(name) FROM lake.public.t1")) {
             rs.next();
             assertThat(rs.getLong(1)).isEqualTo(1);
             assertThat(rs.getString(2)).isEqualTo("b9");
@@ -181,7 +181,7 @@ class DuckLakeChangeConsumerTest {
 
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery(
-                     "SELECT count(*), min(name), max(name) FROM lake.cdc.public_t10")) {
+                     "SELECT count(*), min(name), max(name) FROM lake.public.t10")) {
             rs.next();
             assertThat(rs.getLong(1)).isEqualTo(2);
             assertThat(rs.getString(2)).isEqualTo("a2");
@@ -198,7 +198,7 @@ class DuckLakeChangeConsumerTest {
         ), committer());
 
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.cdc.public_t11")) {
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.public.t11")) {
             rs.next();
             assertThat(rs.getLong(1)).as("insert-only:c 行保留,d 墓碑丢弃").isEqualTo(1);
         }
@@ -226,7 +226,7 @@ class DuckLakeChangeConsumerTest {
         ), committer());
 
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT extra FROM lake.cdc.public_t2 ORDER BY id")) {
+             ResultSet rs = s.executeQuery("SELECT extra FROM lake.public.t2 ORDER BY id")) {
             rs.next();
             assertThat((Object) rs.getObject(1)).isNull();   // 旧结构行:新列补 NULL
             rs.next();
@@ -260,9 +260,9 @@ class DuckLakeChangeConsumerTest {
         // 信号被 DdlApplier 消费(计数推进)
         assertThat(syncState.getDdlAudited().count()).isEqualTo(1);
         try (Statement s = conn.createStatement()) {
-            // 没有被当业务表建出 cdc.public_sys_ddl_log
+            // 没有被当业务表建出 public.sys_ddl_log
             try (ResultSet rs = s.executeQuery(
-                    "SELECT count(*) FROM information_schema.tables WHERE table_catalog='lake' AND table_name='public_sys_ddl_log'")) {
+                    "SELECT count(*) FROM information_schema.tables WHERE table_catalog='lake' AND table_schema='public' AND table_name='sys_ddl_log'")) {
                 rs.next();
                 assertThat(rs.getLong(1)).isZero();
             }
@@ -280,13 +280,13 @@ class DuckLakeChangeConsumerTest {
     void staleColumnCacheSelfHealsByRetry() throws Exception {
         consumer.handleBatch(List.of(rowEvent("zadmin.public.t3", 1, "a", "c", 400)), committer());
         try (Statement s = conn.createStatement()) {
-            s.execute("DROP TABLE lake.cdc.public_t3"); // 制造"缓存认为存在、湖里已没有"
+            s.execute("DROP TABLE lake.public.t3"); // 制造"缓存认为存在、湖里已没有"
         }
         consumer.handleBatch(List.of(rowEvent("zadmin.public.t3", 2, "b", "c", 401)), committer());
 
         assertThat(syncState.getBatchFailures().count()).isEqualTo(1); // 失败一次后自愈
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.cdc.public_t3")) {
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.public.t3")) {
             rs.next();
             assertThat(rs.getLong(1)).isEqualTo(1); // 表重建,重试批的行在
         }
@@ -297,19 +297,19 @@ class DuckLakeChangeConsumerTest {
     void typeDriftSelfHealsByStrictFollow() throws Exception {
         consumer.handleBatch(List.of(rowEvent("zadmin.public.t4", 1, "a", "c", 500)), committer());
         try (Statement s = conn.createStatement()) {
-            s.execute("ALTER TABLE lake.cdc.public_t4 ALTER COLUMN id TYPE SMALLINT"); // 制造湖列收窄漂移
+            s.execute("ALTER TABLE lake.public.t4 ALTER COLUMN id TYPE SMALLINT"); // 制造湖列收窄漂移
         }
         // 缓存里 id 仍是 BIGINT,首批直写溢出失败 → 清缓存重试 → 漂移被发现 → ALTER 跟随 → 自愈
         consumer.handleBatch(List.of(rowEvent("zadmin.public.t4", 4_000_000_000L, "big", "c", 501)), committer());
 
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.cdc.public_t4 WHERE id=4000000000")) {
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.public.t4 WHERE id=4000000000")) {
             rs.next();
             assertThat(rs.getLong(1)).isEqualTo(1);
         }
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery("SELECT data_type FROM information_schema.columns "
-                     + "WHERE table_catalog='lake' AND table_name='public_t4' AND column_name='id'")) {
+                     + "WHERE table_catalog='lake' AND table_schema='public' AND table_name='t4' AND column_name='id'")) {
             rs.next();
             assertThat(rs.getString(1)).isEqualTo("BIGINT"); // 列型已严格跟回事件类型
         }
@@ -320,8 +320,8 @@ class DuckLakeChangeConsumerTest {
     void unconvertibleTypeDriftRebuildsTableOnRetry() throws Exception {
         try (Statement s = conn.createStatement()) {
             // 预置"湖列与事件类型不可转"的表:id 是 VARCHAR 且存着非数值(ALTER/CAST 必失败)
-            s.execute("CREATE TABLE lake.cdc.public_t7 (id VARCHAR, name VARCHAR)");
-            s.execute("INSERT INTO lake.cdc.public_t7 VALUES ('abc', 'old')");
+            s.execute("CREATE TABLE lake.public.t7 (id VARCHAR, name VARCHAR)");
+            s.execute("INSERT INTO lake.public.t7 VALUES ('abc', 'old')");
         }
         // 事件 id 为 BIGINT → 漂移 → ALTER 失败 → CAST 重写失败('abc') → 标记重建+signal(源库不可达仅 log)
         // → 本批重试 → 干净事务 DROP 重建 → 当批行按新类型写入
@@ -329,14 +329,14 @@ class DuckLakeChangeConsumerTest {
 
         assertThat(syncState.getBatchFailures().count()).isEqualTo(1); // 首次失败,重试即成功
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT count(*), max(id) FROM lake.cdc.public_t7")) {
+             ResultSet rs = s.executeQuery("SELECT count(*), max(id) FROM lake.public.t7")) {
             rs.next();
             assertThat(rs.getLong(1)).isEqualTo(1);   // 旧数据已让位(由增量快照重灌,单测不覆盖)
             assertThat(rs.getLong(2)).isEqualTo(42L); // 当批行按 BIGINT 写入
         }
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery("SELECT data_type FROM information_schema.columns "
-                     + "WHERE table_catalog='lake' AND table_name='public_t7' AND column_name='id'")) {
+                     + "WHERE table_catalog='lake' AND table_schema='public' AND table_name='t7' AND column_name='id'")) {
             rs.next();
             assertThat(rs.getString(1)).isEqualTo("BIGINT");
         }
@@ -348,8 +348,8 @@ class DuckLakeChangeConsumerTest {
         consumer.handleBatch(List.of(rowEvent("zadmin.public.t5", 1, "a", "c", 600)), committer());
         try (Statement s = conn.createStatement()) {
             // 表被换成同名视图:列集合/类型与事件完全一致(不触发任何跟随),但写入永远失败
-            s.execute("DROP TABLE lake.cdc.public_t5");
-            s.execute("CREATE VIEW lake.cdc.public_t5 AS SELECT 1::BIGINT AS id, 'x' AS name");
+            s.execute("DROP TABLE lake.public.t5");
+            s.execute("CREATE VIEW lake.public.t5 AS SELECT 1::BIGINT AS id, 'x' AS name");
         }
         assertThatThrownBy(() -> consumer.handleBatch(
                 List.of(rowEvent("zadmin.public.t5", 2, "boom", "c", 601)), committer()))
@@ -364,7 +364,7 @@ class DuckLakeChangeConsumerTest {
         consumer.handleBatch(List.of(rowEvent("zadmin.public.t8", 1, null, "c", 800)), committer());
 
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT name, name IS NULL FROM lake.cdc.public_t8")) {
+             ResultSet rs = s.executeQuery("SELECT name, name IS NULL FROM lake.public.t8")) {
             rs.next();
             assertThat(rs.getString(1)).isNull();
             assertThat(rs.getBoolean(2)).isTrue();
@@ -391,5 +391,25 @@ class DuckLakeChangeConsumerTest {
                 .isEqualTo(new DuckLakeChangeConsumer.TableRef("public", "sys_user"));
         assertThat(DuckLakeChangeConsumer.TableRef.parse("prefix.only"))
                 .isEqualTo(new DuckLakeChangeConsumer.TableRef("public", "only"));
+    }
+
+    /** 湖 schema 前缀:多源库实例共享同一湖时以前缀隔离命名空间(含连字符,验证全链引号化) */
+    @Test
+    void schemaPrefixIsolatesLakeNamespace() throws Exception {
+        props.getMaintenance().setSchemaPrefix("my-");
+        try {
+            consumer.handleBatch(List.of(
+                    rowEvent("zadmin.public.t12", 1, "a", "c", 1200),
+                    rowEvent("zadmin.public.t12", 1, "a2", "u", 1201)   // upsert 路径也过引号链
+            ), committer());
+        } finally {
+            props.getMaintenance().setSchemaPrefix("");
+        }
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*), max(name) FROM lake.\"my-public\".t12")) {
+            rs.next();
+            assertThat(rs.getLong(1)).isEqualTo(1);
+            assertThat(rs.getString(2)).isEqualTo("a2");
+        }
     }
 }

@@ -53,7 +53,7 @@ class DdlApplierTest {
         conn = DriverManager.getConnection("jdbc:duckdb:");
         try (Statement s = conn.createStatement()) {
             s.execute("ATTACH ':memory:' AS lake");
-            s.execute("CREATE SCHEMA lake.cdc");
+            s.execute("CREATE SCHEMA lake.public");
         }
     }
 
@@ -95,35 +95,35 @@ class DdlApplierTest {
     @Test
     void trueRenameIsAppliedToLakeTable() throws Exception {
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.cdc.public_r1 (id BIGINT, note VARCHAR)");
+            s.execute("CREATE TABLE lake.public.r1 (id BIGINT, note VARCHAR)");
         }
         // ALTER TABLE + 同事务无 sql_drop + RENAME COLUMN 语句 = 真 rename
         apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.r1",
                 "ALTER TABLE r1 RENAME COLUMN note TO remark", 100)));
 
-        assertThat(columns("public_r1")).containsExactly("id", "remark");
-        assertThat(invalidated).containsExactly("cdc.public_r1");  // 消费者缓存失效回调
+        assertThat(columns("public", "r1")).containsExactly("id", "remark");
+        assertThat(invalidated).containsExactly("public.r1");  // 消费者缓存失效回调
         assertThat(syncState.getDdlApplied().count()).isEqualTo(1);
     }
 
     @Test
     void renameReplayIsIdempotent() throws Exception {
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.cdc.public_r2 (id BIGINT, note VARCHAR)");
+            s.execute("CREATE TABLE lake.public.r2 (id BIGINT, note VARCHAR)");
         }
         List<Struct> run = List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.r2",
                 "ALTER TABLE r2 RENAME COLUMN note TO remark", 110));
         apply(run);
         apply(run); // 快照重放同一 DDL:旧列已不存在 → 安全跳过
 
-        assertThat(columns("public_r2")).containsExactly("id", "remark");
+        assertThat(columns("public", "r2")).containsExactly("id", "remark");
         assertThat(syncState.getDdlApplied().count()).isEqualTo(1); // 只应用了一次
     }
 
     @Test
     void dropAddIsNotMisjudgedAsRenameAndFollowsDropByDefault() throws Exception {
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.cdc.public_r3 (id BIGINT, note VARCHAR)");
+            s.execute("CREATE TABLE lake.public.r3 (id BIGINT, note VARCHAR)");
         }
         // DROP COLUMN + ADD COLUMN(同 xid 有 sql_drop):不做 rename;followDropColumn 默认 true → 跟随真删
         apply(List.of(
@@ -132,8 +132,8 @@ class DdlApplierTest {
                 row("sql_drop", "ALTER TABLE", "table column", "public.r3.note",
                         "ALTER TABLE r3 DROP COLUMN note, ADD COLUMN remark text", 120)));
 
-        assertThat(columns("public_r3")).containsExactly("id"); // note 已跟删;remark 由数据驱动 ensureTable 建
-        assertThat(invalidated).containsExactly("cdc.public_r3");
+        assertThat(columns("public", "r3")).containsExactly("id"); // note 已跟删;remark 由数据驱动 ensureTable 建
+        assertThat(invalidated).containsExactly("public.r3");
         assertThat(syncState.getDdlApplied().count()).isEqualTo(1);
     }
 
@@ -141,7 +141,7 @@ class DdlApplierTest {
     void followDropColumnDisabledKeepsHistoricalColumn() throws Exception {
         props.getMaintenance().setFollowDropColumn(false);
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.cdc.public_r4 (id BIGINT, legacy VARCHAR)");
+            s.execute("CREATE TABLE lake.public.r4 (id BIGINT, legacy VARCHAR)");
         }
         apply(List.of(
                 row("ddl_command_end", "ALTER TABLE", "table", "public.r4",
@@ -149,7 +149,7 @@ class DdlApplierTest {
                 row("sql_drop", "ALTER TABLE", "table column", "public.r4.legacy",
                         "ALTER TABLE r4 DROP COLUMN legacy", 130)));
 
-        assertThat(columns("public_r4")).containsExactly("id", "legacy"); // 历史列保留,新行该列 NULL
+        assertThat(columns("public", "r4")).containsExactly("id", "legacy"); // 历史列保留,新行该列 NULL
         assertThat(syncState.getDdlApplied().count()).isZero();
     }
 
@@ -157,12 +157,12 @@ class DdlApplierTest {
     void tombstoneEventsAreIgnored() throws Exception {
         // 信号表被 DELETE 清理产生的墓碑(__op=d)不得当作 DDL 信号重放(常规清理走 TRUNCATE 无事件)
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.cdc.public_r5 (id BIGINT, note VARCHAR)");
+            s.execute("CREATE TABLE lake.public.r5 (id BIGINT, note VARCHAR)");
         }
         apply(List.of(rowWithOp("ddl_command_end", "ALTER TABLE", "table", "public.r5",
                 "ALTER TABLE r5 RENAME COLUMN note TO remark", 140, "d")));
 
-        assertThat(columns("public_r5")).containsExactly("id", "note"); // 未被重放
+        assertThat(columns("public", "r5")).containsExactly("id", "note"); // 未被重放
         assertThat(syncState.getDdlApplied().count()).isZero();
         assertThat(syncState.getDdlAudited().count()).isZero(); // 墓碑不计入信号消费数
     }
@@ -179,29 +179,30 @@ class DdlApplierTest {
     @Test
     void dropTableFollowsToLakeByDefault() throws Exception {
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.cdc.public_r6 (id BIGINT)");
+            s.execute("CREATE TABLE lake.public.r6 (id BIGINT)");
         }
         // 真实 PG 行为:DROP 命令不出现在 pg_event_trigger_ddl_commands(),审计流只有 sql_drop 行
         apply(List.of(row("sql_drop", "DROP TABLE", "table", "public.r6", "DROP TABLE r6", 160)));
 
-        assertThat(tableExists("public_r6")).isFalse();
-        assertThat(invalidated).containsExactly("cdc.public_r6");
+        assertThat(tableExists("public", "r6")).isFalse();
+        assertThat(invalidated).containsExactly("public.r6");
         assertThat(syncState.getDdlApplied().count()).isEqualTo(1);
     }
 
     @Test
     void dropSchemaCascadeFollowsEveryTable() throws Exception {
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.cdc.app_o1 (id BIGINT)");
-            s.execute("CREATE TABLE lake.cdc.app_o2 (id BIGINT)");
+            s.execute("CREATE SCHEMA IF NOT EXISTS lake.app");
+            s.execute("CREATE TABLE lake.app.o1 (id BIGINT)");
+            s.execute("CREATE TABLE lake.app.o2 (id BIGINT)");
         }
         // DROP SCHEMA app CASCADE:级联的每张表各有一条 sql_drop table 行(tg_tag='DROP SCHEMA')
         apply(List.of(
                 row("sql_drop", "DROP SCHEMA", "table", "app.o1", "DROP SCHEMA app CASCADE", 165),
                 row("sql_drop", "DROP SCHEMA", "table", "app.o2", "DROP SCHEMA app CASCADE", 165)));
 
-        assertThat(tableExists("app_o1")).isFalse();
-        assertThat(tableExists("app_o2")).isFalse();
+        assertThat(tableExists("app", "o1")).isFalse();
+        assertThat(tableExists("app", "o2")).isFalse();
         assertThat(syncState.getDdlApplied().count()).isEqualTo(2);
     }
 
@@ -209,11 +210,11 @@ class DdlApplierTest {
     void dropTableDisabledKeepsLakeTable() throws Exception {
         props.getMaintenance().setFollowDropTable(false);
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.cdc.public_r7 (id BIGINT)");
+            s.execute("CREATE TABLE lake.public.r7 (id BIGINT)");
         }
         apply(List.of(row("sql_drop", "DROP TABLE", "table", "public.r7", "DROP TABLE r7", 170)));
 
-        assertThat(tableExists("public_r7")).isTrue(); // followDropTable=false:湖表保留
+        assertThat(tableExists("public", "r7")).isTrue(); // followDropTable=false:湖表保留
         assertThat(syncState.getDdlApplied().count()).isZero();
     }
 
@@ -221,18 +222,18 @@ class DdlApplierTest {
     void snapshotReplayedDropTableIsSkipped() throws Exception {
         // 快照重放(op='r')的历史 DROP 不得删活表:快照=当前态,表存在说明后来又被重建
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.cdc.public_r8 (id BIGINT)");
+            s.execute("CREATE TABLE lake.public.r8 (id BIGINT)");
         }
         apply(List.of(rowWithOp("sql_drop", "DROP TABLE", "table", "public.r8", "DROP TABLE r8", 180, "r")));
 
-        assertThat(tableExists("public_r8")).isTrue();
+        assertThat(tableExists("public", "r8")).isTrue();
         assertThat(syncState.getDdlApplied().count()).isZero();
     }
 
     @Test
     void commentOnTableAndColumnFollowsToLake() throws Exception {
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.cdc.public_r9 (id BIGINT, note VARCHAR)");
+            s.execute("CREATE TABLE lake.public.r9 (id BIGINT, note VARCHAR)");
         }
         apply(List.of(
                 row("ddl_command_end", "COMMENT", "table", "public.r9",
@@ -241,13 +242,13 @@ class DdlApplierTest {
                         "COMMENT ON COLUMN r9.note IS '备注''引号'", 191)));
 
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT comment FROM duckdb_tables() WHERE database_name='lake' AND table_name='public_r9'")) {
+                "SELECT comment FROM duckdb_tables() WHERE database_name='lake' AND schema_name='public' AND table_name='r9'")) {
             rs.next();
             assertThat(rs.getString(1)).isEqualTo("测试表");
         }
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
                 "SELECT comment FROM duckdb_columns() WHERE database_name='lake' "
-                        + "AND table_name='public_r9' AND column_name='note'")) {
+                        + "AND schema_name='public' AND table_name='r9' AND column_name='note'")) {
             rs.next();
             assertThat(rs.getString(1)).isEqualTo("备注'引号"); // '' 转义原样搬运
         }
@@ -267,11 +268,11 @@ class DdlApplierTest {
 
     // ---------- 工具 ----------
 
-    private static List<String> columns(String table) throws SQLException {
+    private static List<String> columns(String schema, String table) throws SQLException {
         List<String> cols = new ArrayList<>();
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
                 "SELECT column_name FROM information_schema.columns " +
-                        "WHERE table_catalog='lake' AND table_schema='cdc' AND table_name='" + table + "' ORDER BY ordinal_position")) {
+                        "WHERE table_catalog='lake' AND table_schema='" + schema + "' AND table_name='" + table + "' ORDER BY ordinal_position")) {
             while (rs.next()) {
                 cols.add(rs.getString(1));
             }
@@ -279,10 +280,10 @@ class DdlApplierTest {
         return cols;
     }
 
-    private static boolean tableExists(String table) throws SQLException {
+    private static boolean tableExists(String schema, String table) throws SQLException {
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
                 "SELECT count(*) FROM information_schema.tables " +
-                        "WHERE table_catalog='lake' AND table_schema='cdc' AND table_name='" + table + "'")) {
+                        "WHERE table_catalog='lake' AND table_schema='" + schema + "' AND table_name='" + table + "'")) {
             rs.next();
             return rs.getLong(1) > 0;
         }

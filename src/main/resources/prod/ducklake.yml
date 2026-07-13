@@ -33,3 +33,6 @@ ducklake:
     heartbeat-action-query: ${DUCKLAKE_HEARTBEAT_QUERY:INSERT INTO public.dbz_heartbeat (id, ts) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET ts = now()}
   maintenance:
     enabled: true
+    # 湖 schema 前缀:空(默认)=纯镜像(源 public.demo → 湖 lake.public.demo);
+    # 多源库实例共享同一湖 catalog 时各配不同前缀隔离(如 "erp-" → lake."erp-public".demo)
+    schema-prefix: ${DUCKLAKE_SCHEMA_PREFIX:}

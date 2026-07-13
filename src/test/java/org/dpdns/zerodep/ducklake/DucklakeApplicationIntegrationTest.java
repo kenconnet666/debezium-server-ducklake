@@ -118,7 +118,7 @@ class DucklakeApplicationIntegrationTest {
             s.execute("ALTER TABLE cdc_test REPLICA IDENTITY FULL");
             s.execute("INSERT INTO cdc_test (name, amount) VALUES ('alpha', 10.50), ('beta', 20.00), ('gamma', 99.99)");
 
-            // 非 public schema:默认整库同步下应自动捕获并映射为湖表 cdc.app_orders(快照+增量)
+            // 非 public schema:默认整库同步下应自动捕获并映射为湖表 app.orders(快照+增量)
             s.execute("CREATE SCHEMA app");
             s.execute("CREATE TABLE app.orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
                     + "sku text NOT NULL, qty int DEFAULT 1)");
@@ -159,9 +159,9 @@ class DucklakeApplicationIntegrationTest {
     @Order(1)
     void snapshotLandsInLake() {
         await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() -> {
-            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test")).isEqualTo(3L);
+            assertThat(lakeCount("SELECT count(*) FROM public.cdc_test")).isEqualTo(3L);
             // 默认整库:非 public schema 的存量随 initial 快照自动落湖,湖表名 <schema>_<表>
-            assertThat(lakeCount("SELECT count(*) FROM cdc.app_orders")).isEqualTo(2L);
+            assertThat(lakeCount("SELECT count(*) FROM app.orders")).isEqualTo(2L);
         });
         assertThat(syncState.getEngineRunning().get()).isEqualTo(1);
     }
@@ -176,15 +176,15 @@ class DucklakeApplicationIntegrationTest {
             s.execute("UPDATE cdc_test SET amount = 43.42 WHERE name = 'it_insert'");
         }
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
-            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='it_insert'")).isEqualTo(1L);
-            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='it_insert' AND amount=43.42")).isEqualTo(1L);
+            assertThat(lakeCount("SELECT count(*) FROM public.cdc_test WHERE name='it_insert'")).isEqualTo(1L);
+            assertThat(lakeCount("SELECT count(*) FROM public.cdc_test WHERE name='it_insert' AND amount=43.42")).isEqualTo(1L);
         });
         try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
              Statement s = c.createStatement()) {
             s.execute("DELETE FROM cdc_test WHERE name = 'it_insert'");
         }
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
-                assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='it_insert'")).isZero());
+                assertThat(lakeCount("SELECT count(*) FROM public.cdc_test WHERE name='it_insert'")).isZero());
         // 湖表列与源表一一对应,不含 __* 元列
         assertThat(lakeColumnType("__op")).isNull();
         assertThat(lakeColumnType("__deleted")).isNull();
@@ -201,7 +201,7 @@ class DucklakeApplicationIntegrationTest {
         }
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
             assertThat(lakeColumnType("price")).isNotNull();
-            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='after_rename'")).isEqualTo(1L);
+            assertThat(lakeCount("SELECT count(*) FROM public.cdc_test WHERE name='after_rename'")).isEqualTo(1L);
         });
 
         // ② DROP COLUMN → 湖列跟随真删(followDropColumn 默认 true)
@@ -211,7 +211,7 @@ class DucklakeApplicationIntegrationTest {
             s.execute("INSERT INTO cdc_test (name, price) VALUES ('after_dropcol', 1.00)");
         }
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
-            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='after_dropcol'")).isEqualTo(1L);
+            assertThat(lakeCount("SELECT count(*) FROM public.cdc_test WHERE name='after_dropcol'")).isEqualTo(1L);
             assertThat(lakeColumnType("big_content")).isNull();
         });
 
@@ -231,7 +231,7 @@ class DucklakeApplicationIntegrationTest {
         }
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
             assertThat(lakeColumnType("hits")).isEqualTo("BIGINT");
-            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE hits=4000000000")).isEqualTo(1L);
+            assertThat(lakeCount("SELECT count(*) FROM public.cdc_test WHERE hits=4000000000")).isEqualTo(1L);
         });
 
         // ④ COMMENT 跟随:表/列注释同步到湖(DuckLake catalog 持久化)
@@ -242,10 +242,10 @@ class DucklakeApplicationIntegrationTest {
         }
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
             assertThat(engine.queryScalar("SELECT comment FROM duckdb_tables() "
-                    + "WHERE database_name='lake' AND table_name='public_cdc_test'", String.class))
+                    + "WHERE database_name='lake' AND schema_name='public' AND table_name='cdc_test'", String.class))
                     .isEqualTo("集成测试表");
             assertThat(engine.queryScalar("SELECT comment FROM duckdb_columns() "
-                    + "WHERE database_name='lake' AND table_name='public_cdc_test' AND column_name='name'", String.class))
+                    + "WHERE database_name='lake' AND schema_name='public' AND table_name='cdc_test' AND column_name='name'", String.class))
                     .isEqualTo("名称");
         });
     }
@@ -257,20 +257,20 @@ class DucklakeApplicationIntegrationTest {
         boolean prev = propsEnabled(true);
         try {
             // 两轮 flush 制造多个 parquet 文件,再全量归并
-            long rows0 = lakeCount("SELECT count(*) FROM cdc.public_cdc_test");
+            long rows0 = lakeCount("SELECT count(*) FROM public.cdc_test");
             maintenanceJobs.quick();
             try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
                  Statement s = c.createStatement()) {
                 s.execute("INSERT INTO cdc_test (name, price) VALUES ('merge_probe', 9.99)");
             }
             await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
-                    assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='merge_probe'")).isEqualTo(1L));
+                    assertThat(lakeCount("SELECT count(*) FROM public.cdc_test WHERE name='merge_probe'")).isEqualTo(1L));
             maintenanceJobs.quick();
 
             long filesBefore = catalogFileCount();
             maintenanceJobs.fullMerge();
             long filesAfter = catalogFileCount();
-            long rowsAfter = lakeCount("SELECT count(*) FROM cdc.public_cdc_test");
+            long rowsAfter = lakeCount("SELECT count(*) FROM public.cdc_test");
 
             assertThat(rowsAfter).isEqualTo(rows0 + 1);          // 行数无损
             assertThat(filesAfter).isLessThanOrEqualTo(filesBefore); // 文件收敛(或已最优)
@@ -316,7 +316,7 @@ class DucklakeApplicationIntegrationTest {
             s.execute("INSERT INTO app.orders (sku, qty) VALUES ('sku-live', 5)");
         }
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() ->
-                assertThat(lakeCount("SELECT count(*) FROM cdc.app_orders WHERE sku='sku-live'")).isEqualTo(1L));
+                assertThat(lakeCount("SELECT count(*) FROM app.orders WHERE sku='sku-live'")).isEqualTo(1L));
     }
 
     @Test
@@ -330,7 +330,7 @@ class DucklakeApplicationIntegrationTest {
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() ->
                 assertThat(engine.queryScalar(
                         "SELECT count(*) FROM information_schema.tables "
-                                + "WHERE table_catalog='lake' AND table_schema='cdc' AND table_name='app_orders'",
+                                + "WHERE table_catalog='lake' AND table_schema='app' AND table_name='orders'",
                         Long.class)).isZero());
     }
 
@@ -338,10 +338,10 @@ class DucklakeApplicationIntegrationTest {
         return engine.queryScalar(sql, Long.class);
     }
 
-    /** 湖表 public_cdc_test 指定列的 data_type(列不存在返回 null) */
+    /** 湖表 public.cdc_test 指定列的 data_type(列不存在返回 null) */
     private String lakeColumnType(String column) throws Exception {
         return engine.queryScalar("SELECT data_type FROM information_schema.columns "
-                + "WHERE table_catalog='lake' AND table_name='public_cdc_test' AND column_name='" + column + "'",
+                + "WHERE table_catalog='lake' AND table_schema='public' AND table_name='cdc_test' AND column_name='" + column + "'",
                 String.class);
     }
 }
