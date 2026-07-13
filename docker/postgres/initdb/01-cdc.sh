@@ -71,7 +71,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-'
     CREATE EVENT TRIGGER trg_capture_ddl ON ddl_command_end
         WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'DROP TABLE') EXECUTE FUNCTION fn_capture_ddl();
     CREATE EVENT TRIGGER trg_capture_drop ON sql_drop
-        WHEN TAG IN ('ALTER TABLE', 'DROP TABLE') EXECUTE FUNCTION fn_capture_drop();
+        WHEN TAG IN ('ALTER TABLE', 'DROP TABLE', 'DROP SCHEMA') EXECUTE FUNCTION fn_capture_drop();
 
     GRANT TRUNCATE ON public.sys_ddl_log TO dbuser_cdc;
 

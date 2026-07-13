@@ -138,6 +138,9 @@ public class DucklakeProperties {
         private int snapshotRetainDays = 30;
         /** DDL 信号流里跟随删除湖列（默认 true=跟随真删；false=保留历史列，新行 NULL） */
         private boolean followDropColumn = true;
+        /** DDL 信号流里跟随源库 DROP TABLE 真删湖表（默认 true=镜像语义；false=湖表保留。
+         *  真删后时间旅行窗口内旧 snapshot 仍可 AT (TIMESTAMP ...) 回看该表） */
+        private boolean followDropTable = true;
         /** 数据驱动的类型严格跟随（源库 ALTER COLUMN TYPE 后湖列类型严格对齐，逐级执行：
          *  ALTER 直改 → 湖内整表 CAST 重写旧数据 → 删表重建并经 signal 增量快照重拉；
          *  关闭则类型漂移仅告警，湖列保守不动） */

@@ -28,20 +28,24 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * CDC 批消费者：Debezium 事件 → DuckLake append。
+ * CDC 批消费者：Debezium 事件 → DuckLake 当前态镜像（批量 upsert/delete）。
  * <p>
  * 核心约定：
  * <ul>
  *   <li><b>有序段合并（ordered run coalescing）</b>：严格按事件到达顺序处理，只把"连续同表同结构"
- *       的事件合并成一个 INSERT 批——不做全批按表分组，从而保证 DDL 与前后 DML 的先后语义
+ *       的事件合并成一个应用批——不做全批按表分组，从而保证 DDL 与前后 DML 的先后语义
  *       （单槽复制流按事务提交序全局有序）。</li>
  *   <li><b>单批一个湖事务</b>：整个 handleBatch 在一个 DuckDB 事务里，失败整体回滚并抛出，
- *       引擎按 at-least-once 重投同一批；重复投递靠 __lsn 幂等（查询层窗口函数按 __lsn 取最新）。</li>
- *   <li><b>append 变更流</b>：不做 MERGE（DuckLake 无主键约束、delete file 有读放大），
- *       DELETE 以 __deleted='true' 的整行墓碑落湖；当前态由查询层
- *       row_number() OVER (PARTITION BY id ORDER BY __lsn DESC) 取。</li>
- *   <li><b>建表/加列由事件 schema 驱动</b>（含 unwrap 追加的 __op/__deleted/__lsn/__source_ts_ms/__db/__table 列）；
- *       rename 语义由 DDL 审计流（{@link DdlApplier}）补齐——两者幂等互补。</li>
+ *       引擎按 at-least-once 重投同一批；重放天然幂等（同一批再 upsert 一遍结果一致）。</li>
+ *   <li><b>镜像语义</b>：湖表 = 主库当前态，列与源表一一对应（不落任何 __* 元列）。
+ *       每段两步 SQL：先按主键 DELETE 本段涉及的行（merge-on-read position delete），
+ *       再 INSERT 段内每个主键的最后版本（墓碑除外）——UPDATE/DELETE 物理跟随，
+ *       查询层直接 SELECT 即当前态，无需窗口函数去重。时间旅行由 DuckLake snapshot
+ *       独立提供（保留期内可 AT (TIMESTAMP ...) 回看，不影响默认查询）。</li>
+ *   <li><b>无主键表降级 insert-only</b>：Debezium 事件无 key 时（源表无 PK）湖侧无法定位行，
+ *       UPDATE/DELETE 不跟随（每表告警一次）——PG 逻辑复制本就要求有 PK 的表才有完整语义。</li>
+ *   <li><b>建表/加列由事件 schema 驱动</b>（unwrap 元列剥离后）；rename 语义由 DDL 审计流
+ *       （{@link DdlApplier}）补齐——两者幂等互补。</li>
  * </ul>
  */
 @Slf4j
@@ -55,8 +59,14 @@ public class DuckLakeChangeConsumer
     private final DdlApplier ddlApplier;
     private final SyncState syncState;
 
+    /** unwrap SMT 追加的元列（staging 工作列，不进湖表；见 DebeziumEngineRunner 的 add.fields） */
+    static final Set<String> META_COLS = Set.of("__op", "__table", "__lsn", "__db", "__source_ts_ms", "__deleted");
+
     /** 已确保存在的湖表 → 已知列及其类型（避免每批 DESCRIBE；类型用于漂移检测与安全放宽） */
     private final Map<String, Map<String, String>> knownColumns = new HashMap<>();
+
+    /** 无主键已告警的湖表（降级 insert-only 每表只提示一次） */
+    private final Set<String> noKeyWarned = new HashSet<>();
 
     /** 类型漂移已告警的 表.列（followTypeChange=false 时每列只告警一次，防高频批刷屏） */
     private final Set<String> typeDriftWarned = new HashSet<>();
@@ -103,7 +113,7 @@ public class DuckLakeChangeConsumer
         }
         // 有限重试吸收湖端瞬时故障（rustfs 抖动/catalog PG 切主）；写入已整批回滚，重做安全。
         // 全部失败才抛出 → 引擎致命退出 → Runner 回调让进程退出 → 容器重启后从上个 offset 重放
-        // （at-least-once，查询层按 __lsn 幂等去重）。data=剥离心跳后的数据事件
+        // （at-least-once，镜像 upsert 天然幂等：重放同批=先删后插同样结果）。data=剥离心跳后的数据事件
         long deliveredAt = System.currentTimeMillis();
         // 诊断:空转模式只确认不写湖,测纯解码+交付吞吐——定位吞吐天花板是解码瓶颈还是写侧瓶颈
         if (props.getEngine().isDryRun()) {
@@ -151,8 +161,9 @@ public class DuckLakeChangeConsumer
                 stats.stageMs(), stats.lakeTxMs());
     }
 
-    /** 一个连续段：同表同结构的事件序列（段边界 = 换表或换结构） */
-    private record Segment(String topic, Schema schema, List<Struct> rows) {
+    /** 一个连续段：同表同结构的事件序列（段边界 = 换表或换结构）；keyColumns=Debezium key
+     *  的列名（源表主键，同表恒定，取段首事件即可；空=无主键表，降级 insert-only） */
+    private record Segment(String topic, Schema schema, List<String> keyColumns, List<Struct> rows) {
     }
 
     /** 单次成功写批的水位与分段耗时（deliver 滞后由调用方以交付时刻减 maxSourceTs 得出） */
@@ -175,12 +186,13 @@ public class DuckLakeChangeConsumer
      */
     private WriteStats writeBatchInTx(Connection conn, List<ChangeEvent<SourceRecord, SourceRecord>> records) throws SQLException {
         long t0 = System.currentTimeMillis();
-        // ---- 切段（连续同表同结构），顺带收集水位 ----
+        // ---- 切段（连续同表同结构），顺带收集水位与主键列 ----
         List<Segment> segments = new ArrayList<>();
         long maxSourceTs = 0;
         List<Struct> run = new ArrayList<>();
         String runTopic = null;
         Schema runSchema = null;
+        List<String> runKeys = List.of();
         for (ChangeEvent<SourceRecord, SourceRecord> event : records) {
             SourceRecord record = event.value();
             if (record.value() == null) {
@@ -189,8 +201,11 @@ public class DuckLakeChangeConsumer
             Struct value = (Struct) record.value();
             String topic = record.topic();
             if (runTopic != null && (!runTopic.equals(topic) || runSchema != value.schema())) {
-                segments.add(new Segment(runTopic, runSchema, List.copyOf(run)));
+                segments.add(new Segment(runTopic, runSchema, runKeys, List.copyOf(run)));
                 run.clear();
+            }
+            if (run.isEmpty()) {
+                runKeys = keyColumnsOf(record);
             }
             runTopic = topic;
             runSchema = value.schema();
@@ -202,7 +217,7 @@ public class DuckLakeChangeConsumer
             }
         }
         if (!run.isEmpty()) {
-            segments.add(new Segment(runTopic, runSchema, List.copyOf(run)));
+            segments.add(new Segment(runTopic, runSchema, runKeys, List.copyOf(run)));
         }
 
         // ---- 阶段一：湖事务外，数据段物化到 main.stg_seg_<i> ----
@@ -274,21 +289,64 @@ public class DuckLakeChangeConsumer
         }
     }
 
-    /** 阶段二：staging → 湖表（湖事务内；CAST 投影由 TypeMapper 编码规则配对生成） */
+    /**
+     * 阶段二：staging → 湖表镜像应用（湖事务内，两步 SQL）：
+     * ① 按主键 DELETE 本段涉及的全部行（c 事件空命中幂等；重放=先删旧版本再插，upsert 语义）
+     * ② INSERT 段内每个主键的最后版本（QUALIFY 按 __lsn 取批内终态；__deleted 墓碑不插）
+     * 无主键段（keyColumns 空）降级 insert-only：跳过①，②不去重不滤墓碑无从谈起——仅插非墓碑行。
+     */
     private void insertFromStaging(Connection conn, Segment seg, int idx) throws SQLException {
         TableRef ref = TableRef.parse(seg.topic());
         String lakeTable = props.getMaintenance().getCdcSchema() + "." + ref.pgSchema() + "_" + ref.table();
         ensureTable(conn, lakeTable, seg.schema());
 
-        List<Field> fields = seg.schema().fields();
+        List<Field> fields = seg.schema().fields().stream()
+                .filter(f -> !META_COLS.contains(f.name())).toList();
         String cols = String.join(", ", fields.stream().map(f -> '"' + f.name() + '"').toList());
         String proj = String.join(", ", fields.stream()
                 .map(f -> TypeMapper.castExpr(f.name(), TypeMapper.duckType(f.schema()))).toList());
-        try (Statement s = conn.createStatement()) {
-            s.execute("INSERT INTO " + DuckLakeEngine.LAKE + "." + lakeTable + " (" + cols + ") "
-                    + "SELECT " + proj + " FROM " + DuckLakeEngine.MEM + ".main.stg_seg_" + idx);
+        String stg = DuckLakeEngine.MEM + ".main.stg_seg_" + idx;
+        String lake = DuckLakeEngine.LAKE + "." + lakeTable;
+
+        if (seg.keyColumns().isEmpty()) {
+            if (noKeyWarned.add(lakeTable)) {
+                log.warn("源表无主键,湖侧降级 insert-only(UPDATE/DELETE 不跟随): {}", lakeTable);
+            }
+            try (Statement s = conn.createStatement()) {
+                s.execute("INSERT INTO " + lake + " (" + cols + ") SELECT " + proj + " FROM " + stg
+                        + " WHERE COALESCE(\"__deleted\", 'false') <> 'true'");
+            }
+            return;
         }
-        log.debug("append {} rows -> {}", seg.rows().size(), lakeTable);
+
+        // key 匹配条件:staging 全 VARCHAR,按湖列类型 CAST 后与湖行比较(编码由 TypeMapper 配对保真)
+        String keyMatch = String.join(" AND ", seg.keyColumns().stream()
+                .map(k -> "t.\"" + k + "\" = " + castKey("s", k, seg.schema())).toList());
+        String partition = String.join(", ", seg.keyColumns().stream().map(k -> '"' + k + '"').toList());
+        try (Statement s = conn.createStatement()) {
+            s.execute("DELETE FROM " + lake + " t WHERE EXISTS (SELECT 1 FROM " + stg + " s WHERE " + keyMatch + ")");
+            s.execute("INSERT INTO " + lake + " (" + cols + ") SELECT " + proj + " FROM ("
+                    + "SELECT * FROM " + stg
+                    + " QUALIFY row_number() OVER (PARTITION BY " + partition
+                    + " ORDER BY CAST(\"__lsn\" AS BIGINT) DESC NULLS LAST) = 1"
+                    + ") WHERE COALESCE(\"__deleted\", 'false') <> 'true'");
+        }
+        log.debug("mirror {} rows -> {}", seg.rows().size(), lakeTable);
+    }
+
+    /** staging 的 key 列按湖类型 CAST（类型取自 value schema 同名字段） */
+    private static String castKey(String alias, String col, Schema valueSchema) {
+        Field f = valueSchema.field(col);
+        String type = f != null ? TypeMapper.duckType(f.schema()) : "VARCHAR";
+        return "CAST(" + alias + ".\"" + col + "\" AS " + type + ")";
+    }
+
+    /** Debezium key struct 的列名（源表主键）；无 key（无 PK 表）返回空 */
+    private static List<String> keyColumnsOf(SourceRecord record) {
+        if (record.key() instanceof Struct k) {
+            return k.schema().fields().stream().map(Field::name).toList();
+        }
+        return List.of();
     }
 
     /** staging 清理（事务外 best-effort；内存 instance 的表，进程重启自然消失） */
@@ -319,7 +377,9 @@ public class DuckLakeChangeConsumer
         if (cols == null) {
             StringBuilder ddl = new StringBuilder("CREATE TABLE IF NOT EXISTS ")
                     .append(DuckLakeEngine.LAKE).append('.').append(lakeTable).append(" (");
-            List<Field> fields = schema.fields();
+            // 镜像语义:湖表列=源表列一一对应,unwrap 元列(__op/__lsn/...)只留在 staging 不进湖
+            List<Field> fields = schema.fields().stream()
+                    .filter(f -> !META_COLS.contains(f.name())).toList();
             for (int i = 0; i < fields.size(); i++) {
                 Field f = fields.get(i);
                 ddl.append(i > 0 ? ", " : "").append('"').append(f.name()).append("\" ").append(TypeMapper.duckType(f.schema()));
@@ -333,6 +393,9 @@ public class DuckLakeChangeConsumer
             log.info("湖表就绪: {} ({} 列)", lakeTable, cols.size());
         }
         for (Field f : schema.fields()) {
+            if (META_COLS.contains(f.name())) {
+                continue;
+            }
             String want = TypeMapper.duckType(f.schema());
             String have = cols.get(f.name());
             if (have == null) {
@@ -403,7 +466,9 @@ public class DuckLakeChangeConsumer
                                        Map<String, String> cols) throws SQLException {
         Map<String, String> want = new LinkedHashMap<>();
         for (Field f : schema.fields()) {
-            want.put(f.name(), TypeMapper.duckType(f.schema()));
+            if (!META_COLS.contains(f.name())) {
+                want.put(f.name(), TypeMapper.duckType(f.schema()));
+            }
         }
         StringBuilder proj = new StringBuilder();
         for (Map.Entry<String, String> c : cols.entrySet()) {

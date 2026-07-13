@@ -88,8 +88,24 @@ class DuckLakeChangeConsumerTest {
             .field("__source_ts_ms", Schema.OPTIONAL_INT64_SCHEMA)
             .build();
 
+    private static final Schema KEY_SCHEMA = SchemaBuilder.struct().name("t1.Key")
+            .field("id", Schema.INT64_SCHEMA)
+            .build();
+
+    /** 带主键 key 的常规事件（源表有 PK 的正常形态） */
     private static ChangeEvent<SourceRecord, SourceRecord> rowEvent(String topic, long id, String name,
                                                                     String op, long lsn) {
+        Struct v = new Struct(ROW_SCHEMA)
+                .put("id", id).put("name", name).put("__op", op)
+                .put("__deleted", "d".equals(op) ? "true" : "false")
+                .put("__lsn", lsn).put("__source_ts_ms", 1_783_000_000_000L + lsn);
+        Struct k = new Struct(KEY_SCHEMA).put("id", id);
+        return event(new SourceRecord(Map.of(), Map.of(), topic, KEY_SCHEMA, k, ROW_SCHEMA, v));
+    }
+
+    /** 无 key 事件（源表无 PK）——湖侧应降级 insert-only */
+    private static ChangeEvent<SourceRecord, SourceRecord> rowEventNoKey(String topic, long id, String name,
+                                                                         String op, long lsn) {
         Struct v = new Struct(ROW_SCHEMA)
                 .put("id", id).put("name", name).put("__op", op)
                 .put("__deleted", "d".equals(op) ? "true" : "false")
@@ -119,7 +135,8 @@ class DuckLakeChangeConsumerTest {
     // ---------- 用例 ----------
 
     @Test
-    void createsTableOnFirstSightAndAppendsTombstoneChain() throws Exception {
+    void mirrorsInsertUpdateDeleteToCurrentState() throws Exception {
+        // 批内 I→U→D 链:镜像语义下终态=行不存在(批内按 __lsn 取最后版本,墓碑不插)
         consumer.handleBatch(List.of(
                 rowEvent("zadmin.public.t1", 1, "a", "c", 100),
                 rowEvent("zadmin.public.t1", 1, "a2", "u", 101),
@@ -127,18 +144,64 @@ class DuckLakeChangeConsumerTest {
         ), committer());
 
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT __op, __deleted, name FROM lake.cdc.public_t1 ORDER BY __lsn")) {
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.cdc.public_t1")) {
             rs.next();
-            assertThat(rs.getString(1)).isEqualTo("c");
-            rs.next();
-            assertThat(rs.getString(1)).isEqualTo("u");
-            rs.next();
-            assertThat(List.of(rs.getString(1), rs.getString(2), rs.getString(3)))
-                    .containsExactly("d", "true", "a2"); // 墓碑保留整行旧值
-            assertThat(rs.next()).isFalse();
+            assertThat(rs.getLong(1)).as("I-U-D 链终态应为空表").isZero();
         }
-        // 水位线推进到本批最大源提交时刻
-        assertThat(syncState.getLastSourceTsMs().get()).isEqualTo(1_783_000_000_000L + 102);
+        // 湖表列=源表列一一对应,不含任何 __* 元列
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM information_schema.columns "
+                     + "WHERE table_catalog='lake' AND table_name='public_t1' AND column_name LIKE '\\_\\_%' ESCAPE '\\'")) {
+            rs.next();
+            assertThat(rs.getLong(1)).as("湖表不应含元列").isZero();
+        }
+        // 跨批 UPDATE:值就地更新,行数不变
+        consumer.handleBatch(List.of(rowEvent("zadmin.public.t1", 2, "b", "c", 103)), committer());
+        consumer.handleBatch(List.of(rowEvent("zadmin.public.t1", 2, "b9", "u", 104)), committer());
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*), max(name) FROM lake.cdc.public_t1")) {
+            rs.next();
+            assertThat(rs.getLong(1)).isEqualTo(1);
+            assertThat(rs.getString(2)).isEqualTo("b9");
+        }
+        // 水位线推进到最大源提交时刻
+        assertThat(syncState.getLastSourceTsMs().get()).isEqualTo(1_783_000_000_000L + 104);
+    }
+
+    /** at-least-once 重放:同一批再处理一遍,结果与处理一遍完全一致(upsert 幂等) */
+    @Test
+    void replayingSameBatchIsIdempotent() throws Exception {
+        List<ChangeEvent<SourceRecord, SourceRecord>> batch = List.of(
+                rowEvent("zadmin.public.t10", 1, "a", "c", 100),
+                rowEvent("zadmin.public.t10", 2, "b", "c", 101),
+                rowEvent("zadmin.public.t10", 1, "a2", "u", 102)
+        );
+        consumer.handleBatch(batch, committer());
+        consumer.handleBatch(batch, committer()); // 重放
+
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery(
+                     "SELECT count(*), min(name), max(name) FROM lake.cdc.public_t10")) {
+            rs.next();
+            assertThat(rs.getLong(1)).isEqualTo(2);
+            assertThat(rs.getString(2)).isEqualTo("a2");
+            assertThat(rs.getString(3)).isEqualTo("b");
+        }
+    }
+
+    /** 源表无主键(事件无 key):降级 insert-only,UPDATE/DELETE 不跟随(墓碑丢弃) */
+    @Test
+    void noKeyTableDegradesToInsertOnly() throws Exception {
+        consumer.handleBatch(List.of(
+                rowEventNoKey("zadmin.public.t11", 1, "a", "c", 100),
+                rowEventNoKey("zadmin.public.t11", 1, "a", "d", 101)  // 无 key 无从定位,墓碑丢弃
+        ), committer());
+
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.cdc.public_t11")) {
+            rs.next();
+            assertThat(rs.getLong(1)).as("insert-only:c 行保留,d 墓碑丢弃").isEqualTo(1);
+        }
     }
 
     @Test
@@ -163,7 +226,7 @@ class DuckLakeChangeConsumerTest {
         ), committer());
 
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT extra FROM lake.cdc.public_t2 ORDER BY __lsn")) {
+             ResultSet rs = s.executeQuery("SELECT extra FROM lake.cdc.public_t2 ORDER BY id")) {
             rs.next();
             assertThat((Object) rs.getObject(1)).isNull();   // 旧结构行:新列补 NULL
             rs.next();
@@ -257,9 +320,8 @@ class DuckLakeChangeConsumerTest {
     void unconvertibleTypeDriftRebuildsTableOnRetry() throws Exception {
         try (Statement s = conn.createStatement()) {
             // 预置"湖列与事件类型不可转"的表:id 是 VARCHAR 且存着非数值(ALTER/CAST 必失败)
-            s.execute("CREATE TABLE lake.cdc.public_t7 (id VARCHAR, name VARCHAR, __op VARCHAR, "
-                    + "__deleted VARCHAR, __lsn BIGINT, __source_ts_ms BIGINT)");
-            s.execute("INSERT INTO lake.cdc.public_t7 VALUES ('abc', 'old', 'c', 'false', 1, 1)");
+            s.execute("CREATE TABLE lake.cdc.public_t7 (id VARCHAR, name VARCHAR)");
+            s.execute("INSERT INTO lake.cdc.public_t7 VALUES ('abc', 'old')");
         }
         // 事件 id 为 BIGINT → 漂移 → ALTER 失败 → CAST 重写失败('abc') → 标记重建+signal(源库不可达仅 log)
         // → 本批重试 → 干净事务 DROP 重建 → 当批行按新类型写入
@@ -285,10 +347,9 @@ class DuckLakeChangeConsumerTest {
     void persistentSqlFailureGivesUpAfterThreeAttempts() throws Exception {
         consumer.handleBatch(List.of(rowEvent("zadmin.public.t5", 1, "a", "c", 600)), committer());
         try (Statement s = conn.createStatement()) {
-            // 表被换成同名视图:列集合/类型与事件完全一致(不触发任何跟随),但 INSERT 永远失败
+            // 表被换成同名视图:列集合/类型与事件完全一致(不触发任何跟随),但写入永远失败
             s.execute("DROP TABLE lake.cdc.public_t5");
-            s.execute("CREATE VIEW lake.cdc.public_t5 AS SELECT 1::BIGINT AS id, 'x' AS name, "
-                    + "'c' AS __op, 'false' AS __deleted, 1::BIGINT AS __lsn, 1::BIGINT AS __source_ts_ms");
+            s.execute("CREATE VIEW lake.cdc.public_t5 AS SELECT 1::BIGINT AS id, 'x' AS name");
         }
         assertThatThrownBy(() -> consumer.handleBatch(
                 List.of(rowEvent("zadmin.public.t5", 2, "boom", "c", 601)), committer()))

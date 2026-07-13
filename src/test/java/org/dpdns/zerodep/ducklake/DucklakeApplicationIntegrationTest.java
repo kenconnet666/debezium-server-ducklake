@@ -111,7 +111,7 @@ class DucklakeApplicationIntegrationTest {
             s.execute("CREATE EVENT TRIGGER trg_capture_ddl ON ddl_command_end "
                     + "WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'DROP TABLE') EXECUTE FUNCTION fn_capture_ddl()");
             s.execute("CREATE EVENT TRIGGER trg_capture_drop ON sql_drop "
-                    + "WHEN TAG IN ('ALTER TABLE', 'DROP TABLE') EXECUTE FUNCTION fn_capture_drop()");
+                    + "WHEN TAG IN ('ALTER TABLE', 'DROP TABLE', 'DROP SCHEMA') EXECUTE FUNCTION fn_capture_drop()");
 
             s.execute("CREATE TABLE cdc_test (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
                     + "name text NOT NULL, big_content text, amount numeric(12,2) DEFAULT 0)");
@@ -168,18 +168,26 @@ class DucklakeApplicationIntegrationTest {
 
     @Test
     @Order(2)
-    void streamingInsertUpdateDeleteProduceTombstoneChain() throws Exception {
+    void streamingInsertUpdateDeleteMirrorsCurrentState() throws Exception {
+        // 镜像语义:UPDATE 就地更新值,DELETE 物理跟随——湖=主库当前态,无墓碑无多版本
         try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
              Statement s = c.createStatement()) {
             s.execute("INSERT INTO cdc_test (name, amount) VALUES ('it_insert', 42.42)");
             s.execute("UPDATE cdc_test SET amount = 43.42 WHERE name = 'it_insert'");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='it_insert'")).isEqualTo(1L);
+            assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='it_insert' AND amount=43.42")).isEqualTo(1L);
+        });
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
             s.execute("DELETE FROM cdc_test WHERE name = 'it_insert'");
         }
-        // c → u → d 三事件全落湖,DELETE 是 __deleted='true' 的整行墓碑
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
-                assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='it_insert'")).isEqualTo(3L));
-        assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='it_insert' AND __deleted='true' AND __op='d'"))
-                .isEqualTo(1L);
+                assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE name='it_insert'")).isZero());
+        // 湖表列与源表一一对应,不含 __* 元列
+        assertThat(lakeColumnType("__op")).isNull();
+        assertThat(lakeColumnType("__deleted")).isNull();
     }
 
     @Test
@@ -294,6 +302,21 @@ class DucklakeApplicationIntegrationTest {
         }
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() ->
                 assertThat(lakeCount("SELECT count(*) FROM cdc.app_orders WHERE sku='sku-live'")).isEqualTo(1L));
+    }
+
+    @Test
+    @Order(7)
+    void dropTableFollowsToLake() throws Exception {
+        // 镜像语义:源 DROP TABLE → 湖表真删(followDropTable 默认 true)
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("DROP TABLE app.orders");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() ->
+                assertThat(engine.queryScalar(
+                        "SELECT count(*) FROM information_schema.tables "
+                                + "WHERE table_catalog='lake' AND table_schema='cdc' AND table_name='app_orders'",
+                        Long.class)).isZero());
     }
 
     private Long lakeCount(String sql) throws Exception {

@@ -14,13 +14,16 @@ PostgreSQL → [DuckLake](https://ducklake.select/) 的流式 CDC 入湖器。**
 ## 特性
 
 - **零中间件**：不需要 Kafka / Kafka Connect / Quarkus Debezium Server，一个 Spring Boot 进程搞定采集与写入
-- **高吞吐写入路径**：DuckDB Appender 两阶段写（内存 staging 全 VARCHAR 物化 → 单湖事务 `INSERT SELECT` 向量化 CAST），实测行成本比 prepared-batch 低两个数量级
+- **当前态镜像**：湖表 = 主库当前态，列一一对应、无任何元数据列——UPDATE 就地更新、DELETE 物理跟随（批量 upsert/delete，merge-on-read），查询直接 `SELECT` 即所见即主库，无需窗口函数去重
+- **默认整库同步**：`FOR ALL TABLES` publication + 不限 schema，存量 initial 快照 + WAL 增量都拉，湖表 `<schema>_<表>` 自动一一对应，新建表自动纳入
+- **高吞吐写入路径**：DuckDB Appender 两阶段写（内存 staging 全 VARCHAR 物化 → 单湖事务按主键批量 DELETE + `INSERT SELECT` 向量化 CAST），实测行成本比 prepared-batch 低两个数量级
 - **自适应双模式**：小批（默认 ≤512 行）走 DuckLake Data Inlining 直写 catalog 元空间（最低延迟、零小文件）；大批自动走 Parquet 向量化直写——按批粒度自动切换，无需干预
-- **DDL 跟随**：源库 `RENAME COLUMN` / `DROP COLUMN` 经 event trigger 审计流同步到湖表；新表建表/加列由事件 schema 驱动，两者幂等互补
+- **DDL 跟随**：源库 `RENAME COLUMN` / `DROP COLUMN` / `DROP TABLE` 经 event trigger 审计流同步到湖表；新表建表/加列由事件 schema 驱动，两者幂等互补
 - **类型严格跟随**：源库 `ALTER COLUMN TYPE` 后湖列逐级对齐（就地 ALTER → 整表 CAST 重写 → 删表重建 + 增量快照重灌兜底）
-- **可靠性**：at-least-once 语义——湖事务提交成功后才推进 offset，崩溃/断电重启自动从上个 offset 重放；重复行由查询层 `__lsn` 窗口函数天然去重（实测多轮 kill -9 后源湖行数精确一致）
+- **时间旅行**：DuckLake snapshot 独立提供（默认保留 30 天）——湖是当前态镜像，但保留期内任意时刻可 `AT (TIMESTAMP ...)` 回看，误删有后悔窗口
+- **可靠性**：at-least-once 语义——湖事务提交成功后才推进 offset，崩溃/断电重启自动从上个 offset 重放；镜像 upsert 天然幂等（重放同批=同样结果）
 - **空闲 WAL 防护**：心跳 action query 闭环，防止 publication 空闲时复制槽无限扣留实例级 WAL
-- **湖内维护**：四级分层压实（防写放大的关键设计）、快照过期清理、inlined 数据定时落盘，全部进程内调度
+- **湖内维护**：分层压实（防写放大的关键设计）、快照过期清理、inlined 数据定时落盘，全部进程内调度
 - **可观测**：`/watermark` 水位线接口（湖侧权威提交时刻 + 源事件时刻 + 分段延迟）、Prometheus 指标（`ducklake_*` 系列）
 
 ## 快速开始
@@ -82,16 +85,21 @@ mvn spring-boot:run
 
 ## 数据语义（重要）
 
-湖表是 **append-only 变更流**，不做 MERGE。每行附带元数据列：`__op`（c/u/d/r）、`__deleted`、`__lsn`、`__source_ts_ms`、`__db`、`__table`。DELETE 以 `__deleted='true'` 的整行墓碑落湖。
-
-**查询当前态**用窗口函数按主键取最新版本（这是 CDC 语义的固有部分，同时天然吸收 at-least-once 重放的重复行）：
+湖表是**主库当前态镜像**：列与源表一一对应（无 `__*` 元数据列），UPDATE 就地更新、DELETE 物理跟随、`DROP TABLE` 跟随删湖表。查询当前态就是普通 `SELECT`：
 
 ```sql
-SELECT * FROM (
-  SELECT *, row_number() OVER (PARTITION BY id ORDER BY __lsn DESC) AS rn
-  FROM lake.cdc.public_demo
-) WHERE rn = 1 AND __deleted <> 'true';
+SELECT * FROM lake.cdc.public_demo;   -- 所见即主库当前态(滞后=复制延迟,毫秒-秒级)
 ```
+
+历史版本由 DuckLake snapshot 承担（默认保留 30 天，`maintenance.snapshot-retain-days` 可调）：
+
+```sql
+SELECT * FROM lake.cdc.public_demo AT (TIMESTAMP '2026-07-12 08:00:00');  -- 时间旅行回看
+```
+
+两个语义边界：
+- **无主键表降级 insert-only**：Debezium 事件无 key 时湖侧无法定位行，UPDATE/DELETE 不跟随（PG 逻辑复制本就要求有主键才有完整语义）
+- **源 `TRUNCATE` 暂不跟随**（Debezium 默认跳过 truncate 事件且 unwrap SMT 会丢弃它）——需要清空请用 `DELETE FROM`，或源 TRUNCATE 后到湖侧手动同步
 
 ### 只读查询湖
 
@@ -190,23 +198,42 @@ DuckDB 的 Parquet writer 按 row group 容量**预分配**列缓冲（与实际
 | 空闲期 `pg_wal` 稳步增长 | 零流量时连接器无事件可确认、slot 冻结扣留实例级 WAL。配 `heartbeat-action-query`（心跳表 UPSERT）闭环；只配 interval 不够 |
 | OOM crash loop | `lake.memory-limit` 与容器限额不匹配，或 threads 调大没给内存。按内存预算公式配 |
 | 湖里查不到刚写的数据 | 小批走了 Data Inlining 在 catalog 元空间，属正常——查询照常可见；物理落盘由 quick 任务定时 flush |
-| 重启后行数多了 | offset flush 间隔（默认 10s）内的批被重放，at-least-once 正常行为；当前态查询用 `__lsn` 窗口函数不受影响 |
-| 源表 DROP 后同名重建 | 湖表保留历史行（不跟随 DROP TABLE）；旧列可能"复活"，查询层用 `coalesce(新列,旧列)` 兼容 |
+| 崩溃重启后短暂"回退" | offset flush 间隔（默认 10s)内的批被按序重放（at-least-once），重放期间中间态短暂回退、追平后与主库一致；镜像 upsert 幂等，不会产生重复行 |
+| 无主键表 UPDATE/DELETE 没跟随 | 设计降级：事件无 key 无法定位湖行，insert-only（日志有每表一次的 WARN）。给源表加主键即恢复完整镜像 |
+| 源 TRUNCATE 后湖没清空 | TRUNCATE 事件暂不跟随（见数据语义节）；用 `DELETE FROM` 替代或湖侧手动清 |
 
 ## 性能参考
 
-8C16G all-in-one 测试环境（PG 集群与本服务同机）实测：
+8C16G 单机 Docker Compose 全家桶实测（源 PG、元空间 PG、rustfs、本服务**同机**——即本仓一键体验栈原样；`docker/bench.sh` 四阶段与 `docker/bench-matrix.sh` 参数矩阵可在你的环境一键复现）：
 
-- 端到端持续吞吐 **~25k 行/秒**（宽行表，含 Debezium 解码全链）；瓶颈在 pgoutput 单槽解码（dry-run 纯解码 ~31k），写侧能力 ~91k 有 3 倍余量
-- 空闲首条端到端延迟 ~毫秒级（`poll-interval-ms` + 单批写入耗时）
-- 100 万行积压追赶 ~40s；kill -9 崩溃恢复后源湖行数精确一致
+- **积压追赶吞吐 ~22k 行/秒**（停消费灌 100 万行再启动，两点法测消费速率，~100B/行）——100 万行积压 ~45s 追平
+- **纯解码地板 ~29k 行/秒**（dry-run 空转不写湖）——端到端已达解码地板的 ~77%，**瓶颈在 pgoutput 单槽解码 + 单机 CPU 总量**，写湖侧只占小头
+- **稳态分段延迟**（~2k 行/秒持续流）：batchLag（事件产生→落湖提交）p50 617ms / p95 813ms；分段 deliverLag p50 339ms、stage 14ms、lakeTx p50 252ms（镜像 upsert 的按键 DELETE + INSERT 两步落在 lakeTx 段）
+- **空闲单行端到端 ~280ms**（排空后单行 INSERT 到落湖提交）
+- **追赶期资源峰值**：CPU ~614%（8 核的 77%）、内存 845MiB / 3GiB 限额
+- 崩溃恢复：kill/重启后从上个 offset 按序重放，镜像 upsert 幂等，源湖当前态精确一致
 
-对典型业务 CDC 增量（几百-几千行/秒）有 1-2 个数量级余量。
+对典型业务 CDC 增量（几百-几千行/秒）有 1-2 个数量级余量。参考：append-only 旧写路径同环境追赶 ~26.7k 行/秒——镜像语义（查询即当前态、免视图免去重）的代价约 **-16% 吞吐、+0.4s 稳态延迟**，对分析湖场景完全值得。
+
+### 调参指南（单变量矩阵实测）
+
+吞吐对参数**不敏感**——各组均在基线 ±8% 内（瓶颈在解码侧），**默认参数即最优区**：
+
+| 参数 | 默认 | 矩阵结论 |
+|---|---|---|
+| `engine.max-batch-size` | 8192 | 32768 约 +8% 吞吐，但毒丸批重放粒度 ×4，不值得改默认；超大积压追赶可临时调大 |
+| `lake.threads` | 2 | 4 约 +6%（单机全家桶 CPU 已饱和，收益边际）；独立部署且内存充足可试 4 |
+| `engine.record-processing-threads` | -1（=核数） | 窄行负载下与单线程持平（SMT 本身轻）；宽行/高流量才是它的设计场景，保持默认 |
+| `lake.data-inlining-row-limit` | 512 | 关闭（0）对追赶 +3%（噪声级）；保留 512 换小批低延迟与零小文件 |
+| `engine.poll-interval-ms` | 10 | 调 1ms 无感知收益（空闲延迟主导项是单批写入耗时），保持默认 |
+| `lake.memory-limit` | 1536MB | 与容器限额联动（预算公式见部署节）；过小 OOM crash loop |
 
 ## 局限
 
 - **单表吞吐上限 ≈ 单槽解码能力**（pgoutput 串行解码是架构固有），需要更高聚合吞吐时可按表分片多实例（每实例独立 slot/publication），但注意每个 walsender 都全量解码 WAL 的 N× 读放大
-- DuckLake 无主键约束，当前态语义由查询层窗口函数承担
+- **镜像是当前态不是备份**：主库误删会忠实同步到湖（时间旅行窗口内可 `AT (TIMESTAMP ...)` 找回，过期即不可）；备份职责在 PG 侧（basebackup/WAL 归档）
+- 无主键表降级 insert-only（UPDATE/DELETE 不跟随）；源 `TRUNCATE` 暂不跟随
+- UPDATE/DELETE 密集负载会产生较多 delete file（merge-on-read 读放大），由分层压实定期吸收
 - `numeric` 的 NaN/Infinity 值无法通过 Debezium 的 BigDecimal 转换（上游限制）
 
 ## License

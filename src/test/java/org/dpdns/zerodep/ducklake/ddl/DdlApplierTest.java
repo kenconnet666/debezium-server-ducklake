@@ -176,6 +176,59 @@ class DdlApplierTest {
         assertThat(invalidated).isEmpty();
     }
 
+    @Test
+    void dropTableFollowsToLakeByDefault() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE lake.cdc.public_r6 (id BIGINT)");
+        }
+        // 真实 PG 行为:DROP 命令不出现在 pg_event_trigger_ddl_commands(),审计流只有 sql_drop 行
+        apply(List.of(row("sql_drop", "DROP TABLE", "table", "public.r6", "DROP TABLE r6", 160)));
+
+        assertThat(tableExists("public_r6")).isFalse();
+        assertThat(invalidated).containsExactly("cdc.public_r6");
+        assertThat(syncState.getDdlApplied().count()).isEqualTo(1);
+    }
+
+    @Test
+    void dropSchemaCascadeFollowsEveryTable() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE lake.cdc.app_o1 (id BIGINT)");
+            s.execute("CREATE TABLE lake.cdc.app_o2 (id BIGINT)");
+        }
+        // DROP SCHEMA app CASCADE:级联的每张表各有一条 sql_drop table 行(tg_tag='DROP SCHEMA')
+        apply(List.of(
+                row("sql_drop", "DROP SCHEMA", "table", "app.o1", "DROP SCHEMA app CASCADE", 165),
+                row("sql_drop", "DROP SCHEMA", "table", "app.o2", "DROP SCHEMA app CASCADE", 165)));
+
+        assertThat(tableExists("app_o1")).isFalse();
+        assertThat(tableExists("app_o2")).isFalse();
+        assertThat(syncState.getDdlApplied().count()).isEqualTo(2);
+    }
+
+    @Test
+    void dropTableDisabledKeepsLakeTable() throws Exception {
+        props.getMaintenance().setFollowDropTable(false);
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE lake.cdc.public_r7 (id BIGINT)");
+        }
+        apply(List.of(row("sql_drop", "DROP TABLE", "table", "public.r7", "DROP TABLE r7", 170)));
+
+        assertThat(tableExists("public_r7")).isTrue(); // followDropTable=false:湖表保留
+        assertThat(syncState.getDdlApplied().count()).isZero();
+    }
+
+    @Test
+    void snapshotReplayedDropTableIsSkipped() throws Exception {
+        // 快照重放(op='r')的历史 DROP 不得删活表:快照=当前态,表存在说明后来又被重建
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE lake.cdc.public_r8 (id BIGINT)");
+        }
+        apply(List.of(rowWithOp("sql_drop", "DROP TABLE", "table", "public.r8", "DROP TABLE r8", 180, "r")));
+
+        assertThat(tableExists("public_r8")).isTrue();
+        assertThat(syncState.getDdlApplied().count()).isZero();
+    }
+
     // ---------- 工具 ----------
 
     private static List<String> columns(String table) throws SQLException {
@@ -188,5 +241,14 @@ class DdlApplierTest {
             }
         }
         return cols;
+    }
+
+    private static boolean tableExists(String table) throws SQLException {
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT count(*) FROM information_schema.tables " +
+                        "WHERE table_catalog='lake' AND table_schema='cdc' AND table_name='" + table + "'")) {
+            rs.next();
+            return rs.getLong(1) > 0;
+        }
     }
 }

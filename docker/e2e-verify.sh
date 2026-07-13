@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # 栈端到端冒烟验证:在部署机 docker/ 目录内执行 bash e2e-verify.sh
 # 断言链:全容器健康 → 建表插数落湖 → UPDATE/DELETE 流转 → DDL 加列跟随 → 心跳闭环
-# 自建唯一名测试表(t_e2e_<时分秒>),不碰业务对象;可重复执行(每轮全新表,湖侧不受
-# 上一轮残留影响;湖侧旧测试表留档是 DROP 跟随的设计行为,体验栈可忽略)。
-# 断言口径 = 湖侧事件行数:本服务写湖是 append-only 事件流(UPDATE 追加新版本、DELETE
-# 追加 __op='d' 墓碑行,分析层按 __lsn 去重),因此期望值是事件累计而非净行数:
-#   事件行数 = Σ活跃 data_file.record_count + 活跃 inlined 行
-# (flush_inlined_data 每 5 分钟把 inlined 转 parquet,两分量互补守恒;
+# 自建唯一名测试表(t_e2e_<时分秒>),不碰业务对象;可重复执行(每轮全新表;尾部 DROP
+# 源表后湖表随 DROP 跟随一并消失)。
+# 断言口径 = 湖侧当前态行数(镜像语义:UPDATE 就地更新,DELETE 物理跟随,湖=主库当前态):
+#   当前行数 = Σ活跃 data_file.record_count − Σ活跃 delete_file.delete_count + 活跃 inlined 行
+# 本脚本聚合前两分量于 data_file 净值(delete file 由 DuckLake merge-on-read 语义计入),
+# 实现细节:直接数活跃 data 行减 delete 行,加 inlined 活跃行。
+# (flush_inlined_data 每 5 分钟把 inlined 转 parquet,分量互补守恒;
 #  ducklake_table_stats.record_count 是近似统计,不作断言口径)
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -25,7 +26,8 @@ lakecount() {
   local tid parquet inlined itbl
   tid=$(pcat "SELECT table_id FROM ducklake_table WHERE table_name='$LAKE_TBL' AND end_snapshot IS NULL")
   [ -z "$tid" ] && { echo "<none>"; return; }
-  parquet=$(pcat "SELECT COALESCE(sum(record_count),0) FROM ducklake_data_file WHERE table_id=$tid AND end_snapshot IS NULL")
+  parquet=$(pcat "SELECT COALESCE((SELECT sum(record_count) FROM ducklake_data_file WHERE table_id=$tid AND end_snapshot IS NULL),0)
+                       - COALESCE((SELECT sum(delete_count) FROM ducklake_delete_file WHERE table_id=$tid AND end_snapshot IS NULL),0)")
   # inlined 表按 schema 版本分代(ducklake_inlined_data_<tid>_<版本>),DDL 变更开新代——全代求和
   inlined=0
   for itbl in $(pcat "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE 'ducklake_inlined_data_${tid}\\_%'"); do
@@ -76,18 +78,18 @@ echo "── 3. INSERT 落湖(测试表 $TBL) ──"
 psrc "CREATE TABLE $TBL(id int PRIMARY KEY, name text, val numeric(12,2), created timestamptz DEFAULT now())" >/dev/null
 psrc "ALTER TABLE $TBL REPLICA IDENTITY FULL" >/dev/null
 psrc "INSERT INTO $TBL(id,name,val) SELECT g, 'row-'||g, g*1.5 FROM generate_series(1,1000) g" >/dev/null
-wait_for "1000 行 INSERT 落湖(事件 1000)" 120 "1000" lakecount
+wait_for "1000 行 INSERT 落湖(当前态 1000)" 120 "1000" lakecount
 
-echo "── 4. UPDATE/DELETE 流转 ──"
+echo "── 4. UPDATE/DELETE 镜像跟随 ──"
 psrc "UPDATE $TBL SET val = val + 100 WHERE id <= 100" >/dev/null
 psrc "DELETE FROM $TBL WHERE id > 950" >/dev/null
-wait_for "UPDATE 100 + DELETE 50 到达(事件 1150,含墓碑)" 120 "1150" lakecount
+wait_for "UPDATE 就地更新+DELETE 物理跟随(当前态 950)" 120 "950" lakecount
 
 echo "── 5. DDL 加列跟随 ──"
 psrc "ALTER TABLE $TBL ADD COLUMN note text" >/dev/null
 psrc "INSERT INTO $TBL(id,name,val,note) VALUES (2001,'ddl-probe',1.0,'new-col')" >/dev/null
 wait_for "湖表出现 note 列(DDL 审计流跟随)" 120 "1" hascol
-wait_for "新列行落湖(事件 1151)" 60 "1151" lakecount
+wait_for "新列行落湖(当前态 951)" 60 "951" lakecount
 
 echo "── 6. 非 public schema 自动对应(默认整库同步) ──"
 SCHEMA_TBL="app_e2e.orders_$(date +%H%M%S)"
@@ -97,7 +99,8 @@ schemacount() {
   tid=$(pcat "SELECT table_id FROM ducklake_table WHERE table_name='$LAKE_SCHEMA_TBL' AND end_snapshot IS NULL")
   [ -z "$tid" ] && { echo "<none>"; return; }
   local parquet inlined itbl
-  parquet=$(pcat "SELECT COALESCE(sum(record_count),0) FROM ducklake_data_file WHERE table_id=$tid AND end_snapshot IS NULL")
+  parquet=$(pcat "SELECT COALESCE((SELECT sum(record_count) FROM ducklake_data_file WHERE table_id=$tid AND end_snapshot IS NULL),0)
+                       - COALESCE((SELECT sum(delete_count) FROM ducklake_delete_file WHERE table_id=$tid AND end_snapshot IS NULL),0)")
   inlined=0
   for itbl in $(pcat "SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE 'ducklake_inlined_data_${tid}\\_%'"); do
     inlined=$((inlined + $(pcat "SELECT count(*) FROM \"$itbl\" WHERE end_snapshot IS NULL")))
@@ -127,7 +130,7 @@ if [ "${errs:-0}" = "0" ]; then ok "ducklake 日志无 ERROR"; else
   docker compose logs ducklake 2>/dev/null | grep ' ERROR ' | head -3
 fi
 
-# 清理源库测试表(湖侧对应表按 DROP 跟随策略留档,不影响后续轮次)
+# 清理源库测试表(镜像语义:湖侧对应表随 DROP 跟随一并删除)
 psrc "DROP TABLE IF EXISTS $TBL" >/dev/null
 
 echo

@@ -31,8 +31,9 @@ import java.util.regex.Pattern;
  * ALTER TABLE ... RENAME COLUMN（这是数据驱动 schema 演进做不到、必须靠 DDL 信号补齐的唯一动作）。
  * <p>
  * 其余跟随分工：加列与类型安全放宽交给数据驱动 ensureTable 幂等处理；删列默认跟随真删
- * （followDropColumn=false 时保留湖列留历史）；建表延迟到首批数据；快照重放旧 DDL 时
- * 靠"列存在性检查"天然幂等。
+ * （followDropColumn=false 时保留湖列留历史）；DROP TABLE 默认跟随真删湖表
+ * （followDropTable=false 时湖表保留；快照重放的历史 DROP 一律跳过——快照给的是当前态，
+ * 活表不能被历史 DDL 误删）；建表延迟到首批数据；快照重放旧 DDL 时靠"列存在性检查"天然幂等。
  */
 @Slf4j
 @Component
@@ -65,13 +66,23 @@ public class DdlApplier {
         }
         syncState.getDdlAudited().increment(signals.size());
 
-        // 按源事务 xid 分组（同一条 ALTER 产生的 ddl_command_end 与 sql_drop 共享 xid）
+        // 按源事务 xid 分组（同一条 ALTER 产生的 ddl_command_end 与 sql_drop 共享 xid）。
+        // 已知边界:分组只在单批内做,同事务两行被批边界劈开时(截断事务中间,低概率)
+        // hasDrop 误判为 false→删列跟随静默跳过(集成测试偶发复现);湖列多留无数据
+        // 正确性影响,下一次同表 DDL 或人工 ALTER 可补齐,故不为此引入跨批配对缓存
         Map<Long, List<Struct>> byXid = new LinkedHashMap<>();
         for (Struct row : signals) {
             byXid.computeIfAbsent(asLong(row, "xid"), k -> new ArrayList<>()).add(row);
         }
 
         for (Map.Entry<Long, List<Struct>> group : byXid.entrySet()) {
+            // 镜像语义:源 DROP TABLE/DROP SCHEMA CASCADE → 湖表真删(时间旅行窗口内旧 snapshot
+            // 仍可回看)。⚠️ DROP 命令不出现在 pg_event_trigger_ddl_commands() 里(PG 语义,
+            // 集成测试实测踩坑)——审计流只有 sql_drop 行,跟随必须由 sql_drop 行自身触发,
+            // 不能挂在下面的 ddl_command_end 循环
+            if (props.getMaintenance().isFollowDropTable()) {
+                applyDropTables(conn, group.getValue(), cacheInvalidator);
+            }
             boolean hasDrop = group.getValue().stream()
                     .anyMatch(r -> "sql_drop".equals(str(r, "ev")));
             for (Struct row : group.getValue()) {
@@ -85,9 +96,35 @@ public class DdlApplier {
                 } else if ("ALTER TABLE".equals(tag) && hasDrop && props.getMaintenance().isFollowDropColumn()) {
                     applyDropColumns(conn, group.getValue(), cacheInvalidator);
                 }
-                // 其余（CREATE/DROP TABLE 等）：建表延迟到首批数据到达；DROP TABLE 湖表保留历史快照;
+                // 其余（CREATE TABLE 等）：建表延迟到首批数据到达;
                 // 类型变更由数据驱动的 ensureTable 安全放宽跟随（TypeMapper.isSafeWidening 白名单）
             }
+        }
+    }
+
+    /**
+     * followDropTable=true（默认）时跟随删湖表；sql_drop 的 object_type='table' 行给出被删表
+     * （DROP TABLE 每表一行;DROP SCHEMA CASCADE 级联的每张表也各有一行,天然覆盖）。
+     * 快照重放（op='r'）的历史 DROP 跳过：快照=当前态，活表不能被历史 DDL 误删。
+     */
+    private void applyDropTables(Connection conn, List<Struct> group,
+                                 Consumer<String> cacheInvalidator) throws SQLException {
+        for (Struct row : group) {
+            if (!"sql_drop".equals(str(row, "ev")) || !"table".equals(str(row, "object_type"))
+                    || "r".equals(str(row, "__op"))) {
+                continue;
+            }
+            String identity = str(row, "object_identity");
+            String lakeTable = identity == null ? null : lakeTableOf(identity);
+            if (lakeTable == null) {
+                continue;
+            }
+            try (Statement s = conn.createStatement()) {
+                s.execute("DROP TABLE IF EXISTS " + DuckLakeEngine.LAKE + "." + lakeTable);
+            }
+            cacheInvalidator.accept(lakeTable);
+            syncState.getDdlApplied().increment();
+            log.warn("湖侧跟随删表: {}", lakeTable);
         }
     }
 
