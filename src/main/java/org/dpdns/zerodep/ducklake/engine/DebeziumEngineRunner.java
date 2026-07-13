@@ -159,6 +159,13 @@ public class DebeziumEngineRunner implements SmartLifecycle {
         p.setProperty("max.queue.size", String.valueOf(eng.getMaxQueueSize()));
         p.setProperty("poll.interval.ms", String.valueOf(eng.getPollIntervalMs()));
 
+        // --- SMT 并行(ChangeConsumer 模式=ParallelSmtBatchProcessor,按序收集保序):
+        //     引擎默认的"弹性池"因无界队列实际恒 1 线程(3.6.0 源码实测),显式设值才真并行 ---
+        int rpt = eng.getRecordProcessingThreads();
+        if (rpt != 0) {
+            p.setProperty("record.processing.threads", rpt < 0 ? "AVAILABLE_CORES" : String.valueOf(rpt));
+        }
+
         // --- 类型模式（与 TypeMapper 配套，见类注释） ---
         p.setProperty("decimal.handling.mode", "precise");
         p.setProperty("time.precision.mode", "isostring");

@@ -112,12 +112,25 @@ public class DucklakeProperties {
          *  区分"吞吐上限是解码瓶颈(no-op 也就这么快)还是写侧瓶颈(no-op 快很多)"。
          *  ⚠️ 生产必须 false:开启则数据不落湖、offset 照推进=永久丢数据,仅压测诊断用 */
         private boolean dryRun = false;
+        /** SMT 并行线程数(AsyncEmbeddedEngine record.processing.threads):ChangeConsumer 模式下
+         *  引擎用 ParallelSmtBatchProcessor 把每条记录的 SMT(unwrap 扁平化/墓碑 rewrite)转换
+         *  提交线程池并行执行,再按提交序收集——<b>交付顺序不变,保序语义零影响</b>。
+         *  ⚠️ Debezium 3.6 默认(不设)= ThreadPoolExecutor(core=0, max=核数, 无界 LinkedBlockingQueue)
+         *  ——无界队列下超 core 的线程永不创建,<b>实际恒 1 线程</b>(官方 javadoc 称
+         *  newCachedThreadPool,与实现不符,3.6.0 源码实测);显式设置才走 newFixedThreadPool 真并行。
+         *  -1=AVAILABLE_CORES(默认,真并行到核数);>0=固定 N 线程;0=沿用引擎默认(事实单线程)。
+         *  注:并行的只是 SMT 段,连接器 WAL 解码(pgoutput 解析→Struct 构建)固有单线程,是另一半地板 */
+        private int recordProcessingThreads = -1;
     }
 
     /** 湖维护（全部为进程内 SQL CALL；孤儿清理永远 dry_run，人工确认后才手动清） */
     @Data
     public static class Maintenance {
         private boolean enabled = true;
+        /** 每日维护链(全量归并→快照过期→物理清理→信号表清空)的 cron,默认凌晨 04:40。
+         *  被 LakeMaintenanceJobs 的 @Scheduled 以 placeholder 直接引用;每日全量归并的
+         *  写放大账见该类注释,存量大后可调稀(如每周)并恢复分层 */
+        private String dailyCron = "0 40 4 * * *";
         /** 快照保留窗口（time travel 窗口），过期后物理清理 */
         private int snapshotRetainDays = 30;
         /** DDL 信号流里跟随删除湖列（默认 true=跟随真删；false=保留历史列，新行 NULL） */

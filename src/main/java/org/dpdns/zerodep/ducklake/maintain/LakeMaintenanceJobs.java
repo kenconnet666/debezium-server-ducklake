@@ -18,18 +18,19 @@ import java.sql.Statement;
  * <p>
  * 与 CDC 写入共用 {@link DuckLakeEngine} 的单写者锁，机制上杜绝维护与写入并发提交。
  * <p>
- * <b>分层压实（2026-07-08 换代，替代旧的"每 5 分钟无参 merge"）</b>：旧策略每 5 分钟把当天累积
- * 数据反复重写（一天最多 288 次，30 天保留窗口下中间代文件放大数千倍）。新策略按官方
- * Tiered Compaction 分四级，每个碎片一生只被重写 O(层数) 次：
+ * <b>压实策略（2026-07-13 起：白天分层控碎片 + 每日凌晨全量归并）</b>：
  * <ul>
  *   <li>每 5 分钟：flush 内联 + <b>条件式 Tier0</b>（&lt;1MB 碎片攒够阈值才压，低流量自动 no-op，
  *       高流量保持 5 分钟级收敛）</li>
- *   <li>每小时：Tier1（1–10MB → 32MB）</li>
- *   <li>每日 04:40：Tier2（10–64MB → 128MB）+ 快照过期/物理清理/信号表 TRUNCATE</li>
- *   <li>每月 1 日 05:00：全量归并（target/max=100GB，整表收敛到极少文件）——merge 是流式
- *       读写（无 sort order 时无阻塞算子），内存峰值 ≈ row group 缓冲，与文件大小无关；
- *       即便超 memory_limit 也只是本次 CALL 报错被 catch，不伤数据链路</li>
+ *   <li>每小时：Tier1（1–10MB 归并）——白天查询性能的碎片防线</li>
+ *   <li><b>每日凌晨（cron 可配，默认 04:40）：全量归并</b>（target/max=100GB，整表收敛到
+ *       极少文件）+ 快照过期/物理清理/信号表 TRUNCATE。merge 是流式读写（无 sort order 时
+ *       无阻塞算子），内存峰值 ≈ row group 缓冲，与文件大小无关；即便超 memory_limit 也只是
+ *       本次 CALL 报错被 catch，不伤数据链路。原"每日 Tier2 + 每月全量"两级被本档吸收。</li>
  * </ul>
+ * ⚠️ 每日全量的写放大账：每个字节每天被重写一次（30 天保留窗口 ≈ 30× 存量的月写出量）——
+ * 以此换取"文件数每日归一、白天查询最优"。存量涨到数百 GB 级或写放大成为磁盘/S3 成本瓶颈时，
+ * 把 daily-cron 调稀（如每周）并恢复 Tier2 式分层即可。
  * merge 产物是 partial data file（内嵌 _ducklake_internal_snapshot_id），时间旅行与
  * change feed 完全无损；不同 schema 版本的文件永不互并（DDL 跟随的世代分组是预期行为）。
  * <p>
@@ -71,13 +72,16 @@ public class LakeMaintenanceJobs {
         mergeTier("Tier1(1-10MB 归并)", MB, 10 * MB, 20);
     }
 
-    /** 每日 04:40：Tier2 压实 + 过期旧快照（保留窗口 = time travel 窗口）+ 物理清理 + 信号表防堆积 */
-    @Scheduled(cron = "0 40 4 * * *")
+    /** 每日凌晨（cron 可配 ducklake.maintenance.daily-cron，默认 04:40）：
+     *  全量归并 + 过期旧快照（保留窗口 = time travel 窗口）+ 物理清理 + 信号表防堆积。
+     *  顺序刻意：先归并产出新文件，再 expire/cleanup——归并淘汰的旧文件带 2 小时缓冲，
+     *  次日的 cleanup 才物理删，正在读的旧快照查询不受影响 */
+    @Scheduled(cron = "${ducklake.maintenance.daily-cron:0 40 4 * * *}")
     public void daily() {
         if (!props.getMaintenance().isEnabled()) {
             return;
         }
-        mergeTier("Tier2(10-64MB 归并)", 10 * MB, 64 * MB, 10);
+        fullMerge();
         int days = props.getMaintenance().getSnapshotRetainDays();
         call("CALL ducklake_expire_snapshots('%s', older_than => now() - INTERVAL %d DAYS)"
                 .formatted(DuckLakeEngine.LAKE, days), "expire_snapshots");
@@ -86,18 +90,9 @@ public class LakeMaintenanceJobs {
         truncateDdlSignals();
     }
 
-    /** 每月 1 日 05:00：全量归并——所有(含已很大的)文件收敛到极少数大文件 */
-    @Scheduled(cron = "0 0 5 1 * *")
-    public void monthly() {
-        if (!props.getMaintenance().isEnabled()) {
-            return;
-        }
-        monthlyFullMerge();
-    }
-
     /** 全量归并本体（public 供集成测试跨包直接驱动）：所有文件(含已很大的)参与，不限分批 */
-    public void monthlyFullMerge() {
-        mergeTier("Tier3-monthly(全量归并)", null, 100L * 1024 * MB, null);
+    public void fullMerge() {
+        mergeTier("FullMerge(每日全量归并)", null, 100L * 1024 * MB, null);
     }
 
     /**

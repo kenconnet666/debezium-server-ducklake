@@ -214,7 +214,7 @@ class DucklakeApplicationIntegrationTest {
 
     @Test
     @Order(4)
-    void monthlyFullMergeConvergesFilesWithoutDataLoss() throws Exception {
+    void dailyFullMergeConvergesFilesWithoutDataLoss() throws Exception {
         maintenanceJobs.getClass(); // 显式引用,防未用告警
         boolean prev = propsEnabled(true);
         try {
@@ -230,7 +230,7 @@ class DucklakeApplicationIntegrationTest {
             maintenanceJobs.quick();
 
             long filesBefore = catalogFileCount();
-            maintenanceJobs.monthlyFullMerge();
+            maintenanceJobs.fullMerge();
             long filesAfter = catalogFileCount();
             long rowsAfter = lakeCount("SELECT count(*) FROM cdc.public_cdc_test");
 
