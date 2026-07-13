@@ -6,12 +6,25 @@
 # CDC 基建(角色/publication/DDL 审计/signal/心跳表)由 initdb 自动完成,up 即可用。
 # 布局约定:每个服务一个子目录——Dockerfile 放 <服务>/,持久化数据落 <服务>/data/
 # (bind mount,不用 named volume;数据与栈定义同处一树,备份/清理一个目录搞定)。
-# 生产部署请替换全部 changeme 密码。
+# 密码/密钥可用同目录 .env 覆盖(模板见 .env.example);不建 .env 也能 up(默认 changeme,
+# 仅限本机体验——对外部署必须改)。
+
+# 日志轮转:长驻容器 json-file 无上限会吃满磁盘
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   # ── 源库:postgres:18-bookworm + pig 扩展仓库(加插件一行 pig ext install <name> -v 18 -y)──
   postgres:
     build: ./postgres
     image: ducklake-pg18
+    restart: unless-stopped
+    logging: *default-logging
+    # PG 并行查询用 /dev/shm,docker 默认 64MB 偏小
+    shm_size: 256mb
     command:
       - "postgres"
       # shared_preload 必须启动前就位,initdb 里 CREATE EXTENSION 才能成功
@@ -21,7 +34,8 @@ services:
       - "-c"
       - "wal_level=logical"
     environment:
-      POSTGRES_PASSWORD: changeme
+      # initdb 用同一密码建 postgres 超户与 dbuser_cdc(见 postgres/initdb/01-cdc.sh)
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-changeme}
     ports:
       - "15432:5432"
     volumes:
@@ -39,12 +53,15 @@ services:
   #    与源库隔离:湖元数据高频小事务不打扰业务,互不殃及 ──
   catalog-pg:
     image: ducklake-pg18
+    restart: unless-stopped
+    logging: *default-logging
+    shm_size: 256mb
     depends_on:
       postgres:
         condition: service_started   # 仅为等 build 产物镜像就绪,无数据依赖
     environment:
       POSTGRES_USER: lake_admin
-      POSTGRES_PASSWORD: changeme
+      POSTGRES_PASSWORD: ${CATALOG_PASSWORD:-changeme}
       POSTGRES_DB: ducklake_catalog
     ports:
       - "15434:5432"
@@ -55,15 +72,18 @@ services:
       interval: 5s
       retries: 12
 
-  # ── S3 对象存储:自建 Debian 镜像(rustfs musl 静态二进制 + mc 客户端 + 基础工具)──
+  # ── S3 对象存储:自建 Debian 镜像(rustfs 官方 gnu 二进制 + mc 客户端 + 基础工具)──
   rustfs:
     build: ./rustfs
     image: ducklake-rustfs
+    restart: unless-stopped
+    logging: *default-logging
     environment:
-      RUSTFS_ACCESS_KEY: admin
-      RUSTFS_SECRET_KEY: changeme
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-admin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-changeme}
     ports:
-      - "19000:9000"
+      - "19000:9000"   # S3 API
+      - "19001:9001"   # 管理控制台(http://127.0.0.1:19001,账号=上面 KEY 对)
     volumes:
       - ./rustfs/data:/data
     healthcheck:
@@ -71,14 +91,15 @@ services:
       interval: 5s
       retries: 10
 
-  # 建桶一次性任务:复用 rustfs 镜像里的 mc(minio client),完成即退出
+  # 建桶一次性任务:复用 rustfs 镜像里的 mc(minio client),完成即退出(不设 restart)
   bucket-init:
     image: ducklake-rustfs
+    logging: *default-logging
     depends_on:
       rustfs:
         condition: service_healthy
     entrypoint: >
-      /bin/sh -c "mc alias set rfs http://rustfs:9000 admin changeme
+      /bin/sh -c "mc alias set rfs http://rustfs:9000 ${RUSTFS_ACCESS_KEY:-admin} ${RUSTFS_SECRET_KEY:-changeme}
       && mc mb -p rfs/lake && exit 0"
 
   ducklake:
@@ -86,6 +107,9 @@ services:
       # context 是仓库根:Dockerfile 要 COPY target/*.jar
       context: ..
       dockerfile: docker/ducklake/Dockerfile
+    # 单写者自愈模型:致命错误进程自杀,交给容器重启从上个 offset 重放(零丢失)
+    restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -98,17 +122,17 @@ services:
       DUCKLAKE_SOURCE_HOST: postgres
       DUCKLAKE_SOURCE_PORT: "5432"
       DUCKLAKE_SOURCE_USER: dbuser_cdc
-      DUCKLAKE_SOURCE_PASSWORD: changeme
+      DUCKLAKE_SOURCE_PASSWORD: ${PG_PASSWORD:-changeme}
       DUCKLAKE_SOURCE_DBNAME: postgres
       DUCKLAKE_CATALOG_HOST: catalog-pg
       DUCKLAKE_CATALOG_PORT: "5432"
       DUCKLAKE_CATALOG_DB: ducklake_catalog
       DUCKLAKE_CATALOG_USER: lake_admin
-      DUCKLAKE_CATALOG_PASSWORD: changeme
+      DUCKLAKE_CATALOG_PASSWORD: ${CATALOG_PASSWORD:-changeme}
       DUCKLAKE_DATA_PATH: s3://lake/ducklake/
       DUCKLAKE_S3_ENDPOINT: rustfs:9000
-      DUCKLAKE_S3_ACCESS_KEY: admin
-      DUCKLAKE_S3_SECRET_KEY: changeme
+      DUCKLAKE_S3_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-admin}
+      DUCKLAKE_S3_SECRET_KEY: ${RUSTFS_SECRET_KEY:-changeme}
     ports:
       - "19992:19992"
     deploy:
