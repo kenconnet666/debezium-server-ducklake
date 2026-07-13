@@ -109,7 +109,7 @@ class DucklakeApplicationIntegrationTest {
                       END LOOP;
                     END $fn$""");
             s.execute("CREATE EVENT TRIGGER trg_capture_ddl ON ddl_command_end "
-                    + "WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'DROP TABLE') EXECUTE FUNCTION fn_capture_ddl()");
+                    + "WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'DROP TABLE', 'COMMENT') EXECUTE FUNCTION fn_capture_ddl()");
             s.execute("CREATE EVENT TRIGGER trg_capture_drop ON sql_drop "
                     + "WHEN TAG IN ('ALTER TABLE', 'DROP TABLE', 'DROP SCHEMA') EXECUTE FUNCTION fn_capture_drop()");
 
@@ -232,6 +232,21 @@ class DucklakeApplicationIntegrationTest {
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
             assertThat(lakeColumnType("hits")).isEqualTo("BIGINT");
             assertThat(lakeCount("SELECT count(*) FROM cdc.public_cdc_test WHERE hits=4000000000")).isEqualTo(1L);
+        });
+
+        // ④ COMMENT 跟随:表/列注释同步到湖(DuckLake catalog 持久化)
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("COMMENT ON TABLE cdc_test IS '集成测试表'");
+            s.execute("COMMENT ON COLUMN cdc_test.name IS '名称'");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
+            assertThat(engine.queryScalar("SELECT comment FROM duckdb_tables() "
+                    + "WHERE database_name='lake' AND table_name='public_cdc_test'", String.class))
+                    .isEqualTo("集成测试表");
+            assertThat(engine.queryScalar("SELECT comment FROM duckdb_columns() "
+                    + "WHERE database_name='lake' AND table_name='public_cdc_test' AND column_name='name'", String.class))
+                    .isEqualTo("名称");
         });
     }
 

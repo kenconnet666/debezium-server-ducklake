@@ -229,6 +229,42 @@ class DdlApplierTest {
         assertThat(syncState.getDdlApplied().count()).isZero();
     }
 
+    @Test
+    void commentOnTableAndColumnFollowsToLake() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE lake.cdc.public_r9 (id BIGINT, note VARCHAR)");
+        }
+        apply(List.of(
+                row("ddl_command_end", "COMMENT", "table", "public.r9",
+                        "COMMENT ON TABLE r9 IS '测试表'", 190),
+                row("ddl_command_end", "COMMENT", "table column", "public.r9.note",
+                        "COMMENT ON COLUMN r9.note IS '备注''引号'", 191)));
+
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT comment FROM duckdb_tables() WHERE database_name='lake' AND table_name='public_r9'")) {
+            rs.next();
+            assertThat(rs.getString(1)).isEqualTo("测试表");
+        }
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT comment FROM duckdb_columns() WHERE database_name='lake' "
+                        + "AND table_name='public_r9' AND column_name='note'")) {
+            rs.next();
+            assertThat(rs.getString(1)).isEqualTo("备注'引号"); // '' 转义原样搬运
+        }
+        assertThat(syncState.getDdlApplied().count()).isEqualTo(2);
+    }
+
+    @Test
+    void commentOnAbsentTableOrUnparsableIsSkipped() throws Exception {
+        apply(List.of(
+                row("ddl_command_end", "COMMENT", "table", "public.ghost9",
+                        "COMMENT ON TABLE ghost9 IS 'x'", 195),      // 湖表不存在:执行失败仅告警
+                row("ddl_command_end", "COMMENT", "table", "public.ghost9",
+                        "COMMENT ON TABLE ghost9 IS E'pg\\n转义'", 196))); // PG E'' 形式:解析不上跳过
+        // 两条都不落地也不抛出
+        assertThat(syncState.getDdlApplied().count()).isZero();
+    }
+
     // ---------- 工具 ----------
 
     private static List<String> columns(String table) throws SQLException {

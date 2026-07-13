@@ -43,6 +43,12 @@ public class DdlApplier {
     private static final Pattern RENAME_COLUMN = Pattern.compile(
             "RENAME\\s+COLUMN\\s+\"?([\\w$]+)\"?\\s+TO\\s+\"?([\\w$]+)\"?", Pattern.CASE_INSENSITIVE);
 
+    /** COMMENT ON TABLE/COLUMN ... IS <值>——取 IS 之后原样搬运（'文本'/NULL 的字面量
+     *  语法 PG 与 DuckDB 兼容，含 '' 转义;E'...' 等 PG 特有形式匹配不上则跳过） */
+    private static final Pattern COMMENT_IS = Pattern.compile(
+            "COMMENT\\s+ON\\s+(?:TABLE|COLUMN)\\s+\\S+\\s+IS\\s+('(?:[^']|'')*'|NULL)\\s*;?\\s*$",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+
     private final DucklakeProperties props;
     private final SyncState syncState;
 
@@ -95,10 +101,53 @@ public class DdlApplier {
                     applyRenameIfAny(conn, str(row, "object_identity"), query, cacheInvalidator);
                 } else if ("ALTER TABLE".equals(tag) && hasDrop && props.getMaintenance().isFollowDropColumn()) {
                     applyDropColumns(conn, group.getValue(), cacheInvalidator);
+                } else if ("COMMENT".equals(tag)) {
+                    applyComment(conn, str(row, "object_type"), str(row, "object_identity"), query);
                 }
                 // 其余（CREATE TABLE 等）：建表延迟到首批数据到达;
                 // 类型变更由数据驱动的 ensureTable 安全放宽跟随（TypeMapper.isSafeWidening 白名单）
             }
+        }
+    }
+
+    /**
+     * COMMENT ON TABLE/COLUMN 跟随：对象名取自 object_identity（规范名，免解析原句里的写法），
+     * 注释值从 query_text 的 IS 之后原样搬运。重复应用=同值覆盖，天然幂等（快照重放同样无害）。
+     * 失败仅告警不抛出——注释是元数据锦上添花，不值得让 CDC 批进入重试。
+     */
+    private void applyComment(Connection conn, String objectType, String identity, String query) {
+        if (identity == null || query == null
+                || !("table".equals(objectType) || "table column".equals(objectType))) {
+            return; // index/view/function 等对象的 comment 不在湖跟随范围
+        }
+        Matcher m = COMMENT_IS.matcher(query.trim());
+        if (!m.find()) {
+            log.info("COMMENT 语句无法解析,跳过: {}", query);
+            return;
+        }
+        String value = m.group(1);
+        String target;
+        if ("table".equals(objectType)) {
+            String lakeTable = lakeTableOf(identity);
+            if (lakeTable == null) {
+                return;
+            }
+            target = "TABLE " + DuckLakeEngine.LAKE + "." + lakeTable;
+        } else {
+            int lastDot = identity.lastIndexOf('.');
+            String col = identity.substring(lastDot + 1);
+            String lakeTable = lakeTableOf(identity.substring(0, lastDot));
+            if (lakeTable == null) {
+                return;
+            }
+            target = "COLUMN " + DuckLakeEngine.LAKE + "." + lakeTable + ".\"" + col + "\"";
+        }
+        try (Statement s = conn.createStatement()) {
+            s.execute("COMMENT ON " + target + " IS " + value);
+            syncState.getDdlApplied().increment();
+            log.info("湖侧注释跟随: {} IS {}", target, value.length() > 40 ? value.substring(0, 40) + "…" : value);
+        } catch (SQLException e) {
+            log.warn("湖侧注释应用失败(跳过,不影响数据链): {} ({})", target, e.getMessage());
         }
     }
 

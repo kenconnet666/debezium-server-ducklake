@@ -71,7 +71,7 @@ END $fn$;
 
 DROP EVENT TRIGGER IF EXISTS trg_capture_ddl;
 CREATE EVENT TRIGGER trg_capture_ddl ON ddl_command_end
-    WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'DROP TABLE') EXECUTE FUNCTION fn_capture_ddl();
+    WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'DROP TABLE', 'COMMENT') EXECUTE FUNCTION fn_capture_ddl();
 DROP EVENT TRIGGER IF EXISTS trg_capture_drop;
 CREATE EVENT TRIGGER trg_capture_drop ON sql_drop
     WHEN TAG IN ('ALTER TABLE', 'DROP TABLE', 'DROP SCHEMA') EXECUTE FUNCTION fn_capture_drop();
