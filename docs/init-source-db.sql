@@ -7,13 +7,10 @@
 -- 本脚本幂等可重跑。密码请替换为你自己的。
 -- ============================================================================
 
--- ① 角色：CDC 复制账号（logical replication + 全库只读）与湖 catalog 属主
+-- ① 角色：CDC 复制账号（logical replication + 全库只读）
 DO $$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'dbuser_cdc') THEN
     CREATE ROLE dbuser_cdc REPLICATION LOGIN PASSWORD 'changeme';
-  END IF;
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'lake_admin') THEN
-    CREATE ROLE lake_admin LOGIN PASSWORD 'changeme';
   END IF;
 END $$;
 GRANT pg_read_all_data TO dbuser_cdc;
@@ -25,9 +22,12 @@ DO $$ BEGIN
   END IF;
 END $$;
 
--- ③ DuckLake catalog 库（湖元数据 + Debezium offset 存储都在这个库）
---    CREATE DATABASE 不能在 DO 块里执行，重跑时报 already exists 可忽略
-CREATE DATABASE ducklake_catalog OWNER lake_admin;
+-- ③ DuckLake catalog（湖元数据 + Debezium offset 存储）——**推荐独立 PG 实例承载**
+--    （docker/docker-compose.yml 即此形态：catalog-pg 容器由 POSTGRES_USER=lake_admin /
+--     POSTGRES_DB=ducklake_catalog 环境变量直接建好，无需任何脚本）。
+--    仅当与源库共用同一实例时才取消下面两行注释：
+-- CREATE ROLE lake_admin LOGIN PASSWORD 'changeme';
+-- CREATE DATABASE ducklake_catalog OWNER lake_admin;   -- 重跑报 already exists 可忽略
 
 -- ④ DDL 审计流：event trigger 把 DDL 写进 sys_ddl_log，
 --    该表在 publication 内随流复制，服务端 DdlApplier 据此跟随 rename/删列

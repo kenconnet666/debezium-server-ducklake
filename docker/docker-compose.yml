@@ -1,25 +1,57 @@
-# 一键体验栈：PostgreSQL 18(源库+DuckLake catalog) + rustfs(S3) + debezium-server-ducklake
+# 一键体验栈：源库 PG(Debian+Pigsty 可装插件) + 独立元空间 PG + rustfs(S3) + debezium-server-ducklake
 # 使用:
 #   1. mvn package -DskipTests
-#   2. docker compose -f docker/docker-compose.example.yml up -d --build
-#   3. psql -h 127.0.0.1 -p 15432 -U postgres -d postgres -f docs/init-source-db.sql
-#   4. 重启 ducklake 容器(初始化脚本晚于首启时): docker compose ... restart ducklake
-#   5. 建表写数据,查 watermark: curl http://127.0.0.1:19992/api/ducklake/watermark
-# 生产部署请用 prod profile(全环境变量)并替换全部密码。
+#   2. docker compose -f docker/docker-compose.yml up -d --build
+#   3. 建表写数据,查 watermark: curl http://127.0.0.1:19992/api/ducklake/watermark
+# CDC 基建(角色/publication/DDL 审计/signal/心跳表)由 initdb 自动完成,up 即可用。
+# 生产部署请替换全部 changeme 密码。
 services:
+  # ── 源库:postgres:18-bookworm + pig 扩展仓库(加插件一行 pig ext install <name> -v 18 -y)──
   postgres:
-    image: postgres:18-alpine
-    command: postgres -c wal_level=logical
+    build: ./postgres
+    image: ducklake-pg18
+    command:
+      - "postgres"
+      # shared_preload 必须启动前就位,initdb 里 CREATE EXTENSION 才能成功
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements,auto_explain,pg_stat_kcache,pg_wait_sampling,pg_bigm"
+      # 逻辑复制(CDC 前提)
+      - "-c"
+      - "wal_level=logical"
     environment:
       POSTGRES_PASSWORD: changeme
     ports:
       - "15432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # postgres:18 起挂载点必须是 /var/lib/postgresql(数据在 18/docker 子目录),
+      # 挂 .../data 会被 entrypoint 拒绝(docker-library/postgres#1259)
+      - pgdata:/var/lib/postgresql
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
-      retries: 10
+      retries: 12
+
+  # ── DuckLake 专用元空间 PG(独立实例,同一 pigsty 镜像——以后想给元空间装插件同样一行命令):
+  #    POSTGRES_USER/DB 直接建好 lake_admin 与 ducklake_catalog 库,零初始化脚本;
+  #    与源库隔离:湖元数据高频小事务不打扰业务,互不殃及 ──
+  catalog-pg:
+    image: ducklake-pg18
+    depends_on:
+      postgres:
+        condition: service_started   # 仅为等 build 产物镜像就绪,无数据依赖
+    environment:
+      POSTGRES_USER: lake_admin
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: ducklake_catalog
+    ports:
+      - "15434:5432"
+    volumes:
+      - catalogdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lake_admin -d ducklake_catalog"]
+      interval: 5s
+      retries: 12
 
   rustfs:
     image: rustfs/rustfs:latest
@@ -51,6 +83,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      catalog-pg:
+        condition: service_healthy
       bucket-init:
         condition: service_completed_successfully
     environment:
@@ -60,7 +94,7 @@ services:
       DUCKLAKE_SOURCE_USER: dbuser_cdc
       DUCKLAKE_SOURCE_PASSWORD: changeme
       DUCKLAKE_SOURCE_DBNAME: postgres
-      DUCKLAKE_CATALOG_HOST: postgres
+      DUCKLAKE_CATALOG_HOST: catalog-pg
       DUCKLAKE_CATALOG_PORT: "5432"
       DUCKLAKE_CATALOG_DB: ducklake_catalog
       DUCKLAKE_CATALOG_USER: lake_admin
@@ -81,5 +115,6 @@ services:
 
 volumes:
   pgdata:
+  catalogdata:
   lakedata:
   duckdb-ext:

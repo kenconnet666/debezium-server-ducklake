@@ -35,11 +35,13 @@ PostgreSQL → [DuckLake](https://ducklake.select/) 的流式 CDC 入湖器。**
 
 ```bash
 mvn package -DskipTests
-docker compose -f docker/docker-compose.example.yml up -d --build
-# 初始化源库(角色/publication/DDL审计/signal/心跳表)
-psql -h 127.0.0.1 -p 15432 -U postgres -d postgres -f docs/init-source-db.sql
-docker compose -f docker/docker-compose.example.yml restart ducklake
+docker compose -f docker/docker-compose.yml up -d --build
 ```
+
+栈内容：源库 PG（Debian bookworm + [Pigsty pig](https://pigsty.io/docs/pig/) 扩展仓库，
+加插件一行 `pig ext install <name> -v 18 -y`）+ **独立元空间 PG**（catalog-pg，湖元数据
+高频小事务与源库隔离）+ rustfs(S3) + 本服务。CDC 全套基建（角色/publication/DDL 审计/
+signal/心跳表）由 initdb 自动完成——**up 即可用，无需手动初始化**。
 
 写点数据看它流进湖：
 
@@ -53,9 +55,10 @@ INSERT INTO demo (name) VALUES ('hello'), ('ducklake');
 curl http://127.0.0.1:19992/api/ducklake/watermark
 ```
 
-### 2. 本机开发运行
+### 2. 本机开发运行（接入已有 PG）
 
-初始化好源库后（`docs/init-source-db.sql`），改 `src/main/resources/dev/ducklake.yml` 指向你的 PG 与 S3，然后：
+用 `docs/init-source-db.sql` 初始化你的源库（catalog 推荐独立实例，见脚本 ③ 段注释），
+改 `src/main/resources/dev/ducklake.yml` 指向你的 PG 与 S3，然后：
 
 ```bash
 mvn spring-boot:run
@@ -114,6 +117,19 @@ SELECT count(*) FROM lake.cdc.public_demo;
 | `maintenance.snapshot-retain-days` | `30` | 快照保留窗口（time travel），过期物理清理 |
 
 ## 部署
+
+### 预构建产物
+
+每次推送 `v*` tag 自动发布（`.github/workflows/release.yml`）：
+- **jar**：GitHub Releases 附件 `debezium-server-ducklake-<版本>.jar`
+- **镜像**（多架构 amd64/arm64）：
+
+```bash
+docker pull ghcr.io/kenconnet666/debezium-server-ducklake:latest
+```
+
+维护者发布：`git tag v0.1.0 && git push origin v0.1.0` 即可；
+首次发布后需在 GitHub Packages 设置里把包改为 public 才能匿名拉取。
 
 ### 内存预算（实测公式）
 
