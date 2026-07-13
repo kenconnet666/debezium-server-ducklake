@@ -38,9 +38,12 @@ recordService = new ThreadPoolExecutor(0, AVAILABLE_CORES, 60L, SECONDS, new Lin
 `ThreadPoolExecutor` 的规则是"超过 corePoolSize 的线程只在**队列满**时创建"——core=0 +
 **无界** LinkedBlockingQueue = 队列永不满 = **实际恒 1 个线程**。官方 javadoc 声称该默认
 "using Java 'Executors.newCachedThreadPool()'"（`AsyncEngineConfig` L32-33）——与实现不符
-（cached pool 用 SynchronousQueue 才会按需扩线程）。
+（cached pool 用 SynchronousQueue 才会按需扩线程）。JDK 25 下用同款构造实测复现：
+顺序提交 500 个任务，默认分支恒用 **1** 个 worker 线程；`newFixedThreadPool(12)` 用满 12 个。
 
 显式设置才走 `Executors.newFixedThreadPool(n)` 真并行（L171）。
+`record.processing.order` 在 ChangeConsumer 分支被短路不读取（字段 Javadoc 原文：
+"doesn't have any effect when ChangeConsumer is provided"），交付顺序恒等于原批次序。
 
 **本项目处置**：`ducklake.engine.record-processing-threads` 默认 `-1` = 传
 `AVAILABLE_CORES` 占位符（引擎解析为核数），SMT 段从事实单线程变真并行。
@@ -59,8 +62,21 @@ recordService = new ThreadPoolExecutor(0, AVAILABLE_CORES, 60L, SECONDS, new Lin
 | `max.queue.size` | 8192 | 32768 | 解码→消费的缓冲；堆内存量 = 队列 × 平均事件大小 |
 | `max.queue.size.in.bytes` | 0（禁用） | 未设 | 按字节的队列上限，宽行表防 OOM 的补充手段 |
 | `poll.interval.ms` | 500 | 10 | 仅空闲时燃烧的唤醒间隔（连续消费下 poll 立即返回） |
-| `status.update.interval.ms` | 10000 | 默认 | 向 PG 回报 standby status 的频率，非吞吐路径 |
+| `status.update.interval.ms` | 10000 | 默认 | 向 PG 回报 standby status 的频率，非吞吐路径（独立 keep-alive 线程） |
+| `query.fetch.size` | 0 | 默认 | **只影响 snapshot 阶段**的 JDBC ResultSet 抓取——流式走复制协议不经 JDBC ResultSet，对稳态解码无效 |
 | `decimal/time/binary handling` | — | precise/isostring | 类型保真需要，isostring 有每行格式化成本（换 numeric 保真，不可省） |
+
+补充事实（源码核实）：
+- **`Connect.class` 格式下 per-record converter 开销为 0**——`ConverterBuilder.toFormat()` 对
+  Connect 分支只做轻量包装，不调用 `Converter.fromConnectData()`；`JsonConverter` 仅用于
+  offset map 的低频序列化（`offset.flush.interval.ms` 节奏），与逐行吞吐无关。
+- **PG 连接器 task 级并行也不存在**：`PostgresConnector.taskConfigs()` 硬编码返回单元素
+  list 无视 maxTasks（官方文档：仅 SQL Server/MongoDB 支持单连接器多 task）。
+- 解码线程每行 CPU 成本的压缩手段（对本项目逐一判定）：publication column filter 收窄列
+  （不适用——全列入湖）、避开 `REPLICA IDENTITY FULL`（不可行——DELETE 整行墓碑必需）、
+  `provide.transaction.metadata` 保持关闭（默认已关 ✓）。即本项目在解码线程成本侧已无可省项。
+- 孵化中的 `queue.provider.type=hybrid_chronicle`（堆外/持久化队列，未入正式文档）理论上
+  降宽行 GC 压力，成熟度未知——仅记录，不建议生产使用。
 
 ## 行动结论（按收益排序）
 
