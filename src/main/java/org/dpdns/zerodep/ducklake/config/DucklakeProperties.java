@@ -6,7 +6,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import java.util.List;
 
 /**
- * ducklake 模块配置（前缀 zadmin.ducklake，各 profile 的 ducklake.yml 提供实际值）。
+ * ducklake 模块配置（前缀 ducklake，各 profile 的 ducklake.yml 提供实际值）。
  * 分四段：source=PG 逻辑复制源；lake=DuckLake 目标；engine=Debezium 引擎调参；maintenance=湖维护开关。
  */
 @Data
@@ -27,7 +27,7 @@ public class DucklakeProperties {
         private String password;
         /** 逻辑复制所在库（业务库） */
         private String dbname = "postgres";
-        /** 复制槽名（与现役 iceberg 链的 dbz_iceberg 槽相互独立，可并行影子期） */
+        /** 复制槽名（一个实例一个槽；与源库上其他消费链的槽相互独立，可并行共存） */
         private String slotName = "dbz_ducklake";
         /** 发布名（init 脚本建 FOR ALL TABLES 发布：整库所有 schema 的表、含新建表自动纳入） */
         private String publicationName = "dbz_publication";
@@ -54,7 +54,7 @@ public class DucklakeProperties {
         private String catalogPassword;
         /** 数据文件根路径（S3） */
         private String dataPath = "s3://lake/ducklake/";
-        /** S3（rustfs）端点：容器网内 zrustfs:9000；path-style 必须 */
+        /** S3 端点（rustfs/MinIO 等，容器网内如 rustfs:9000）；path-style 必须 */
         private String s3Endpoint;
         private String s3AccessKey;
         private String s3SecretKey;
