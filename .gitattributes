@@ -1,2 +1,2 @@
-/mvnw text eol=lf
-*.cmd text eol=crlf
+# shell 脚本强制 LF(容器/服务器执行,CRLF 会 ": command not found")
+*.sh text eol=lf
