@@ -206,14 +206,26 @@ DuckDB 的 Parquet writer 按 row group 容量**预分配**列缓冲（与实际
 
 8C16G 单机 Docker Compose 全家桶实测（源 PG、元空间 PG、rustfs、本服务**同机**——即本仓一键体验栈原样；`docker/bench.sh` 四阶段与 `docker/bench-matrix.sh` 参数矩阵可在你的环境一键复现）：
 
-- **积压追赶吞吐 ~22k 行/秒**（停消费灌 100 万行再启动，两点法测消费速率，~100B/行）——100 万行积压 ~45s 追平
-- **纯解码地板 ~29k 行/秒**（dry-run 空转不写湖）——端到端已达解码地板的 ~77%，**瓶颈在 pgoutput 单槽解码 + 单机 CPU 总量**，写湖侧只占小头
-- **稳态分段延迟**（~2k 行/秒持续流）：batchLag（事件产生→落湖提交）p50 617ms / p95 813ms；分段 deliverLag p50 339ms、stage 14ms、lakeTx p50 252ms（镜像 upsert 的按键 DELETE + INSERT 两步落在 lakeTx 段）
-- **空闲单行端到端 ~280ms**（排空后单行 INSERT 到落湖提交）
-- **追赶期资源峰值**：CPU ~614%（8 核的 77%）、内存 845MiB / 3GiB 限额
-- 崩溃恢复：kill/重启后从上个 offset 按序重放，镜像 upsert 幂等，源湖当前态精确一致
+### 吞吐
 
-对典型业务 CDC 增量（几百-几千行/秒）有 1-2 个数量级余量。参考：append-only 旧写路径同环境追赶 ~26.7k 行/秒——镜像语义（查询即当前态、免视图免去重）的代价约 **-16% 吞吐、+0.4s 稳态延迟**，对分析湖场景完全值得。
+| 指标 | 实测值 | 口径 |
+|---|---:|---|
+| 积压追赶吞吐（端到端写湖） | **~22,400 行/秒** | 停消费灌 100 万行再启动，两点法测消费速率，~100B/行；100 万积压 ~45s 追平 |
+| 纯解码地板（dry-run 空转） | ~29,000 行/秒 | 不写湖只解码+交付——端到端已达地板的 ~77%，**瓶颈在 pgoutput 单槽解码 + 单机 CPU 总量**，写湖侧只占小头 |
+| 追赶期资源峰值 | CPU 614% / 内存 845MiB | 8 核的 77% / 3GiB 容器限额内 |
+| 参考：append-only 旧写路径 | ~26,700 行/秒 | 同环境——镜像语义（查询即当前态、免视图免去重）的代价约 **-16% 吞吐**，对分析湖完全值得 |
+
+### 延迟
+
+| 指标 | p50 | p95 | 口径 |
+|---|---:|---:|---|
+| **batchLag**（事件产生→落湖提交，端到端） | **617ms** | 813ms | ~2k 行/秒持续流 |
+| ├ deliverLag（Debezium 解码+交付） | 339ms | 510ms | 同上 |
+| ├ stage（staging 物化） | 14ms | 19ms | 同上 |
+| └ lakeTx（湖事务：按键 DELETE + INSERT） | 252ms | 304ms | 镜像 upsert 两步的成本所在 |
+| 空闲单行端到端 | ~280ms | — | 排空后单行 INSERT 到落湖提交（中位，5 次探针） |
+
+崩溃恢复：kill/重启后从上个 offset 按序重放，镜像 upsert 幂等，源湖当前态精确一致。对典型业务 CDC 增量（几百-几千行/秒）有 1-2 个数量级余量。
 
 ### 调参指南（单变量矩阵实测）
 
@@ -227,6 +239,25 @@ DuckDB 的 Parquet writer 按 row group 容量**预分配**列缓冲（与实际
 | `lake.data-inlining-row-limit` | 512 | 关闭（0）对追赶 +3%（噪声级）；保留 512 换小批低延迟与零小文件 |
 | `engine.poll-interval-ms` | 10 | 调 1ms 无感知收益（空闲延迟主导项是单批写入耗时），保持默认 |
 | `lake.memory-limit` | 1536MB | 与容器限额联动（预算公式见部署节）；过小 OOM crash loop |
+
+## 与其他方案对比
+
+PostgreSQL CDC → 分析存储的常见选型对照。⚠️ 本方案列为上文同环境实测；其余列为各官方文档/公开资料的**典型配置口径，非同环境实测**，仅供架构选型参考：
+
+| 维度 | 本方案（DuckLake） | Iceberg 链路 | Apache Doris | Cloudberry（GP 系 MPP） |
+|---|---|---|---|---|
+| 典型链路 | Debezium Embedded + 内嵌 DuckDB，**单进程** | Kafka + Connect/Flink CDC → Iceberg + catalog 服务（Hive/REST）+ 查询引擎 | Flink CDC → Doris（FE+BE 集群） | Kafka/gpss 等 → MPP 集群 |
+| 最小部署 | 单机 `docker compose up`（本仓一键栈） | 5+ 组件各自高可用 | 3 节点起（可单机试用） | 多节点 MPP 集群 |
+| 数据存储 | S3 Parquet（开放格式，catalog 在 PG） | S3/HDFS Parquet/ORC（开放格式） | 本地盘为主（存算一体；3.x 起有存算分离形态） | 本地盘 MPP 分布式 |
+| CDC 端到端延迟 | **亚秒~秒级**（实测 p50 0.6s @2k 行/秒） | 分钟级为主（Flink checkpoint 驱动；激进配置 ~30s，但小文件压力大） | 秒级（典型 1~10s，攒批导入） | 批 ETL 分钟~小时；流式（gpss）秒~分钟 |
+| 当前态语义 | 镜像 upsert，查询即当前态 | delete file + 后台 compaction，查询引擎 merge-on-read | Unique Key 模型 merge-on-write | 原生 UPDATE/DELETE |
+| 时间旅行 | ✓ snapshot（默认保留 30 天） | ✓ snapshot | ✗（靠备份恢复） | ✗ |
+| 查询引擎 | DuckDB（任意客户端只读 ATTACH 直查，不经本服务） | Trino/Spark/Flink/DuckDB…**生态最广** | 自带（MySQL 协议，高并发点查/聚合强） | 自带（PostgreSQL 协议） |
+| 吞吐扩展 | 单实例 ~22k 行/秒；按表分片多实例横向扩 | Flink 并行度横向扩，上限最高 | 导入随 BE 横向扩 | 随 MPP 节点横向扩 |
+| 运维面 | **最小**：单进程 + 你已有的 PG 与 S3 | 最大：Kafka/Flink/catalog 三套系统各自运维 | 中：集群自管（FE/BE/Compaction） | 大：MPP 集群管理 |
+| 适合场景 | 中小规模、要开放湖格式 + 极简运维、PG 技术栈 | 组织级湖仓平台、多引擎共享、超大规模 | 高并发低延迟 OLAP 对外服务 | Greenplum 迁移、PG 系重型数仓 |
+
+一句话：**要一个"接上就有、查询即当前态、随时能被任何 DuckDB 客户端打开"的 PG 分析副本**，选本方案；要组织级多引擎湖仓平台选 Iceberg；要高并发对外 OLAP 服务选 Doris；深度 PG 生态的重型 MPP 数仓选 Cloudberry。
 
 ## 局限
 
