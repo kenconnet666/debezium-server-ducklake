@@ -6,9 +6,16 @@ FROM debian:trixie-slim
 
 ARG TARGETARCH=amd64
 
-# JBR 运行依赖:libstdc++6/zlib1g(DuckDB JNI 与 JDK native 链接),curl/ca-certificates(下载 JBR+健康检查)
-RUN apt-get update -qq \
-    && apt-get install -y -qq --no-install-recommends curl ca-certificates libstdc++6 zlib1g \
+# APT 换阿里云镜像(deb822 格式,主源+security 同域名替换) + 基础工具:
+#   curl/ca-certificates(下载 JBR+健康检查) libstdc++6/zlib1g(DuckDB JNI 链接)
+#   procps/iproute2/less/jq(容器内排障:ps、ss、翻日志、调 API)
+RUN sed -i -e 's|deb.debian.org|mirrors.aliyun.com|g' -e 's|security.debian.org|mirrors.aliyun.com|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends \
+        curl ca-certificates tzdata libstdc++6 zlib1g procps iproute2 less jq \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 # JBR 25 runtime(非 SDK,更小;cache-redirector 为 JetBrains 官方分发 CDN);

@@ -43,6 +43,22 @@ docker compose -f docker/docker-compose.yml up -d --build
 高频小事务与源库隔离）+ rustfs(S3) + 本服务。CDC 全套基建（角色/publication/DDL 审计/
 signal/心跳表）由 initdb 自动完成——**up 即可用，无需手动初始化**。
 
+镜像统一约定：**全部 Debian 基础镜像**（本服务跑 JetBrains Runtime 25，rustfs 用官方
+gnu 二进制自建，均非 alpine），构建期换阿里云 APT 源，内置排障工具
+（`procps`/`iproute2`/`less`/`jq`）。目录布局——`docker-compose.yml` 统一编排，
+每服务一个子目录放各自 `Dockerfile`，持久化数据落各自 `<服务>/data/`（bind mount，
+备份/清理一个目录搞定）：
+
+```
+docker/
+├── docker-compose.yml     # 统一编排
+├── e2e-verify.sh          # 部署后端到端冒烟(建表→落湖→DDL 跟随→心跳,PASS/FAIL 汇总)
+├── ducklake/              # 本服务:Debian 13 + JBR 25(Dockerfile + data/duckdb-ext 扩展缓存)
+├── postgres/              # 源库:postgres:18-bookworm + pig(Dockerfile + initdb/ + data/)
+├── catalog-pg/            # 元空间:复用 postgres 镜像(仅 data/)
+└── rustfs/                # S3:Debian 13 + rustfs gnu 二进制 + mc(Dockerfile + data/)
+```
+
 写点数据看它流进湖：
 
 ```sql

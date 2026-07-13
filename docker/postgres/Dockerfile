@@ -6,13 +6,20 @@ FROM postgres:18.4-bookworm
 
 USER root
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates gnupg tzdata && \
-    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-    echo "Asia/Shanghai" > /etc/timezone
+# APT 换阿里云镜像;官方镜像自带的 pgdg 源(apt.postgresql.org,国内慢)直接移除——
+# 下面 pig repo add 会配好 pgdg+pigsty 的国内镜像仓。基础工具:
+#   curl/ca-certificates/gnupg(pig 安装链) procps/iproute2/less/jq(排障)
+RUN sed -i -e 's|deb.debian.org|mirrors.aliyun.com|g' -e 's|security.debian.org|mirrors.aliyun.com|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && rm -f /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends \
+        curl ca-certificates gnupg tzdata procps iproute2 less jq \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone
 
-# pig CLI + PGDG/Pigsty 扩展仓库(中国网络环境把两处 URL 换成 repo.pigsty.cc 并加 --region=china)
-RUN curl -fsSL https://repo.pigsty.io/pig | bash && \
+# pig CLI + PGDG/Pigsty 扩展仓库(repo.pigsty.cc = 中国区镜像域,海外部署换回 repo.pigsty.io)
+RUN curl -fsSL https://repo.pigsty.cc/pig | bash && \
     pig repo add pgdg pigsty -u
 
 # 预装内核没带的常用扩展(contrib 自带 pg_stat_statements/auto_explain 无需安装):

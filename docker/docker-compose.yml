@@ -55,8 +55,10 @@ services:
       interval: 5s
       retries: 12
 
+  # ── S3 对象存储:自建 Debian 镜像(rustfs musl 静态二进制 + mc 客户端 + 基础工具)──
   rustfs:
-    image: rustfs/rustfs:latest
+    build: ./rustfs
+    image: ducklake-rustfs
     environment:
       RUSTFS_ACCESS_KEY: admin
       RUSTFS_SECRET_KEY: changeme
@@ -69,8 +71,9 @@ services:
       interval: 5s
       retries: 10
 
+  # 建桶一次性任务:复用 rustfs 镜像里的 mc(minio client),完成即退出
   bucket-init:
-    image: minio/mc
+    image: ducklake-rustfs
     depends_on:
       rustfs:
         condition: service_healthy
