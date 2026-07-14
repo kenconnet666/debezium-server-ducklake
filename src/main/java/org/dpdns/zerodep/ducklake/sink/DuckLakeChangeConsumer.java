@@ -455,7 +455,7 @@ public class DuckLakeChangeConsumer
         //    抛错让本批走既有重试:重试批在干净事务开头完成 DROP 重建(见 ensureTable),
         //    当批数据按新类型写入,历史当前态由增量快照重灌
         if (pendingRebuild.add(lakeTable)) {
-            requestIncrementalSnapshot(lakeTable);
+            requestSnapshot(lakeTable, "incremental");
         }
         throw new SQLException("湖列类型无法就地转换,已安排重建+增量快照重拉,本批将重试: "
                 + lakeTable + " (" + col + " " + have + " -> " + want + ")");
@@ -503,10 +503,12 @@ public class DuckLakeChangeConsumer
     }
 
     /**
-     * 向源库 signal 表写 execute-snapshot，触发 Debezium 对该表的增量快照（READ 事件重灌当前态）。
-     * signal 行由连接器内部消费不进变更流；表由维护任务随 DDL 信号表一并 TRUNCATE。
+     * 向源库 signal 表写 execute-snapshot，触发 Debezium 对该表的快照重灌（READ 事件重灌当前态）。
+     * type=incremental（分块、不停流，要求 connector 已知主键）或 blocking（同 initial 流程、
+     * 重读表结构、该表快照期间流式短暂停顿）。signal 行由连接器内部消费不进变更流；
+     * 表由维护任务随 DDL 信号表一并 TRUNCATE。
      */
-    private void requestIncrementalSnapshot(String lakeTable) {
+    private void requestSnapshot(String lakeTable, String type) {
         // 镜像命名反向:<前缀><pg_schema>.<表> → <pg_schema>.<表>(剥掉配置前缀)
         String prefix = props.getMaintenance().getSchemaPrefix();
         String pgTable = lakeTable.startsWith(prefix) ? lakeTable.substring(prefix.length()) : lakeTable;
@@ -516,11 +518,11 @@ public class DuckLakeChangeConsumer
         try (Connection c = java.sql.DriverManager.getConnection(url, src.getUser(), src.getPassword());
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, java.util.UUID.randomUUID().toString());
-            ps.setString(2, "{\"data-collections\":[\"" + pgTable + "\"],\"type\":\"incremental\"}");
+            ps.setString(2, "{\"data-collections\":[\"" + pgTable + "\"],\"type\":\"" + type + "\"}");
             ps.executeUpdate();
-            log.warn("已触发增量快照重拉: {} (湖表已按新类型重建,当前态将重灌)", pgTable);
+            log.warn("已触发 {} 快照重拉: {} (湖表将重建,当前态将重灌)", type, pgTable);
         } catch (SQLException e) {
-            log.error("增量快照 signal 写入失败,需人工重拉 {}: {}", pgTable, e.getMessage());
+            log.error("快照 signal 写入失败,需人工重拉 {}: {}", pgTable, e.getMessage());
         }
     }
 
@@ -529,15 +531,19 @@ public class DuckLakeChangeConsumer
         knownColumns.remove(lakeTable);
     }
 
-    /** 主键变更（存量表补主键等）由 DdlApplier 回调：湖表标记重建 + 触发增量快照重灌。
+    /** 主键变更（存量表补主键等）由 DdlApplier 回调：湖表标记重建 + 触发 blocking 快照重灌。
      *  存量行的主键回填不产生 CDC 事件、湖旧行主键恒 NULL——重建后快照 READ 事件按新主键
      *  重灌当前态（兑现点在 ensureTable：首个 READ 批到达时干净事务里 DROP 重建）。
+     *  ⚠️ 必须用 blocking 而非 incremental：pgoutput 只在该表下一条 DML 时才刷新 connector
+     *  内部 schema，增量快照此刻仍按旧 schema 判"无主键"直接 skip（集成测试实测踩坑）；
+     *  blocking 快照走 initial 同款流程、从 JDBC metadata 重读表结构，能拿到新主键
+     *  （代价=该表快照期间流式短暂停顿，低频运维操作可接受）。
      *  标记是进程内存态：崩溃丢失由 at-least-once 兜底（重放审计事件会重新标记，
      *  signal 重复写只是多触发一轮幂等快照） */
     public void rebuildWithResnapshot(String lakeTable) {
         if (pendingRebuild.add(lakeTable)) {
-            requestIncrementalSnapshot(lakeTable);
-            log.warn("主键变更,湖表将重建并由增量快照重灌当前态: {}", lakeTable);
+            requestSnapshot(lakeTable, "blocking");
+            log.warn("主键变更,湖表将重建并由 blocking 快照重灌当前态: {}", lakeTable);
         }
     }
 

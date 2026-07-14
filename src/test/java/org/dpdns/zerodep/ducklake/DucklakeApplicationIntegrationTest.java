@@ -337,8 +337,10 @@ class DucklakeApplicationIntegrationTest {
             s.execute("ALTER TABLE pkfix ADD COLUMN id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY");
             s.execute("ALTER TABLE pkfix REPLICA IDENTITY FULL");
         }
-        // 重建+重灌后:行数不变且全部行的主键非空(旧 NULL 行已让位)
-        await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
+        // 重建+重灌后:行数不变且全部行的主键非空(旧 NULL 行已让位)。
+        // ignoreExceptions:重建完成前 id 列不存在会抛 Binder Error,应视作"未就绪"继续等
+        await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() -> {
             assertThat(lakeCount("SELECT count(*) FROM public.pkfix WHERE id IS NOT NULL")).isEqualTo(3L);
             assertThat(lakeCount("SELECT count(*) FROM public.pkfix")).isEqualTo(3L);
         });
