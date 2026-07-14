@@ -321,6 +321,38 @@ class DucklakeApplicationIntegrationTest {
 
     @Test
     @Order(7)
+    void addingPrimaryKeyToExistingTableRebuildsAndResnapshotsLake() throws Exception {
+        // 用户实测场景:无主键表先积累了数据(湖 insert-only 镜像),后补主键——
+        // 旧行主键回填无 CDC 事件,湖旧行主键恒 NULL;应自动重建+增量快照重灌恢复完整镜像
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE pkfix (name text NOT NULL)");
+            s.execute("INSERT INTO pkfix VALUES ('a'), ('b'), ('c')");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM public.pkfix")).isEqualTo(3L));
+
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("ALTER TABLE pkfix ADD COLUMN id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY");
+            s.execute("ALTER TABLE pkfix REPLICA IDENTITY FULL");
+        }
+        // 重建+重灌后:行数不变且全部行的主键非空(旧 NULL 行已让位)
+        await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM public.pkfix WHERE id IS NOT NULL")).isEqualTo(3L);
+            assertThat(lakeCount("SELECT count(*) FROM public.pkfix")).isEqualTo(3L);
+        });
+        // 补主键后 DELETE 应完整跟随(修复前:湖旧行 NULL 主键永久失配,删不掉)
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("DELETE FROM pkfix WHERE name = 'b'");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM public.pkfix")).isEqualTo(2L));
+    }
+
+    @Test
+    @Order(8)
     void dropTableFollowsToLake() throws Exception {
         // 镜像语义:源 DROP TABLE → 湖表真删(followDropTable 默认 true)
         try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");

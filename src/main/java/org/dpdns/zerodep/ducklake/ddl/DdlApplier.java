@@ -49,6 +49,13 @@ public class DdlApplier {
             "COMMENT\\s+ON\\s+(?:TABLE|COLUMN)\\s+\\S+\\s+IS\\s+('(?:[^']|'')*'|NULL)\\s*;?\\s*$",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
+    /** ALTER TABLE 语句涉及主键变更（ADD PRIMARY KEY / ADD COLUMN ... PRIMARY KEY 等）。
+     *  ⚠️ 存量表补主键时，PG 对旧行的主键值回填是 DDL 内部表重写、不产生任何 CDC 事件——
+     *  湖里旧行的主键列恒 NULL，而镜像 upsert 按主键定位行，NULL 永久失配
+     *  （DELETE/UPDATE 从此打不中）。唯一正解是湖表重建 + 增量快照重灌当前态 */
+    private static final Pattern PRIMARY_KEY_CHANGE = Pattern.compile(
+            "\\bPRIMARY\\s+KEY\\b", Pattern.CASE_INSENSITIVE);
+
     private final DucklakeProperties props;
     private final SyncState syncState;
 
@@ -57,8 +64,10 @@ public class DdlApplier {
      *
      * @param cacheInvalidator 湖表结构被本方法改动后回调（消费者失效其 knownColumns 缓存）；
      *                         以回调而非直引消费者，避免 consumer↔applier 循环依赖
+     * @param rebuildRequester 主键变更时回调（消费者标记湖表重建并触发增量快照重灌）
      */
-    public void apply(Connection conn, List<Struct> run, Consumer<String> cacheInvalidator) throws SQLException {
+    public void apply(Connection conn, List<Struct> run, Consumer<String> cacheInvalidator,
+                      Consumer<String> rebuildRequester) throws SQLException {
         // 只认插入(c)与快照读(r)——信号表若被 DELETE 清理会产生墓碑(d)事件,不得当作信号重放
         // (常规清理走 TRUNCATE 不产生事件,此过滤是对误用 DELETE 的兜底)
         List<Struct> signals = run.stream()
@@ -103,6 +112,15 @@ public class DdlApplier {
                     applyDropColumns(conn, group.getValue(), cacheInvalidator);
                 } else if ("COMMENT".equals(tag)) {
                     applyComment(conn, str(row, "object_type"), str(row, "object_identity"), query);
+                }
+                // 主键变更(独立于上面分支;快照重放的历史 DDL 跳过——当前态本就完整,重灌无意义):
+                // 存量行主键回填无 CDC 事件,湖旧行主键恒 NULL → 重建+增量快照重灌
+                if ("ALTER TABLE".equals(tag) && !"r".equals(str(row, "__op"))
+                        && PRIMARY_KEY_CHANGE.matcher(query).find()) {
+                    String lakeTable = lakeTableOf(str(row, "object_identity"));
+                    if (lakeTable != null) {
+                        rebuildRequester.accept(lakeTable);
+                    }
                 }
                 // 其余（CREATE TABLE 等）：建表延迟到首批数据到达;
                 // 类型变更由数据驱动的 ensureTable 安全放宽跟随（TypeMapper.isSafeWidening 白名单）

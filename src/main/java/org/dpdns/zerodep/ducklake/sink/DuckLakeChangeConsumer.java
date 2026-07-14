@@ -234,7 +234,7 @@ public class DuckLakeChangeConsumer
             for (int i = 0; i < segments.size(); i++) {
                 Segment seg = segments.get(i);
                 if (isDdlSignal(seg.topic())) {
-                    ddlApplier.apply(conn, seg.rows(), this::invalidateColumns);
+                    ddlApplier.apply(conn, seg.rows(), this::invalidateColumns, this::rebuildWithResnapshot);
                 } else {
                     insertFromStaging(conn, seg, i);
                 }
@@ -527,6 +527,18 @@ public class DuckLakeChangeConsumer
     /** DDL 流 rename 后由 DdlApplier 调用，失效列缓存 */
     public void invalidateColumns(String lakeTable) {
         knownColumns.remove(lakeTable);
+    }
+
+    /** 主键变更（存量表补主键等）由 DdlApplier 回调：湖表标记重建 + 触发增量快照重灌。
+     *  存量行的主键回填不产生 CDC 事件、湖旧行主键恒 NULL——重建后快照 READ 事件按新主键
+     *  重灌当前态（兑现点在 ensureTable：首个 READ 批到达时干净事务里 DROP 重建）。
+     *  标记是进程内存态：崩溃丢失由 at-least-once 兜底（重放审计事件会重新标记，
+     *  signal 重复写只是多触发一轮幂等快照） */
+    public void rebuildWithResnapshot(String lakeTable) {
+        if (pendingRebuild.add(lakeTable)) {
+            requestIncrementalSnapshot(lakeTable);
+            log.warn("主键变更,湖表将重建并由增量快照重灌当前态: {}", lakeTable);
+        }
     }
 
     private Map<String, String> loadColumns(Connection conn, String lakeTable) throws SQLException {

@@ -34,6 +34,7 @@ class DdlApplierTest {
     private SyncState syncState;
     private DdlApplier applier;
     private List<String> invalidated;
+    private List<String> rebuilds;
 
     private static final Schema DDL_SCHEMA = SchemaBuilder.struct().name("sys_ddl_log.Value")
             .field("id", Schema.OPTIONAL_INT64_SCHEMA)
@@ -68,6 +69,7 @@ class DdlApplierTest {
         syncState = new SyncState(new SimpleMeterRegistry());
         applier = new DdlApplier(props, syncState);
         invalidated = new ArrayList<>();
+        rebuilds = new ArrayList<>();
     }
 
     private static long idSeq = 0;
@@ -87,7 +89,7 @@ class DdlApplierTest {
     }
 
     private void apply(List<Struct> run) throws SQLException {
-        applier.apply(conn, run, invalidated::add);
+        applier.apply(conn, run, invalidated::add, rebuilds::add);
     }
 
     // ---------- 用例 ----------
@@ -264,6 +266,30 @@ class DdlApplierTest {
                         "COMMENT ON TABLE ghost9 IS E'pg\\n转义'", 196))); // PG E'' 形式:解析不上跳过
         // 两条都不落地也不抛出
         assertThat(syncState.getDdlApplied().count()).isZero();
+    }
+
+    @Test
+    void primaryKeyChangeTriggersRebuildResnapshot() throws Exception {
+        // 存量表补主键:旧行主键回填无 CDC 事件,湖旧行主键恒 NULL——必须重建+重灌
+        apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.p1",
+                "ALTER TABLE p1 ADD COLUMN id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY", 200)));
+        assertThat(rebuilds).containsExactly("public.p1");
+
+        // 对已有列直接 ADD PRIMARY KEY 同样触发
+        apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.p2",
+                "ALTER TABLE p2 ADD PRIMARY KEY (code)", 201)));
+        assertThat(rebuilds).containsExactly("public.p1", "public.p2");
+    }
+
+    @Test
+    void primaryKeyChangeSkippedForSnapshotReplayAndUnrelatedAlter() throws Exception {
+        // 快照重放(op='r')的历史主键 DDL 不触发(当前态本就完整,重灌无意义)
+        apply(List.of(rowWithOp("ddl_command_end", "ALTER TABLE", "table", "public.p3",
+                "ALTER TABLE p3 ADD PRIMARY KEY (id)", 210, "r")));
+        // 与主键无关的 ALTER(如 DROP CONSTRAINT xxx_pkey 语句不含 PRIMARY KEY 字样)不触发
+        apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.p4",
+                "ALTER TABLE p4 DROP CONSTRAINT p4_pkey", 211)));
+        assertThat(rebuilds).isEmpty();
     }
 
     // ---------- 工具 ----------
