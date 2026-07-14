@@ -79,7 +79,6 @@ wait_for "watermark API 可达且引擎 running" 90 "true" engine_up
 
 echo "── 3. INSERT 落湖(测试表 $TBL) ──"
 psrc "CREATE TABLE $TBL(id int PRIMARY KEY, name text, val numeric(12,2), created timestamptz DEFAULT now())" >/dev/null
-psrc "ALTER TABLE $TBL REPLICA IDENTITY FULL" >/dev/null
 psrc "INSERT INTO $TBL(id,name,val) SELECT g, 'row-'||g, g*1.5 FROM generate_series(1,1000) g" >/dev/null
 wait_for "1000 行 INSERT 落湖(当前态 1000)" 120 "1000" lakecount
 

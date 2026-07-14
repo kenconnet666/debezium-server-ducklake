@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS public.dbz_heartbeat (
 ALTER TABLE public.dbz_heartbeat REPLICA IDENTITY FULL;
 GRANT SELECT, INSERT, UPDATE ON public.dbz_heartbeat TO dbuser_cdc;
 
--- ⑦ 业务表建议：REPLICA IDENTITY FULL 让 UPDATE/DELETE 事件携带整行旧值
---    （DELETE 墓碑行才能带全列；按表执行）
--- ALTER TABLE <你的表> REPLICA IDENTITY FULL;
+-- ⑦ 业务表要求：**必须有主键**（无主键的表在 FOR ALL TABLES publication 下
+--    连源库自己的 DELETE/UPDATE 都会被 PG 拒绝(55000)，湖侧也只能降级 insert-only）。
+--    无需 REPLICA IDENTITY FULL——镜像 upsert 只按主键定位行，DEFAULT（主键旧值）
+--    足够且更省 WAL（FULL 会把整行旧值写入 WAL，宽表高频更新时膨胀明显）。

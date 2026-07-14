@@ -11,7 +11,7 @@
 -- 【第一段】在 PostgreSQL 主库 console 执行(jdbc:postgresql://...:15432)
 -- ████████████████████████████████████████████████████████████████████
 
--- 每表都带主键 + REPLICA IDENTITY FULL——完整镜像(UPDATE/DELETE 跟随)的硬要求
+-- 每表都带主键——完整镜像(UPDATE/DELETE 跟随)的硬要求;无需 REPLICA IDENTITY FULL(镜像 upsert 只按主键定位,DEFAULT 即可)
 DROP TABLE IF EXISTS order_items, orders, customers;
 
 CREATE TABLE customers (
@@ -20,7 +20,6 @@ CREATE TABLE customers (
     city text NOT NULL,
     vip  boolean DEFAULT false
 );
-ALTER TABLE customers REPLICA IDENTITY FULL;
 COMMENT ON TABLE customers IS '客户';
 COMMENT ON COLUMN customers.vip IS '是否 VIP';
 
@@ -30,7 +29,6 @@ CREATE TABLE orders (
     order_date  date NOT NULL,
     status      text NOT NULL DEFAULT 'paid'  -- paid / shipped / cancelled
 );
-ALTER TABLE orders REPLICA IDENTITY FULL;
 COMMENT ON TABLE orders IS '订单';
 
 CREATE TABLE order_items (
@@ -40,7 +38,6 @@ CREATE TABLE order_items (
     qty      int NOT NULL,
     price    numeric(10,2) NOT NULL
 );
-ALTER TABLE order_items REPLICA IDENTITY FULL;
 COMMENT ON TABLE order_items IS '订单明细';
 
 -- 8 个客户(4 城市,3 个 VIP)

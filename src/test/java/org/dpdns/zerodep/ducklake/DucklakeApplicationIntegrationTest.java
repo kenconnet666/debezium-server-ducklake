@@ -115,14 +115,12 @@ class DucklakeApplicationIntegrationTest {
 
             s.execute("CREATE TABLE cdc_test (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
                     + "name text NOT NULL, big_content text, amount numeric(12,2) DEFAULT 0)");
-            s.execute("ALTER TABLE cdc_test REPLICA IDENTITY FULL");
             s.execute("INSERT INTO cdc_test (name, amount) VALUES ('alpha', 10.50), ('beta', 20.00), ('gamma', 99.99)");
 
             // 非 public schema:默认整库同步下应自动捕获并映射为湖表 app.orders(快照+增量)
             s.execute("CREATE SCHEMA app");
             s.execute("CREATE TABLE app.orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
                     + "sku text NOT NULL, qty int DEFAULT 1)");
-            s.execute("ALTER TABLE app.orders REPLICA IDENTITY FULL");
             s.execute("INSERT INTO app.orders (sku, qty) VALUES ('sku-a', 2), ('sku-b', 3)");
 
             // Debezium 增量快照 signal 表(类型严格跟随的重建+重拉兜底;连接器写快照水位也在此表)
@@ -335,7 +333,6 @@ class DucklakeApplicationIntegrationTest {
         try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
              Statement s = c.createStatement()) {
             s.execute("ALTER TABLE pkfix ADD COLUMN id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY");
-            s.execute("ALTER TABLE pkfix REPLICA IDENTITY FULL");
         }
         // 重建+重灌后:行数不变且全部行的主键非空(旧 NULL 行已让位)。
         // ignoreExceptions:重建完成前 id 列不存在会抛 Binder Error,应视作"未就绪"继续等
