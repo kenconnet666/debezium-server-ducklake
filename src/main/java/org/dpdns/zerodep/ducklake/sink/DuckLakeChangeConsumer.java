@@ -59,8 +59,10 @@ public class DuckLakeChangeConsumer
     private final DdlApplier ddlApplier;
     private final SyncState syncState;
 
-    /** unwrap SMT 追加的元列（staging 工作列，不进湖表；见 DebeziumEngineRunner 的 add.fields） */
-    static final Set<String> META_COLS = Set.of("__op", "__table", "__lsn", "__db", "__source_ts_ms", "__deleted");
+    /** unwrap SMT 追加的元列（staging 工作列，不进湖表；见 DebeziumEngineRunner 的 add.fields）。
+     *  __seq 是消费者侧 staging 追加的批内到达序号（非事件字段）；__lsn 已不再附加，
+     *  保留在集合里作向后兼容防御（旧配置若仍加 lsn 不至于当业务列建进湖） */
+    static final Set<String> META_COLS = Set.of("__op", "__table", "__lsn", "__seq", "__db", "__source_ts_ms", "__deleted");
 
     /** 已确保存在的湖表 → 已知列及其类型（避免每批 DESCRIBE；类型用于漂移检测与安全放宽） */
     private final Map<String, Map<String, String>> knownColumns = new HashMap<>();
@@ -161,9 +163,16 @@ public class DuckLakeChangeConsumer
                 stats.stageMs(), stats.lakeTxMs());
     }
 
-    /** 一个连续段：同表同结构的事件序列（段边界 = 换表或换结构）；keyColumns=Debezium key
-     *  的列名（源表主键，同表恒定，取段首事件即可；空=无主键表，降级 insert-only） */
-    private record Segment(String topic, Schema schema, List<String> keyColumns, List<Struct> rows) {
+    /** 段类型：DATA=常规数据镜像；TRUNCATE=源 TRUNCATE 跟随（MySQL op=t，湖表清空）；
+     *  段序即到达序，DDL 与 TRUNCATE 与前后 DML 的先后语义由段序保证 */
+    private enum SegKind { DATA, TRUNCATE }
+
+    /** 一个连续段：同表同结构的事件序列（段边界 = 换表或换结构或遇 TRUNCATE）；keyColumns=Debezium
+     *  key 的列名（源表主键，同表恒定，取段首事件即可；空=无主键表，降级 insert-only） */
+    private record Segment(String topic, Schema schema, List<String> keyColumns, List<Struct> rows, SegKind kind) {
+        Segment(String topic, Schema schema, List<String> keyColumns, List<Struct> rows) {
+            this(topic, schema, keyColumns, rows, SegKind.DATA);
+        }
     }
 
     /** 单次成功写批的水位与分段耗时（deliver 滞后由调用方以交付时刻减 maxSourceTs 得出） */
@@ -200,6 +209,18 @@ public class DuckLakeChangeConsumer
             }
             Struct value = (Struct) record.value();
             String topic = record.topic();
+            // TRUNCATE(op=t,MySQL):无 before/after 的全 null 行,不能混入数据段(会插脏行)——
+            // 强制封段后独立成 TRUNCATE 段,与前后 DML 保序(先插后清=空表,语义与源一致)
+            if (isTruncateEvent(value)) {
+                if (!run.isEmpty()) {
+                    segments.add(new Segment(runTopic, runSchema, runKeys, List.copyOf(run)));
+                    run.clear();
+                }
+                runTopic = null;
+                runSchema = null;
+                segments.add(new Segment(topic, value.schema(), List.of(), List.of(value), SegKind.TRUNCATE));
+                continue;
+            }
             if (runTopic != null && (!runTopic.equals(topic) || runSchema != value.schema())) {
                 segments.add(new Segment(runTopic, runSchema, runKeys, List.copyOf(run)));
                 run.clear();
@@ -220,10 +241,11 @@ public class DuckLakeChangeConsumer
             segments.add(new Segment(runTopic, runSchema, runKeys, List.copyOf(run)));
         }
 
-        // ---- 阶段一：湖事务外，数据段物化到 main.stg_seg_<i> ----
+        // ---- 阶段一：湖事务外，数据段物化到 main.stg_seg_<i>（DDL/schema change/TRUNCATE 段不物化） ----
         for (int i = 0; i < segments.size(); i++) {
-            if (!isDdlSignal(segments.get(i).topic())) {
-                stageSegment(conn, segments.get(i), i);
+            Segment seg = segments.get(i);
+            if (seg.kind() == SegKind.DATA && !isDdlSignal(seg.topic()) && !isSchemaChange(seg.topic())) {
+                stageSegment(conn, seg, i);
             }
         }
         long t1 = System.currentTimeMillis();
@@ -233,7 +255,12 @@ public class DuckLakeChangeConsumer
         try {
             for (int i = 0; i < segments.size(); i++) {
                 Segment seg = segments.get(i);
-                if (isDdlSignal(seg.topic())) {
+                if (seg.kind() == SegKind.TRUNCATE) {
+                    applyTruncate(conn, seg);
+                } else if (isSchemaChange(seg.topic())) {
+                    // MySQL binlog DDL(一段式 topic=topic.prefix,经 predicate 免 unwrap 原样到达)
+                    ddlApplier.applySchemaChange(conn, seg.rows(), this::invalidateColumns, this::rebuildWithResnapshot);
+                } else if (isDdlSignal(seg.topic())) {
                     ddlApplier.apply(conn, seg.rows(), this::invalidateColumns, this::rebuildWithResnapshot);
                 } else {
                     insertFromStaging(conn, seg, i);
@@ -263,7 +290,43 @@ public class DuckLakeChangeConsumer
         return props.getMaintenance().getDdlAuditTables().contains(TableRef.parse(topic).table());
     }
 
-    /** 阶段一：段数据经 Appender 灌入本地内存库 stg_seg_<idx>（全 VARCHAR 列，autocommit 下执行）。
+    /** MySQL schema change 事件：topic 为一段式（= topic.prefix，无 '.'），与三段式数据 topic 区分 */
+    private static boolean isSchemaChange(String topic) {
+        return topic.indexOf('.') < 0;
+    }
+
+    /** 源 TRUNCATE 事件（op=t）：兼容 unwrap 透传的原始 envelope（op+source 字段）与
+     *  扁平化后（__op 字段）两种形态——ExtractNewRecordState 对 truncate 的行为随版本有差异 */
+    private static boolean isTruncateEvent(Struct value) {
+        Schema sch = value.schema();
+        if (sch.field("__op") != null) {
+            return "t".equals(value.get("__op"));
+        }
+        return sch.field("op") != null && sch.field("source") != null && "t".equals(value.get("op"));
+    }
+
+    /** TRUNCATE 段应用：湖表清空（表未落湖过则静默跳过；followTruncate=false 时仅告警） */
+    private void applyTruncate(Connection conn, Segment seg) throws SQLException {
+        TableRef ref = TableRef.parse(seg.topic());
+        String lakeTable = props.getMaintenance().getSchemaPrefix() + ref.pgSchema() + "." + ref.table();
+        if (!props.getMaintenance().isFollowTruncate()) {
+            log.warn("源 TRUNCATE 不跟随(followTruncate=false),湖表保留: {}", lakeTable);
+            return;
+        }
+        try (Statement s = conn.createStatement()) {
+            s.execute("DELETE FROM " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable));
+            syncState.getDdlApplied().increment();
+            log.warn("湖侧跟随 TRUNCATE(清空): {}", lakeTable);
+        } catch (SQLException e) {
+            // 表从未落湖(如 signal 表)或已被删——TRUNCATE 语义本就是"没有=已空",跳过
+            log.info("TRUNCATE 跳过(湖表不存在): {} ({})", lakeTable, e.getMessage());
+        }
+    }
+
+    /** 阶段一：段数据经 Appender 灌入本地内存库 stg_seg_<idx>（事件字段全 VARCHAR 列 + 末尾
+     *  __seq BIGINT 到达序号，autocommit 下执行）。__seq 是批内终态排序的依据：Debezium
+     *  record.processing.order=ORDERED 保证交付序=复制流序（PG LSN 序 / MySQL binlog 序），
+     *  两源通用且免 CAST——不再依赖 PG 特有的 lsn 字段。
      *  ⚠️ 一律三段名/三参 appender 显式指到内存 catalog——worker 会话 USE lake 下
      *  两段名 main.x 解析为 lake.main.x，staging 会静默落湖（功能正确但每批多 3 次 catalog 提交） */
     private void stageSegment(Connection conn, Segment seg, int idx) throws SQLException {
@@ -273,17 +336,19 @@ public class DuckLakeChangeConsumer
         for (int i = 0; i < fields.size(); i++) {
             ddl.append(i > 0 ? ", " : "").append('"').append(fields.get(i).name()).append("\" VARCHAR");
         }
-        ddl.append(')');
+        ddl.append(", \"__seq\" BIGINT)");
         try (Statement s = conn.createStatement()) {
             s.execute(ddl.toString());
         }
         DuckDBConnection dc = conn.unwrap(DuckDBConnection.class);
         try (DuckDBAppender ap = dc.createAppender(DuckLakeEngine.MEM, "main", "stg_seg_" + idx)) {
+            long seq = 0;
             for (Struct row : seg.rows()) {
                 ap.beginRow();
                 for (Field f : fields) {
                     ap.append(TypeMapper.stagingText(f.schema(), row.get(f)));
                 }
+                ap.append(seq++);
                 ap.endRow();
             }
         }
@@ -292,12 +357,12 @@ public class DuckLakeChangeConsumer
     /**
      * 阶段二：staging → 湖表镜像应用（湖事务内，两步 SQL）：
      * ① 按主键 DELETE 本段涉及的全部行（c 事件空命中幂等；重放=先删旧版本再插，upsert 语义）
-     * ② INSERT 段内每个主键的最后版本（QUALIFY 按 __lsn 取批内终态；__deleted 墓碑不插）
+     * ② INSERT 段内每个主键的最后版本（QUALIFY 按 __seq 到达序取批内终态；__deleted 墓碑不插）
      * 无主键段（keyColumns 空）降级 insert-only：跳过①，②不去重不滤墓碑无从谈起——仅插非墓碑行。
      */
     private void insertFromStaging(Connection conn, Segment seg, int idx) throws SQLException {
         TableRef ref = TableRef.parse(seg.topic());
-        // 镜像命名:湖 schema = <前缀><pg_schema>,表名原样(lake.my_public.demo / lake.public.demo)
+        // 镜像命名:湖 schema = <前缀><源 schema|db>,表名原样(lake.my_public.demo / lake.shop.orders)
         String lakeTable = props.getMaintenance().getSchemaPrefix() + ref.pgSchema() + "." + ref.table();
         ensureTable(conn, lakeTable, seg.schema());
 
@@ -329,7 +394,7 @@ public class DuckLakeChangeConsumer
             s.execute("INSERT INTO " + lake + " (" + cols + ") SELECT " + proj + " FROM ("
                     + "SELECT * FROM " + stg
                     + " QUALIFY row_number() OVER (PARTITION BY " + partition
-                    + " ORDER BY CAST(\"__lsn\" AS BIGINT) DESC NULLS LAST) = 1"
+                    + " ORDER BY \"__seq\" DESC) = 1"
                     + ") WHERE COALESCE(\"__deleted\", 'false') <> 'true'");
         }
         log.debug("mirror {} rows -> {}", seg.rows().size(), lakeTable);
@@ -509,20 +574,20 @@ public class DuckLakeChangeConsumer
      * 表由维护任务随 DDL 信号表一并 TRUNCATE。
      */
     private void requestSnapshot(String lakeTable, String type) {
-        // 镜像命名反向:<前缀><pg_schema>.<表> → <pg_schema>.<表>(剥掉配置前缀)
+        // 镜像命名反向:<前缀><源 schema|db>.<表> → <源 schema|db>.<表>(剥掉配置前缀)
         String prefix = props.getMaintenance().getSchemaPrefix();
-        String pgTable = lakeTable.startsWith(prefix) ? lakeTable.substring(prefix.length()) : lakeTable;
+        String srcTable = lakeTable.startsWith(prefix) ? lakeTable.substring(prefix.length()) : lakeTable;
         DucklakeProperties.Source src = props.getSource();
-        String url = "jdbc:postgresql://%s:%d/%s".formatted(src.getHostname(), src.getPort(), src.getDbname());
-        String sql = "INSERT INTO " + src.getSignalTable() + " (id, type, data) VALUES (?, 'execute-snapshot', ?)";
-        try (Connection c = java.sql.DriverManager.getConnection(url, src.getUser(), src.getPassword());
+        // signal payload 是 Debezium 通用格式;直连 URL 按源类型出方言(jdbc:postgresql / jdbc:mysql)
+        String sql = "INSERT INTO " + src.resolvedSignalTable() + " (id, type, data) VALUES (?, 'execute-snapshot', ?)";
+        try (Connection c = java.sql.DriverManager.getConnection(src.jdbcUrl(), src.getUser(), src.getPassword());
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, java.util.UUID.randomUUID().toString());
-            ps.setString(2, "{\"data-collections\":[\"" + pgTable + "\"],\"type\":\"" + type + "\"}");
+            ps.setString(2, "{\"data-collections\":[\"" + srcTable + "\"],\"type\":\"" + type + "\"}");
             ps.executeUpdate();
-            log.warn("已触发 {} 快照重拉: {} (湖表将重建,当前态将重灌)", type, pgTable);
+            log.warn("已触发 {} 快照重拉: {} (湖表将重建,当前态将重灌)", type, srcTable);
         } catch (SQLException e) {
-            log.error("快照 signal 写入失败,需人工重拉 {}: {}", pgTable, e.getMessage());
+            log.error("快照 signal 写入失败,需人工重拉 {}: {}", srcTable, e.getMessage());
         }
     }
 
@@ -573,7 +638,8 @@ public class DuckLakeChangeConsumer
         return v instanceof Number n ? n.longValue() : null;
     }
 
-    /** topic "ducklake.public.cdc_test" → (public, cdc_test)；防御性处理仅两段的极端情况 */
+    /** topic "ducklake.public.cdc_test" → (public, cdc_test)——中段=PG schema / MySQL database，
+     *  湖 schema 同位镜像；防御性处理仅两段的极端情况（兜底 public 仅 PG 语义，正常不触达） */
     record TableRef(String pgSchema, String table) {
         static TableRef parse(String topic) {
             String[] parts = topic.split("\\.");

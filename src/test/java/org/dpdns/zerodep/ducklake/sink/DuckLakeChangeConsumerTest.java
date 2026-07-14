@@ -84,7 +84,6 @@ class DuckLakeChangeConsumerTest {
             .field("name", Schema.OPTIONAL_STRING_SCHEMA)
             .field("__op", Schema.OPTIONAL_STRING_SCHEMA)
             .field("__deleted", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("__lsn", Schema.OPTIONAL_INT64_SCHEMA)
             .field("__source_ts_ms", Schema.OPTIONAL_INT64_SCHEMA)
             .build();
 
@@ -92,24 +91,25 @@ class DuckLakeChangeConsumerTest {
             .field("id", Schema.INT64_SCHEMA)
             .build();
 
-    /** 带主键 key 的常规事件（源表有 PK 的正常形态） */
+    /** 带主键 key 的常规事件（源表有 PK 的正常形态）。批内终态取到达序（__seq 由消费者
+     *  staging 侧生成），seq 参数仅用于让 __source_ts_ms 单调 */
     private static ChangeEvent<SourceRecord, SourceRecord> rowEvent(String topic, long id, String name,
-                                                                    String op, long lsn) {
+                                                                    String op, long seq) {
         Struct v = new Struct(ROW_SCHEMA)
                 .put("id", id).put("name", name).put("__op", op)
                 .put("__deleted", "d".equals(op) ? "true" : "false")
-                .put("__lsn", lsn).put("__source_ts_ms", 1_783_000_000_000L + lsn);
+                .put("__source_ts_ms", 1_783_000_000_000L + seq);
         Struct k = new Struct(KEY_SCHEMA).put("id", id);
         return event(new SourceRecord(Map.of(), Map.of(), topic, KEY_SCHEMA, k, ROW_SCHEMA, v));
     }
 
     /** 无 key 事件（源表无 PK）——湖侧应降级 insert-only */
     private static ChangeEvent<SourceRecord, SourceRecord> rowEventNoKey(String topic, long id, String name,
-                                                                         String op, long lsn) {
+                                                                         String op, long seq) {
         Struct v = new Struct(ROW_SCHEMA)
                 .put("id", id).put("name", name).put("__op", op)
                 .put("__deleted", "d".equals(op) ? "true" : "false")
-                .put("__lsn", lsn).put("__source_ts_ms", 1_783_000_000_000L + lsn);
+                .put("__source_ts_ms", 1_783_000_000_000L + seq);
         return event(new SourceRecord(Map.of(), Map.of(), topic, ROW_SCHEMA, v));
     }
 
@@ -212,12 +212,11 @@ class DuckLakeChangeConsumerTest {
                 .field("extra", Schema.OPTIONAL_INT32_SCHEMA)   // 新列
                 .field("__op", Schema.OPTIONAL_STRING_SCHEMA)
                 .field("__deleted", Schema.OPTIONAL_STRING_SCHEMA)
-                .field("__lsn", Schema.OPTIONAL_INT64_SCHEMA)
                 .field("__source_ts_ms", Schema.OPTIONAL_INT64_SCHEMA)
                 .build();
         Struct evolvedRow = new Struct(evolved)
                 .put("id", 2L).put("name", "b").put("extra", 7)
-                .put("__op", "c").put("__deleted", "false").put("__lsn", 201L).put("__source_ts_ms", 1L);
+                .put("__op", "c").put("__deleted", "false").put("__source_ts_ms", 1L);
 
         // 同一批内旧结构 → 新结构:段边界切开,湖表自动 ADD COLUMN
         consumer.handleBatch(List.of(
@@ -245,13 +244,12 @@ class DuckLakeChangeConsumerTest {
                 .field("query_text", Schema.OPTIONAL_STRING_SCHEMA)
                 .field("xid", Schema.OPTIONAL_INT64_SCHEMA)
                 .field("occurred_at", Schema.OPTIONAL_STRING_SCHEMA)
-                .field("__lsn", Schema.OPTIONAL_INT64_SCHEMA)
                 .build();
         Struct ddlRow = new Struct(ddlSchema)
                 .put("id", 1L).put("ev", "ddl_command_end").put("tag", "CREATE TABLE")
                 .put("object_type", "table").put("object_identity", "public.t9")
                 .put("query_text", "CREATE TABLE t9(id bigint)").put("xid", 900L)
-                .put("occurred_at", "2026-07-07T10:00:00+08:00").put("__lsn", 300L);
+                .put("occurred_at", "2026-07-07T10:00:00+08:00");
 
         consumer.handleBatch(List.of(
                 event(new SourceRecord(Map.of(), Map.of(), "zadmin.public.dbz_ddl_log", ddlSchema, ddlRow))
@@ -391,6 +389,70 @@ class DuckLakeChangeConsumerTest {
                 .isEqualTo(new DuckLakeChangeConsumer.TableRef("public", "sys_user"));
         assertThat(DuckLakeChangeConsumer.TableRef.parse("prefix.only"))
                 .isEqualTo(new DuckLakeChangeConsumer.TableRef("public", "only"));
+    }
+
+    /** 源 TRUNCATE(op=t,MySQL):独立成段与前后 DML 保序,湖表清空;全 null 行不得混入数据段 */
+    @Test
+    void truncateEventClearsLakeTableInArrivalOrder() throws Exception {
+        // 先插 2 行 → TRUNCATE → 再插 1 行:终态=只有 truncate 之后的行(与源语义一致)
+        Struct truncateRow = new Struct(ROW_SCHEMA).put("id", 0L).put("__op", "t");
+        consumer.handleBatch(List.of(
+                rowEvent("zadmin.shop.t13", 1, "a", "c", 100),
+                rowEvent("zadmin.shop.t13", 2, "b", "c", 101),
+                event(new SourceRecord(Map.of(), Map.of(), "zadmin.shop.t13", ROW_SCHEMA, truncateRow)),
+                rowEvent("zadmin.shop.t13", 3, "after", "c", 102)
+        ), committer());
+
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*), max(name) FROM lake.shop.t13")) {
+            rs.next();
+            assertThat(rs.getLong(1)).as("TRUNCATE 后仅保留其后到达的行").isEqualTo(1);
+            assertThat(rs.getString(2)).isEqualTo("after");
+        }
+    }
+
+    /** followTruncate=false:TRUNCATE 事件只告警不清湖(且同样不得混入数据段产生脏行) */
+    @Test
+    void truncateDisabledKeepsLakeRows() throws Exception {
+        props.getMaintenance().setFollowTruncate(false);
+        try {
+            Struct truncateRow = new Struct(ROW_SCHEMA).put("id", 0L).put("__op", "t");
+            consumer.handleBatch(List.of(
+                    rowEvent("zadmin.shop.t14", 1, "a", "c", 100),
+                    event(new SourceRecord(Map.of(), Map.of(), "zadmin.shop.t14", ROW_SCHEMA, truncateRow))
+            ), committer());
+        } finally {
+            props.getMaintenance().setFollowTruncate(true);
+        }
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM lake.shop.t14")) {
+            rs.next();
+            assertThat(rs.getLong(1)).as("不跟随:湖行保留,truncate 行不落").isEqualTo(1);
+        }
+    }
+
+    /** MySQL schema change 事件(一段式 topic=topic.prefix):路由到 DdlApplier,不得当数据表建湖表 */
+    @Test
+    void schemaChangeTopicRoutesToApplierNotDataTable() throws Exception {
+        Schema changeSchema = SchemaBuilder.struct().name("SchemaChangeValue")
+                .field("databaseName", Schema.OPTIONAL_STRING_SCHEMA)
+                .field("ddl", Schema.OPTIONAL_STRING_SCHEMA)
+                .build();
+        Struct change = new Struct(changeSchema)
+                .put("databaseName", "shop")
+                .put("ddl", "CREATE TABLE orders (id bigint primary key)");
+
+        consumer.handleBatch(List.of(
+                event(new SourceRecord(Map.of(), Map.of(), "zadmin", changeSchema, change))
+        ), committer());
+
+        assertThat(syncState.getDdlAudited().count()).isEqualTo(1); // 进了 applySchemaChange
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM information_schema.tables "
+                     + "WHERE table_catalog='lake' AND table_name='zadmin'")) {
+            rs.next();
+            assertThat(rs.getLong(1)).as("schema change 事件不得被当业务表落湖").isZero();
+        }
     }
 
     /** 湖 schema 前缀:多源库实例共享同一湖时以前缀隔离命名空间——前缀限定合法标识符

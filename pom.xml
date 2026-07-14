@@ -59,6 +59,13 @@
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
+        <!-- MySQL 源（source.type=mysql）的 JDBC 驱动：snapshot/元数据读取用；binlog 流式
+             走 connector 传递的 io.debezium:mysql-binlog-connector-java。版本由 Boot BOM 托管 -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -89,7 +96,14 @@
             <groupId>io.debezium</groupId>
             <artifactId>debezium-connector-postgres</artifactId>
         </dependency>
-        <!-- offset 存 PG（JdbcOffsetBackingStore）；PG 连接器无需 schema history -->
+        <!-- MySQL 8.0+ 源连接器（binlog 解码 + ANTLR DDL 解析；MySQL/MariaDB 共享
+             debezium-connector-binlog 基座，均由 connector 传递） -->
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>debezium-connector-mysql</artifactId>
+        </dependency>
+        <!-- offset 存 PG（JdbcOffsetBackingStore）；PG 连接器无需 schema history，
+             MySQL 源的 schema history 亦经本模块的 JdbcSchemaHistory 存同一 catalog PG -->
         <dependency>
             <groupId>io.debezium</groupId>
             <artifactId>debezium-storage-jdbc</artifactId>
@@ -143,6 +157,11 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-mysql</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>

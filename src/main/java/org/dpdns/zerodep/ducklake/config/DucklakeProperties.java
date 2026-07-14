@@ -7,7 +7,8 @@ import java.util.List;
 
 /**
  * ducklake 模块配置（前缀 ducklake，各 profile 的 ducklake.yml 提供实际值）。
- * 分四段：source=PG 逻辑复制源；lake=DuckLake 目标；engine=Debezium 引擎调参；maintenance=湖维护开关。
+ * 分四段：source=CDC 源库（PostgreSQL / MySQL）；lake=DuckLake 目标；engine=Debezium 引擎调参；
+ * maintenance=湖维护开关。
  */
 @Data
 @ConfigurationProperties(prefix = "ducklake")
@@ -18,29 +19,60 @@ public class DucklakeProperties {
     private Engine engine = new Engine();
     private Maintenance maintenance = new Maintenance();
 
-    /** PG 逻辑复制源（集群形态填 HAProxy 读写口，故障转移自动跟随；单机直连） */
+    /** 源库类型：解码机制与 DDL 跟随路线随之切换（见 DebeziumEngineRunner / DdlApplier） */
+    public enum SourceType { POSTGRES, MYSQL }
+
+    /** CDC 源库。PG=逻辑复制（slot+publication）；MySQL 8.0+=binlog（ROW/FULL，8.0 起默认即是）。
+     *  集群形态填代理读写口（HAProxy 等），故障转移自动跟随；单机直连 */
     @Data
     public static class Source {
+        /** 源库类型：postgres（默认，全向后兼容）/ mysql（8.0+，不支持 5.7） */
+        private SourceType type = SourceType.POSTGRES;
         private String hostname;
+        /** 端口。⚠️ 默认 5432 是 PG 习惯值——type=mysql 时务必显式配 3306（或实际端口） */
         private int port = 5432;
         private String user = "dbuser_cdc";
         private String password;
-        /** 逻辑复制所在库（业务库） */
+        /** 业务库：PG=逻辑复制所在库；MySQL=signal/心跳表所在的主业务库（binlog 是实例级，
+         *  捕获范围由 schema-include-list 决定，此值不限定捕获） */
         private String dbname = "postgres";
-        /** 复制槽名（一个实例一个槽；与源库上其他消费链的槽相互独立，可并行共存） */
+        /** [仅 PG] 复制槽名（一个实例一个槽；与源库上其他消费链的槽相互独立，可并行共存） */
         private String slotName = "dbz_ducklake";
-        /** 发布名（init 脚本建 FOR ALL TABLES 发布：整库所有 schema 的表、含新建表自动纳入） */
+        /** [仅 PG] 发布名（init 脚本建 FOR ALL TABLES 发布：整库所有 schema 的表、含新建表自动纳入） */
         private String publicationName = "dbz_publication";
-        /** 捕获的 schema（Debezium schema.include.list）。默认空 = 不限制：整库全部用户
-         *  schema 自动捕获（pg_catalog/information_schema 等系统 schema 由 Debezium 内建排除），
-         *  首启 initial 快照拉全部存量 + 之后 WAL 流式增量，湖表名 <schema>_<表> 一一自动对应。
-         *  需收窄时填逗号分隔 schema 列表（正则） */
+        /** [仅 MySQL] binlog 客户端 ID（database.server.id）：以"另一台 replica"身份接入，
+         *  必须在整个 MySQL 集群的 server_id/replica id 空间内唯一；多实例部署各配不同值 */
+        private long serverId = 6400;
+        /** [仅 MySQL] 会话时区透传（driver.connectionTimeZone）。空=Debezium 自动从服务端查询
+         *  （默认行为，通常无需配置）；服务端 time_zone=SYSTEM 且 JVM 时区不一致时显式指定 */
+        private String connectionTimeZone = "";
+        /** 捕获范围（PG 下发 schema.include.list；MySQL 下发 database.include.list——湖 schema
+         *  一一镜像 PG schema / MySQL database，语义完全对应）。默认空 = 不限制：整库全部用户
+         *  schema/库自动捕获（系统 schema/库由 Debezium 内建排除），首启 initial 快照拉全部存量
+         *  + 之后流式增量。需收窄时填逗号分隔列表（正则） */
         private String schemaIncludeList = "";
-        /** 排除表（正则，schema.table 形式），如内部状态表 */
+        /** 排除表（正则，PG schema.table / MySQL db.table 形式），如内部状态表 */
         private String tableExcludeList = "";
         /** Debezium 增量快照 signal 表（source channel；类型严格跟随的"重建+重拉"兜底经由它触发，
-         *  连接器的快照水位标记也写在此表；行由连接器内部消费不进变更流，维护任务定期 TRUNCATE） */
-        private String signalTable = "public.dbz_signal";
+         *  连接器的快照水位标记也写在此表；行由连接器内部消费不进变更流，维护任务定期 TRUNCATE）。
+         *  空 = 按类型推导默认：PG "public.dbz_signal"；MySQL "<dbname>.dbz_signal" */
+        private String signalTable = "";
+
+        /** 直连源库的 JDBC URL（signal 写入 / 信号表维护清理用；按 type 出方言） */
+        public String jdbcUrl() {
+            return switch (type) {
+                case POSTGRES -> "jdbc:postgresql://%s:%d/%s".formatted(hostname, port, dbname);
+                case MYSQL -> "jdbc:mysql://%s:%d/%s".formatted(hostname, port, dbname);
+            };
+        }
+
+        /** signal 表全名（显式配置优先；空则按类型推导，PG 兼容旧默认 public.dbz_signal） */
+        public String resolvedSignalTable() {
+            if (!signalTable.isBlank()) {
+                return signalTable;
+            }
+            return type == SourceType.MYSQL ? dbname + ".dbz_signal" : "public.dbz_signal";
+        }
     }
 
     /** DuckLake 目标（catalog=PG 库，数据=S3 Parquet） */
@@ -138,6 +170,9 @@ public class DucklakeProperties {
         private int snapshotRetainDays = 30;
         /** DDL 信号流里跟随删除湖列（默认 true=跟随真删；false=保留历史列，新行 NULL） */
         private boolean followDropColumn = true;
+        /** [仅 MySQL] 源 TRUNCATE TABLE 跟随清空湖表（binlog 有 op=t 事件；默认 true=镜像语义）。
+         *  PG 路线暂不支持（pgoutput truncate 事件被 Debezium 默认跳过且 unwrap 丢弃，见 README） */
+        private boolean followTruncate = true;
         /** DDL 信号流里跟随源库 DROP TABLE 真删湖表（默认 true=镜像语义；false=湖表保留。
          *  真删后时间旅行窗口内旧 snapshot 仍可 AT (TIMESTAMP ...) 回看该表） */
         private boolean followDropTable = true;

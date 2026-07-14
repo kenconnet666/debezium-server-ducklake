@@ -21,27 +21,30 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * DDL 信号流消费：PG event trigger（ddl_command_end + sql_drop）写入 dbz_ddl_log，
- * 该表随 publication 被 Debezium 当普通表抓走，到这里翻译应用到湖侧——**纯跟随，不留档**
- * （2026-07-08 起湖侧 meta.ddl_history 审计已裁撤；信号表本身由维护任务每日 TRUNCATE 阅后即焚）。
- * <p>
- * 判定原理（PG 目录语义，确定性非启发式）：RENAME COLUMN 是 pg_attribute 原地改名、
- * <b>不触发 sql_drop</b>；DROP+ADD 必触发。故按事务号 xid 分组后，
- * "ALTER TABLE 且同事务无 sql_drop 且语句含 RENAME COLUMN" ⇒ 真 rename，湖侧同步
- * ALTER TABLE ... RENAME COLUMN（这是数据驱动 schema 演进做不到、必须靠 DDL 信号补齐的唯一动作）。
- * <p>
- * 其余跟随分工：加列与类型安全放宽交给数据驱动 ensureTable 幂等处理；删列默认跟随真删
- * （followDropColumn=false 时保留湖列留历史）；DROP TABLE 默认跟随真删湖表
- * （followDropTable=false 时湖表保留；快照重放的历史 DROP 一律跳过——快照给的是当前态，
- * 活表不能被历史 DDL 误删）；建表延迟到首批数据；快照重放旧 DDL 时靠"列存在性检查"天然幂等。
+ * DDL 信号流消费——**纯跟随，不留档**，双前端共用一组湖端执行原语（rename/删列/删表/注释/重建回调）：
+ * <ul>
+ *   <li><b>PG 前端 {@link #apply}</b>：event trigger（ddl_command_end + sql_drop）写 dbz_ddl_log，
+ *       随 publication 被当普通表抓走。判定靠 PG 目录语义（按 xid 分组配对 sql_drop）：
+ *       RENAME COLUMN 是 pg_attribute 原地改名<b>不触发 sql_drop</b>，DROP+ADD 必触发——
+ *       "ALTER TABLE 且同事务无 sql_drop 且语句含 RENAME COLUMN" ⇒ 真 rename。</li>
+ *   <li><b>MySQL 前端 {@link #applySchemaChange}</b>：binlog 自带 DDL，Debezium 原生 schema change
+ *       事件（topic=一段式 topic.prefix，经 predicate 免 unwrap 原样到达）。tableChanges 给
+ *       "变更后的完整表结构快照"（含全列/主键/注释）而非语义 diff，rename/删列语义从 ddl
+ *       原文正则取——源库<b>无需任何审计表/触发器基建</b>。</li>
+ * </ul>
+ * 其余跟随分工（两前端一致）：加列与类型安全放宽交给数据驱动 ensureTable 幂等处理；删列默认跟随真删
+ * （followDropColumn=false 时保留湖列留历史）；DROP TABLE 默认跟随真删湖表（followDropTable=false
+ * 时保留；快照重放的历史 DDL 一律跳过——快照给的是当前态，活表不能被历史 DDL 误删）；
+ * 建表延迟到首批数据；重复应用靠"列存在性检查"天然幂等。
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class DdlApplier {
 
+    /** RENAME COLUMN old TO new（PG 双引号 / MySQL 8.0 反引号或裸名通用） */
     private static final Pattern RENAME_COLUMN = Pattern.compile(
-            "RENAME\\s+COLUMN\\s+\"?([\\w$]+)\"?\\s+TO\\s+\"?([\\w$]+)\"?", Pattern.CASE_INSENSITIVE);
+            "RENAME\\s+COLUMN\\s+[\"`]?([\\w$]+)[\"`]?\\s+TO\\s+[\"`]?([\\w$]+)[\"`]?", Pattern.CASE_INSENSITIVE);
 
     /** COMMENT ON TABLE/COLUMN ... IS <值>——取 IS 之后原样搬运（'文本'/NULL 的字面量
      *  语法 PG 与 DuckDB 兼容，含 '' 转义;E'...' 等 PG 特有形式匹配不上则跳过） */
@@ -49,22 +52,57 @@ public class DdlApplier {
             "COMMENT\\s+ON\\s+(?:TABLE|COLUMN)\\s+\\S+\\s+IS\\s+('(?:[^']|'')*'|NULL)\\s*;?\\s*$",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
 
-    /** ALTER TABLE 语句涉及主键变更（ADD PRIMARY KEY / ADD COLUMN ... PRIMARY KEY 等）。
-     *  ⚠️ 存量表补主键时，PG 对旧行的主键值回填是 DDL 内部表重写、不产生任何 CDC 事件——
+    /** ALTER TABLE 语句涉及主键变更（ADD PRIMARY KEY / ADD COLUMN ... PRIMARY KEY / DROP PRIMARY KEY）。
+     *  ⚠️ 存量表补主键时，旧行的主键值回填是 DDL 内部表重写、不产生任何 CDC 事件——
      *  湖里旧行的主键列恒 NULL，而镜像 upsert 按主键定位行，NULL 永久失配
-     *  （DELETE/UPDATE 从此打不中）。唯一正解是湖表重建 + 增量快照重灌当前态 */
+     *  （DELETE/UPDATE 从此打不中）。唯一正解是湖表重建 + 快照重灌当前态 */
     private static final Pattern PRIMARY_KEY_CHANGE = Pattern.compile(
             "\\bPRIMARY\\s+KEY\\b", Pattern.CASE_INSENSITIVE);
 
+    // ---- MySQL ddl 原文正则（schema change 前端专用；MySQL 标识符为反引号或裸名） ----
+
+    /** MySQL 5.x 遗留改名语法：CHANGE [COLUMN] old new <type...>（old≠new 才是 rename，
+     *  old=new 是纯类型变更，交给数据驱动跟随） */
+    private static final Pattern MYSQL_CHANGE_COLUMN = Pattern.compile(
+            "\\bCHANGE\\s+(?:COLUMN\\s+)?[\"`]?([\\w$]+)[\"`]?\\s+[\"`]?([\\w$]+)[\"`]?\\s",
+            Pattern.CASE_INSENSITIVE);
+
+    /** MySQL 删列：DROP [COLUMN] col——负前瞻排除 DROP PRIMARY KEY/FOREIGN KEY/INDEX/分区等形态 */
+    private static final Pattern MYSQL_DROP_COLUMN = Pattern.compile(
+            "\\bDROP\\s+(?:COLUMN\\s+)?(?!(?:PRIMARY|FOREIGN|INDEX|KEY|CONSTRAINT|CHECK|PARTITION|DEFAULT)\\b)"
+                    + "[\"`]?([\\w$]+)[\"`]?", Pattern.CASE_INSENSITIVE);
+
+    /** 表重命名：ALTER TABLE x RENAME [TO|AS] y（不含 RENAME COLUMN/RENAME INDEX/RENAME KEY） */
+    private static final Pattern MYSQL_RENAME_TABLE_ALTER = Pattern.compile(
+            "\\bRENAME\\s+(?:TO|AS)?\\s*(?!COLUMN\\b|INDEX\\b|KEY\\b)[\"`]?(?:[\\w$]+[\"`]?\\.[\"`]?)?([\\w$]+)[\"`]?",
+            Pattern.CASE_INSENSITIVE);
+
+    /** RENAME TABLE old TO new（独立语句形态；仅取第一对，跨库形态跳过） */
+    private static final Pattern MYSQL_RENAME_TABLE_STMT = Pattern.compile(
+            "^\\s*RENAME\\s+TABLE\\s+[\"`]?(?:[\\w$]+[\"`]?\\.[\"`]?)?([\\w$]+)[\"`]?\\s+TO\\s+"
+                    + "[\"`]?(?:[\\w$]+[\"`]?\\.[\"`]?)?([\\w$]+)[\"`]?", Pattern.CASE_INSENSITIVE);
+
+    /** TRUNCATE TABLE t（schema change 流形态的兜底；主路径是 op=t 数据事件，见消费者） */
+    private static final Pattern MYSQL_TRUNCATE = Pattern.compile(
+            "^\\s*TRUNCATE\\s+(?:TABLE\\s+)?[\"`]?(?:[\\w$]+[\"`]?\\.[\"`]?)?([\\w$]+)[\"`]?",
+            Pattern.CASE_INSENSITIVE);
+
+    /** DROP DATABASE/SCHEMA db → 湖侧 DROP SCHEMA CASCADE（受 followDropTable 开关管） */
+    private static final Pattern MYSQL_DROP_DATABASE = Pattern.compile(
+            "^\\s*DROP\\s+(?:DATABASE|SCHEMA)\\s+(?:IF\\s+EXISTS\\s+)?[\"`]?([\\w$]+)[\"`]?",
+            Pattern.CASE_INSENSITIVE);
+
     private final DucklakeProperties props;
     private final SyncState syncState;
+
+    // ================================ PG 前端 ================================
 
     /**
      * 处理一段连续的 dbz_ddl_log 事件（由消费者在湖事务内调用，与数据写入同序同事务）。
      *
      * @param cacheInvalidator 湖表结构被本方法改动后回调（消费者失效其 knownColumns 缓存）；
      *                         以回调而非直引消费者，避免 consumer↔applier 循环依赖
-     * @param rebuildRequester 主键变更时回调（消费者标记湖表重建并触发增量快照重灌）
+     * @param rebuildRequester 主键变更时回调（消费者标记湖表重建并触发快照重灌）
      */
     public void apply(Connection conn, List<Struct> run, Consumer<String> cacheInvalidator,
                       Consumer<String> rebuildRequester) throws SQLException {
@@ -131,7 +169,6 @@ public class DdlApplier {
     /**
      * COMMENT ON TABLE/COLUMN 跟随：对象名取自 object_identity（规范名，免解析原句里的写法），
      * 注释值从 query_text 的 IS 之后原样搬运。重复应用=同值覆盖，天然幂等（快照重放同样无害）。
-     * 失败仅告警不抛出——注释是元数据锦上添花，不值得让 CDC 批进入重试。
      */
     private void applyComment(Connection conn, String objectType, String identity, String query) {
         if (identity == null || query == null
@@ -144,28 +181,19 @@ public class DdlApplier {
             return;
         }
         String value = m.group(1);
-        String target;
         if ("table".equals(objectType)) {
             String lakeTable = lakeTableOf(identity);
-            if (lakeTable == null) {
-                return;
+            if (lakeTable != null) {
+                commentInLake(conn, "TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable), value);
             }
-            target = "TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable);
         } else {
             int lastDot = identity.lastIndexOf('.');
             String col = identity.substring(lastDot + 1);
             String lakeTable = lakeTableOf(identity.substring(0, lastDot));
-            if (lakeTable == null) {
-                return;
+            if (lakeTable != null) {
+                commentInLake(conn, "COLUMN " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                        + ".\"" + col + "\"", value);
             }
-            target = "COLUMN " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable) + ".\"" + col + "\"";
-        }
-        try (Statement s = conn.createStatement()) {
-            s.execute("COMMENT ON " + target + " IS " + value);
-            syncState.getDdlApplied().increment();
-            log.info("湖侧注释跟随: {} IS {}", target, value.length() > 40 ? value.substring(0, 40) + "…" : value);
-        } catch (SQLException e) {
-            log.warn("湖侧注释应用失败(跳过,不影响数据链): {} ({})", target, e.getMessage());
         }
     }
 
@@ -183,15 +211,9 @@ public class DdlApplier {
             }
             String identity = str(row, "object_identity");
             String lakeTable = identity == null ? null : lakeTableOf(identity);
-            if (lakeTable == null) {
-                continue;
+            if (lakeTable != null) {
+                dropTableInLake(conn, lakeTable, cacheInvalidator);
             }
-            try (Statement s = conn.createStatement()) {
-                s.execute("DROP TABLE IF EXISTS " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable));
-            }
-            cacheInvalidator.accept(lakeTable);
-            syncState.getDdlApplied().increment();
-            log.warn("湖侧跟随删表: {}", lakeTable);
         }
     }
 
@@ -202,22 +224,9 @@ public class DdlApplier {
         if (!m.find() || objectIdentity == null) {
             return;
         }
-        String oldCol = m.group(1);
-        String newCol = m.group(2);
         String lakeTable = lakeTableOf(objectIdentity);
-        if (lakeTable == null) {
-            return;
-        }
-        if (columnExists(conn, lakeTable, oldCol) && !columnExists(conn, lakeTable, newCol)) {
-            try (Statement s = conn.createStatement()) {
-                s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
-                        + " RENAME COLUMN \"" + oldCol + "\" TO \"" + newCol + "\"");
-            }
-            cacheInvalidator.accept(lakeTable);
-            syncState.getDdlApplied().increment();
-            log.warn("湖侧真 rename 应用: {} {} -> {}", lakeTable, oldCol, newCol);
-        } else {
-            log.info("rename 跳过(已应用或列不存在): {} {} -> {}", lakeTable, oldCol, newCol);
+        if (lakeTable != null) {
+            renameColumnInLake(conn, lakeTable, m.group(1), m.group(2), cacheInvalidator);
         }
     }
 
@@ -236,20 +245,276 @@ public class DdlApplier {
             int lastDot = identity.lastIndexOf('.');
             String col = identity.substring(lastDot + 1);
             String lakeTable = lakeTableOf(identity.substring(0, lastDot));
-            if (lakeTable != null && columnExists(conn, lakeTable, col)) {
-                try (Statement s = conn.createStatement()) {
-                    s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable) + " DROP COLUMN \"" + col + "\"");
-                }
-                cacheInvalidator.accept(lakeTable);
-                syncState.getDdlApplied().increment();
-                log.warn("湖侧跟随删列: {}.{}", lakeTable, col);
+            if (lakeTable != null) {
+                dropColumnInLake(conn, lakeTable, col, cacheInvalidator);
             }
         }
     }
 
-    /** public.sys_user → <前缀>public.sys_user（镜像命名，与消费者的表命名规则一致） */
-    private String lakeTableOf(String pgIdentity) {
-        String[] parts = pgIdentity.split("\\.");
+    // ============================== MySQL 前端 ==============================
+
+    /**
+     * 处理一段连续的 MySQL schema change 事件（binlog DDL，Debezium 原生结构化；predicate 免
+     * unwrap 原样到达）。事件字段：databaseName / ddl（逐字 SQL 原文）/ tableChanges[]
+     * （type=CREATE|ALTER|DROP + 变更后的完整表结构快照）/ source.snapshot。
+     * <p>
+     * 语义判定：结构化优先（DROP 表、注释、主键列表来自 tableChanges），rename/删列这类
+     * "快照表达不出的迁移语义"从 ddl 原文正则取——与 PG 前端"目录语义配对"异曲同工，
+     * 判定后统一走湖端原语（幂等，快照重放/重复应用安全）。
+     * 快照期事件（source.snapshot ≠ false，即历史结构声明）一律只做注释跟随不做结构变更，
+     * 对齐 PG 前端对 op='r' 的处理。
+     */
+    public void applySchemaChange(Connection conn, List<Struct> events, Consumer<String> cacheInvalidator,
+                                  Consumer<String> rebuildRequester) throws SQLException {
+        syncState.getDdlAudited().increment(events.size());
+        for (Struct ev : events) {
+            String db = str(ev, "databaseName");
+            String ddl = str(ev, "ddl");
+            boolean snapshot = isSnapshotEvent(ev);
+            List<Struct> tableChanges = structList(ev, "tableChanges");
+
+            // ① DROP TABLE（结构化）：type=DROP 每表一个条目
+            if (props.getMaintenance().isFollowDropTable() && !snapshot) {
+                for (Struct tc : tableChanges) {
+                    if ("DROP".equals(str(tc, "type"))) {
+                        String lakeTable = lakeTableOfChangeId(db, str(tc, "id"));
+                        if (lakeTable != null) {
+                            dropTableInLake(conn, lakeTable, cacheInvalidator);
+                        }
+                    }
+                }
+            }
+            if (ddl == null || db == null || db.isBlank()) {
+                continue;
+            }
+            // ② DROP DATABASE → 湖 DROP SCHEMA CASCADE（tableChanges 为空,只有 ddl 原文）
+            Matcher dropDb = MYSQL_DROP_DATABASE.matcher(ddl);
+            if (props.getMaintenance().isFollowDropTable() && !snapshot && dropDb.find()) {
+                dropSchemaInLake(conn, dropDb.group(1), cacheInvalidator);
+                continue;
+            }
+            boolean isAlter = ddl.stripLeading().regionMatches(true, 0, "ALTER TABLE", 0, 11);
+            String targetTable = firstAlteredTable(db, tableChanges, ddl);
+            if (!snapshot && targetTable != null) {
+                // ③ RENAME COLUMN：8.0 语法直配；5.x CHANGE old new 且 old≠new 也是改名
+                if (isAlter) {
+                    Matcher rn = RENAME_COLUMN.matcher(ddl);
+                    while (rn.find()) {
+                        renameColumnInLake(conn, targetTable, rn.group(1), rn.group(2), cacheInvalidator);
+                    }
+                    Matcher ch = MYSQL_CHANGE_COLUMN.matcher(ddl);
+                    while (ch.find()) {
+                        if (!ch.group(1).equalsIgnoreCase(ch.group(2))) {
+                            renameColumnInLake(conn, targetTable, ch.group(1), ch.group(2), cacheInvalidator);
+                        }
+                    }
+                    // ④ DROP COLUMN（正则；漏匹配仅湖多留列，无数据正确性影响）
+                    if (props.getMaintenance().isFollowDropColumn()) {
+                        Matcher dc = MYSQL_DROP_COLUMN.matcher(ddl);
+                        while (dc.find()) {
+                            dropColumnInLake(conn, targetTable, dc.group(1), cacheInvalidator);
+                        }
+                    }
+                    // ⑤ 表重命名：ALTER TABLE x RENAME TO y（RENAME COLUMN 已在上面消费,此处负前瞻规避）
+                    Matcher rt = MYSQL_RENAME_TABLE_ALTER.matcher(ddl);
+                    if (rt.find() && !RENAME_COLUMN.matcher(ddl).find()) {
+                        renameTableInLake(conn, targetTable, rt.group(1), cacheInvalidator);
+                    }
+                    // ⑥ 主键变更 → 重建 + 快照重灌（对齐 PG 前端）
+                    if (PRIMARY_KEY_CHANGE.matcher(ddl).find()) {
+                        rebuildRequester.accept(targetTable);
+                    }
+                }
+            }
+            if (!snapshot) {
+                // ⑦ RENAME TABLE a TO b 独立语句（不依赖 tableChanges）
+                Matcher rts = MYSQL_RENAME_TABLE_STMT.matcher(ddl);
+                if (rts.find()) {
+                    String from = lakeTableOf(db + "." + rts.group(1));
+                    if (from != null) {
+                        renameTableInLake(conn, from, rts.group(2), cacheInvalidator);
+                    }
+                }
+                // ⑧ TRUNCATE（schema change 流形态兜底;主路径为 op=t 数据事件,见消费者）
+                Matcher tr = MYSQL_TRUNCATE.matcher(ddl);
+                if (props.getMaintenance().isFollowTruncate() && tr.find()) {
+                    truncateInLake(conn, lakeTableOf(db + "." + tr.group(1)));
+                }
+            }
+            // ⑨ 注释跟随（快照期也做:CREATE TABLE 的列注释借此落湖）:tableChanges 携带
+            //    变更后全列 comment(include.schema.comments=true),幂等覆盖
+            if (ddl.toUpperCase().contains("COMMENT")) {
+                applyCommentsFromTableChanges(conn, db, tableChanges);
+            }
+        }
+    }
+
+    /** 快照期 schema change（历史结构声明，非实时 DDL）：source.snapshot ∈ {true,last,...}≠false */
+    private static boolean isSnapshotEvent(Struct ev) {
+        if (ev.schema().field("source") == null || !(ev.get("source") instanceof Struct source)) {
+            return false;
+        }
+        String snapshot = str(source, "snapshot");
+        return snapshot != null && !"false".equals(snapshot);
+    }
+
+    /** 事件指向的第一张（也几乎总是唯一一张）被改表 → 湖表名：tableChanges.id 优先，ddl 正文兜底 */
+    private String firstAlteredTable(String db, List<Struct> tableChanges, String ddl) {
+        for (Struct tc : tableChanges) {
+            String lakeTable = lakeTableOfChangeId(db, str(tc, "id"));
+            if (lakeTable != null) {
+                return lakeTable;
+            }
+        }
+        // tableChanges 为空（如 TRUNCATE/部分语句）：从 ALTER TABLE `db`.`t` / TRUNCATE t 原文抓表名
+        Matcher m = Pattern.compile(
+                        "(?:ALTER|TRUNCATE)\\s+TABLE\\s+[\"`]?(?:([\\w$]+)[\"`]?\\.[\"`]?)?([\\w$]+)[\"`]?",
+                        Pattern.CASE_INSENSITIVE)
+                .matcher(ddl);
+        if (m.find()) {
+            return lakeTableOf((m.group(1) != null ? m.group(1) : db) + "." + m.group(2));
+        }
+        return null;
+    }
+
+    /** tableChanges.id（"db"."table"，表重命名时 "<old>,<new>" 取 old）→ 湖表名 */
+    private String lakeTableOfChangeId(String db, String id) {
+        if (id == null) {
+            return null;
+        }
+        String first = id.split(",")[0].replace("\"", "").replace("`", "");
+        // id 形如 db.table；防御仅表名的形态（拼上事件库名）
+        return lakeTableOf(first.contains(".") ? first : db + "." + first);
+    }
+
+    /** tableChanges 的列/表 comment → 湖侧 COMMENT ON（值经单引号转义;null 注释跳过——
+     *  MySQL 无"删注释"语义,置空表现为 comment=''，同样跟随覆盖） */
+    private void applyCommentsFromTableChanges(Connection conn, String db, List<Struct> tableChanges) {
+        for (Struct tc : tableChanges) {
+            if (!(tc.schema().field("table") != null && tc.get("table") instanceof Struct table)) {
+                continue;
+            }
+            String lakeTable = lakeTableOfChangeId(db, str(tc, "id"));
+            if (lakeTable == null) {
+                continue;
+            }
+            String tableComment = str(table, "comment");
+            if (tableComment != null) {
+                commentInLake(conn, "TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable),
+                        quoteLiteral(tableComment));
+            }
+            for (Struct col : structList(table, "columns")) {
+                String comment = str(col, "comment");
+                if (comment != null) {
+                    commentInLake(conn, "COLUMN " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                            + ".\"" + str(col, "name") + "\"", quoteLiteral(comment));
+                }
+            }
+        }
+    }
+
+    // ============================ 湖端执行原语（双前端共用） ============================
+
+    /** 湖表 rename 列：列存在性双检保证幂等（重复应用/快照重放安全跳过） */
+    private void renameColumnInLake(Connection conn, String lakeTable, String oldCol, String newCol,
+                                    Consumer<String> cacheInvalidator) throws SQLException {
+        if (columnExists(conn, lakeTable, oldCol) && !columnExists(conn, lakeTable, newCol)) {
+            try (Statement s = conn.createStatement()) {
+                s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                        + " RENAME COLUMN \"" + oldCol + "\" TO \"" + newCol + "\"");
+            }
+            cacheInvalidator.accept(lakeTable);
+            syncState.getDdlApplied().increment();
+            log.warn("湖侧真 rename 应用: {} {} -> {}", lakeTable, oldCol, newCol);
+        } else {
+            log.info("rename 跳过(已应用或列不存在): {} {} -> {}", lakeTable, oldCol, newCol);
+        }
+    }
+
+    /** 湖表删列（列存在才删，幂等） */
+    private void dropColumnInLake(Connection conn, String lakeTable, String col,
+                                  Consumer<String> cacheInvalidator) throws SQLException {
+        if (columnExists(conn, lakeTable, col)) {
+            try (Statement s = conn.createStatement()) {
+                s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                        + " DROP COLUMN \"" + col + "\"");
+            }
+            cacheInvalidator.accept(lakeTable);
+            syncState.getDdlApplied().increment();
+            log.warn("湖侧跟随删列: {}.{}", lakeTable, col);
+        }
+    }
+
+    /** 湖表真删（IF EXISTS 幂等；时间旅行窗口内旧 snapshot 仍可回看） */
+    private void dropTableInLake(Connection conn, String lakeTable,
+                                 Consumer<String> cacheInvalidator) throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("DROP TABLE IF EXISTS " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable));
+        }
+        cacheInvalidator.accept(lakeTable);
+        syncState.getDdlApplied().increment();
+        log.warn("湖侧跟随删表: {}", lakeTable);
+    }
+
+    /** 湖 schema 整删（MySQL DROP DATABASE 跟随；CASCADE 连带全部表） */
+    private void dropSchemaInLake(Connection conn, String db, Consumer<String> cacheInvalidator) throws SQLException {
+        String lakeSchema = props.getMaintenance().getSchemaPrefix() + db;
+        try (Statement s = conn.createStatement()) {
+            s.execute("DROP SCHEMA IF EXISTS " + DuckLakeEngine.LAKE + ".\"" + lakeSchema + "\" CASCADE");
+        }
+        cacheInvalidator.accept(lakeSchema + ".*");
+        syncState.getDdlApplied().increment();
+        log.warn("湖侧跟随删库(schema): {}", lakeSchema);
+    }
+
+    /** 湖表重命名（同 schema 内；目标已存在或源不存在时跳过，幂等） */
+    private void renameTableInLake(Connection conn, String lakeTable, String newTable,
+                                   Consumer<String> cacheInvalidator) throws SQLException {
+        String schema = lakeTable.substring(0, lakeTable.indexOf('.'));
+        String target = schema + "." + newTable;
+        if (tableExists(conn, lakeTable) && !tableExists(conn, target)) {
+            try (Statement s = conn.createStatement()) {
+                s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                        + " RENAME TO \"" + newTable + "\"");
+            }
+            cacheInvalidator.accept(lakeTable);
+            cacheInvalidator.accept(target);
+            syncState.getDdlApplied().increment();
+            log.warn("湖侧跟随表重命名: {} -> {}", lakeTable, target);
+        } else {
+            log.info("表重命名跳过(已应用或源表不存在): {} -> {}", lakeTable, target);
+        }
+    }
+
+    /** 湖表清空（TRUNCATE 跟随；表未落湖过则静默跳过） */
+    private void truncateInLake(Connection conn, String lakeTable) throws SQLException {
+        if (lakeTable == null || !tableExists(conn, lakeTable)) {
+            return;
+        }
+        try (Statement s = conn.createStatement()) {
+            s.execute("DELETE FROM " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable));
+        }
+        syncState.getDdlApplied().increment();
+        log.warn("湖侧跟随 TRUNCATE(清空): {}", lakeTable);
+    }
+
+    /** COMMENT ON 执行（值须已是合法字面量）。失败仅告警——注释是元数据锦上添花，
+     *  不值得让 CDC 批进入重试 */
+    private void commentInLake(Connection conn, String target, String valueLiteral) {
+        try (Statement s = conn.createStatement()) {
+            s.execute("COMMENT ON " + target + " IS " + valueLiteral);
+            syncState.getDdlApplied().increment();
+            log.info("湖侧注释跟随: {} IS {}", target,
+                    valueLiteral.length() > 40 ? valueLiteral.substring(0, 40) + "…" : valueLiteral);
+        } catch (SQLException e) {
+            log.warn("湖侧注释应用失败(跳过,不影响数据链): {} ({})", target, e.getMessage());
+        }
+    }
+
+    /** public.sys_user → <前缀>public.sys_user（镜像命名，与消费者的表命名规则一致；
+     *  MySQL 侧 db.table 同位映射） */
+    private String lakeTableOf(String sourceIdentity) {
+        String[] parts = sourceIdentity.split("\\.");
         if (parts.length < 2) {
             return null;
         }
@@ -270,12 +535,40 @@ public class DdlApplier {
         }
     }
 
+    private boolean tableExists(Connection conn, String lakeTable) throws SQLException {
+        String[] parts = lakeTable.split("\\.", 2);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT 1 FROM information_schema.tables WHERE table_catalog=? AND table_schema=? AND table_name=?")) {
+            ps.setString(1, DuckLakeEngine.LAKE);
+            ps.setString(2, parts[0]);
+            ps.setString(3, parts[1]);
+            try (var rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    /** 明文 → SQL 单引号字面量（'' 转义） */
+    private static String quoteLiteral(String text) {
+        return "'" + text.replace("'", "''") + "'";
+    }
+
     private static String str(Struct row, String field) {
         if (row.schema().field(field) == null) {
             return null;
         }
         Object v = row.get(field);
         return v == null ? null : v.toString();
+    }
+
+    /** Struct 的数组字段 → List<Struct>（字段缺失/空返回空列表，防御 schema 差异） */
+    @SuppressWarnings("unchecked")
+    private static List<Struct> structList(Struct row, String field) {
+        if (row.schema().field(field) == null) {
+            return List.of();
+        }
+        Object v = row.get(field);
+        return v instanceof List<?> list ? (List<Struct>) list : List.of();
     }
 
     private static Long asLong(Struct row, String field) {

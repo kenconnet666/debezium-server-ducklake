@@ -160,6 +160,61 @@ class TypeMapperTest {
         }
     }
 
+    /** MySQL 空间族(Geometry/Point):Struct{wkb,srid} 取 WKB 落 BLOB,hex-staging 往返无损 */
+    @Test
+    void geometryStructMapsToBlobViaWkb() throws SQLException {
+        Schema geo = SchemaBuilder.struct().name("io.debezium.data.geometry.Geometry")
+                .field("wkb", Schema.BYTES_SCHEMA)
+                .field("srid", Schema.OPTIONAL_INT32_SCHEMA)
+                .optional().build();
+        assertThat(TypeMapper.duckType(geo)).isEqualTo("BLOB");
+
+        byte[] wkb = {0x01, 0x01, 0x00, 0x00, 0x00, 0x2A}; // 任意 WKB 字节
+        Struct point = new Struct(geo).put("wkb", wkb).put("srid", 4326);
+        // staging 文本=hex,castExpr(BLOB)=unhex——真 DuckDB 回读闭环
+        String staged = TypeMapper.stagingText(geo, point);
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE t_geo AS SELECT " + TypeMapper.castExpr("v", "BLOB")
+                    + " AS g FROM (SELECT '" + staged + "' AS v)");
+        }
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery("SELECT g FROM t_geo")) {
+            rs.next();
+            assertThat(rs.getBytes(1)).isEqualTo(wkb);
+        }
+    }
+
+    /** MySQL 特有逻辑类型按物理类型兜底：Year→INTEGER、Enum/EnumSet→VARCHAR、Bits→BLOB */
+    @Test
+    void mysqlLogicalTypesFallBackToPhysical() {
+        assertThat(TypeMapper.duckType(SchemaBuilder.int32().name("io.debezium.time.Year").build()))
+                .isEqualTo("INTEGER");
+        assertThat(TypeMapper.duckType(SchemaBuilder.string().name("io.debezium.data.Enum").build()))
+                .isEqualTo("VARCHAR");
+        assertThat(TypeMapper.duckType(SchemaBuilder.string().name("io.debezium.data.EnumSet").build()))
+                .isEqualTo("VARCHAR");
+        assertThat(TypeMapper.duckType(SchemaBuilder.bytes().name("io.debezium.data.Bits").build()))
+                .isEqualTo("BLOB");
+    }
+
+    /** 时间族毒丸防护:TRY_CAST 让 MySQL TIME>24h/zero-date 个别值置 NULL 而非整批 crash loop */
+    @Test
+    void timeFamilyCastExprUsesTryCastAgainstPoisonValues() throws SQLException {
+        assertThat(TypeMapper.castExpr("c", "TIME")).isEqualTo("TRY_CAST(\"c\" AS TIME)");
+        assertThat(TypeMapper.castExpr("c", "DATE")).isEqualTo("TRY_CAST(\"c\" AS DATE)");
+        assertThat(TypeMapper.castExpr("c", "TIMESTAMP")).isEqualTo("TRY_CAST(\"c\" AS TIMESTAMP)");
+        assertThat(TypeMapper.castExpr("c", "TIMESTAMPTZ")).isEqualTo("TRY_CAST(\"c\" AS TIMESTAMPTZ)");
+        assertThat(TypeMapper.castExpr("c", "BIGINT")).isEqualTo("CAST(\"c\" AS BIGINT)"); // 非时间族仍严格 CAST
+
+        // 真 DuckDB 验证:毒丸值(MySQL TIME 合法值域 ±838h / zero-date)不炸、正常值无损
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT TRY_CAST('838:59:59' AS TIME), TRY_CAST('0000-00-00' AS DATE), TRY_CAST('12:34:56' AS TIME)")) {
+            rs.next();
+            assertThat(rs.getObject(1)).isNull();
+            assertThat(rs.getObject(2)).isNull();
+            assertThat(rs.getObject(3, java.time.LocalTime.class)).isEqualTo(java.time.LocalTime.of(12, 34, 56));
+        }
+    }
+
     @Test
     void bindNullSetsSqlNull() throws SQLException {
         try (Statement s = conn.createStatement()) {

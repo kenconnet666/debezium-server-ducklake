@@ -292,6 +292,172 @@ class DdlApplierTest {
         assertThat(rebuilds).isEmpty();
     }
 
+    // ---------- MySQL schema change 前端（applySchemaChange） ----------
+
+    private static final Schema CHANGE_TABLE_COLUMN = SchemaBuilder.struct().name("Column")
+            .field("name", Schema.STRING_SCHEMA)
+            .field("comment", Schema.OPTIONAL_STRING_SCHEMA)
+            .optional().build();
+    private static final Schema CHANGE_TABLE = SchemaBuilder.struct().name("Table")
+            .field("comment", Schema.OPTIONAL_STRING_SCHEMA)
+            .field("columns", SchemaBuilder.array(CHANGE_TABLE_COLUMN).optional().build())
+            .optional().build();
+    private static final Schema TABLE_CHANGE = SchemaBuilder.struct().name("Change")
+            .field("type", Schema.STRING_SCHEMA)
+            .field("id", Schema.STRING_SCHEMA)
+            .field("table", CHANGE_TABLE)
+            .optional().build();
+    private static final Schema CHANGE_SOURCE = SchemaBuilder.struct().name("Source")
+            .field("snapshot", Schema.OPTIONAL_STRING_SCHEMA)
+            .optional().build();
+    private static final Schema SCHEMA_CHANGE = SchemaBuilder.struct().name("SchemaChangeValue")
+            .field("source", CHANGE_SOURCE)
+            .field("databaseName", Schema.OPTIONAL_STRING_SCHEMA)
+            .field("ddl", Schema.OPTIONAL_STRING_SCHEMA)
+            .field("tableChanges", SchemaBuilder.array(TABLE_CHANGE).optional().build())
+            .build();
+
+    /** 构造 MySQL schema change 事件（snapshot=false 的实时 DDL） */
+    private static Struct changeEvent(String db, String ddl, Struct... tableChanges) {
+        return changeEventWithSnapshot(db, ddl, "false", tableChanges);
+    }
+
+    private static Struct changeEventWithSnapshot(String db, String ddl, String snapshot, Struct... tableChanges) {
+        return new Struct(SCHEMA_CHANGE)
+                .put("source", new Struct(CHANGE_SOURCE).put("snapshot", snapshot))
+                .put("databaseName", db)
+                .put("ddl", ddl)
+                .put("tableChanges", List.of(tableChanges));
+    }
+
+    private static Struct tableChange(String type, String id) {
+        return new Struct(TABLE_CHANGE).put("type", type).put("id", id);
+    }
+
+    private void applyChange(Struct... events) throws SQLException {
+        applier.applySchemaChange(conn, List.of(events), invalidated::add, rebuilds::add);
+    }
+
+    @Test
+    void mysqlRenameColumnBothSyntaxesFollow() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
+            s.execute("CREATE TABLE lake.shop.m1 (id BIGINT, note VARCHAR, alias VARCHAR)");
+        }
+        // 8.0 RENAME COLUMN 语法（反引号标识符）
+        applyChange(changeEvent("shop", "ALTER TABLE `shop`.`m1` RENAME COLUMN `note` TO `remark`",
+                tableChange("ALTER", "\"shop\".\"m1\"")));
+        // 5.x CHANGE 语法改名（old≠new）
+        applyChange(changeEvent("shop", "ALTER TABLE m1 CHANGE alias nickname varchar(64)",
+                tableChange("ALTER", "\"shop\".\"m1\"")));
+
+        assertThat(columns("shop", "m1")).containsExactly("id", "remark", "nickname");
+        // CHANGE 同名（纯类型变更）不触发 rename
+        applyChange(changeEvent("shop", "ALTER TABLE m1 CHANGE nickname nickname varchar(255)",
+                tableChange("ALTER", "\"shop\".\"m1\"")));
+        assertThat(columns("shop", "m1")).containsExactly("id", "remark", "nickname");
+    }
+
+    @Test
+    void mysqlDropColumnAndDropTableFollow() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
+            s.execute("CREATE TABLE lake.shop.m2 (id BIGINT, legacy VARCHAR)");
+            s.execute("CREATE TABLE lake.shop.m3 (id BIGINT)");
+        }
+        applyChange(changeEvent("shop", "ALTER TABLE m2 DROP COLUMN legacy",
+                tableChange("ALTER", "\"shop\".\"m2\"")));
+        assertThat(columns("shop", "m2")).containsExactly("id");
+
+        // DROP TABLE 走结构化 tableChanges type=DROP（ddl 原文无关紧要）
+        applyChange(changeEvent("shop", "DROP TABLE `m3`", tableChange("DROP", "\"shop\".\"m3\"")));
+        assertThat(tableExists("shop", "m3")).isFalse();
+        // DROP PRIMARY KEY 不得误判为删列
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE lake.shop.m4 (id BIGINT, name VARCHAR)");
+        }
+        applyChange(changeEvent("shop", "ALTER TABLE m4 DROP PRIMARY KEY",
+                tableChange("ALTER", "\"shop\".\"m4\"")));
+        assertThat(columns("shop", "m4")).containsExactly("id", "name");
+        assertThat(rebuilds).contains("shop.m4"); // 但主键变更触发重建
+    }
+
+    @Test
+    void mysqlRenameTableAndTruncateFollow() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
+            s.execute("CREATE TABLE lake.shop.m5 (id BIGINT)");
+            s.execute("INSERT INTO lake.shop.m5 VALUES (1), (2)");
+        }
+        // 表重命名:tableChanges id 为 "<old>,<new>" 拼接形态
+        applyChange(changeEvent("shop", "ALTER TABLE m5 RENAME TO m5_new",
+                tableChange("ALTER", "\"shop\".\"m5\",\"shop\".\"m5_new\"")));
+        assertThat(tableExists("shop", "m5")).isFalse();
+        assertThat(tableExists("shop", "m5_new")).isTrue();
+
+        // TRUNCATE(schema change 流形态兜底)
+        applyChange(changeEvent("shop", "TRUNCATE TABLE m5_new"));
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT count(*) FROM lake.shop.m5_new")) {
+            rs.next();
+            assertThat(rs.getLong(1)).isZero();
+        }
+    }
+
+    @Test
+    void mysqlDropDatabaseFollowsAsSchemaCascade() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA IF NOT EXISTS lake.olddb");
+            s.execute("CREATE TABLE lake.olddb.x1 (id BIGINT)");
+        }
+        applyChange(changeEvent("olddb", "DROP DATABASE `olddb`"));
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT count(*) FROM information_schema.schemata WHERE catalog_name='lake' AND schema_name='olddb'")) {
+            rs.next();
+            assertThat(rs.getLong(1)).as("湖 schema 应随 DROP DATABASE 级联删除").isZero();
+        }
+    }
+
+    @Test
+    void mysqlSnapshotPhaseDdlOnlyFollowsComments() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
+            s.execute("CREATE TABLE lake.shop.m6 (id BIGINT, note VARCHAR)");
+        }
+        // 快照期(snapshot=true)的历史 DDL:结构变更一律跳过(活表不能被历史 DDL 误删/误改)
+        Struct dropInSnapshot = changeEventWithSnapshot("shop", "DROP TABLE m6", "true",
+                tableChange("DROP", "\"shop\".\"m6\""));
+        applyChange(dropInSnapshot);
+        assertThat(tableExists("shop", "m6")).isTrue();
+
+        // 但快照期 CREATE TABLE 携带的注释照样跟随(存量表注释借初始快照落湖)
+        Struct col = new Struct(CHANGE_TABLE_COLUMN).put("name", "note").put("comment", "备注列");
+        Struct table = new Struct(CHANGE_TABLE).put("comment", "商品表")
+                .put("columns", List.of(col));
+        Struct create = new Struct(TABLE_CHANGE).put("type", "CREATE")
+                .put("id", "\"shop\".\"m6\"").put("table", table);
+        applyChange(changeEventWithSnapshot("shop",
+                "CREATE TABLE m6 (id bigint, note varchar(64) COMMENT '备注列') COMMENT='商品表'", "true", create));
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT comment FROM duckdb_tables() WHERE database_name='lake' AND schema_name='shop' AND table_name='m6'")) {
+            rs.next();
+            assertThat(rs.getString(1)).isEqualTo("商品表");
+        }
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT comment FROM duckdb_columns() WHERE database_name='lake' "
+                        + "AND schema_name='shop' AND table_name='m6' AND column_name='note'")) {
+            rs.next();
+            assertThat(rs.getString(1)).isEqualTo("备注列");
+        }
+    }
+
+    @Test
+    void mysqlPrimaryKeyAddTriggersRebuild() throws Exception {
+        applyChange(changeEvent("shop", "ALTER TABLE m7 ADD PRIMARY KEY (id)",
+                tableChange("ALTER", "\"shop\".\"m7\"")));
+        assertThat(rebuilds).containsExactly("shop.m7");
+    }
+
     // ---------- 工具 ----------
 
     private static List<String> columns(String schema, String table) throws SQLException {

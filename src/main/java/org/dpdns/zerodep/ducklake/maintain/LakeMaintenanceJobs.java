@@ -178,23 +178,30 @@ public class LakeMaintenanceJobs {
     }
 
     /**
-     * 源库信号表阅后即焚：TRUNCATE 不产生复制事件（Debezium 默认 skipped.operations=t），
-     * 已提交信号早在 WAL/复制流内、消费与表内容无关，任意时刻清空都安全；重快照后无历史信号
-     * 也安全（rename/删列应用有列存在性幂等兜底）。⚠️ 不能用 DELETE 清——会产生墓碑事件流进
-     * DdlApplier（其 __op 过滤只是兜底）。需要 GRANT TRUNCATE ON dbz_ddl_log TO dbuser_cdc。
+     * 源库信号表阅后即焚：已提交信号早在复制流内、消费与表内容无关，任意时刻清空都安全；
+     * 重快照后无历史信号也安全（rename/删列应用有列存在性幂等兜底）。
+     * ⚠️ 不能用 DELETE 清——会产生墓碑事件流进 DdlApplier（其 __op 过滤只是兜底）。
+     * 需要 GRANT TRUNCATE（PG）/ DROP 权限（MySQL 的 TRUNCATE 走 DROP 权限）。
+     * PG：TRUNCATE 不产生复制事件（Debezium 默认 skipped.operations=t）。
+     * MySQL：TRUNCATE 是 DDL 会进 binlog——signal 表从不落湖（行事件被连接器内部消费），
+     * 消费者对未落湖表的 TRUNCATE 静默跳过，无副作用。
+     * DDL 审计表是 PG event trigger 专属基建，MySQL 模式不存在、跳过。
      */
     private void truncateDdlSignals() {
         DucklakeProperties.Source src = props.getSource();
-        String url = "jdbc:postgresql://%s:%d/%s".formatted(src.getHostname(), src.getPort(), src.getDbname());
-        try (Connection c = DriverManager.getConnection(url, src.getUser(), src.getPassword());
+        try (Connection c = DriverManager.getConnection(src.jdbcUrl(), src.getUser(), src.getPassword());
              Statement s = c.createStatement()) {
-            for (String table : props.getMaintenance().getDdlAuditTables()) {
-                s.execute("TRUNCATE TABLE " + table);
+            if (src.getType() == DucklakeProperties.SourceType.POSTGRES) {
+                for (String table : props.getMaintenance().getDdlAuditTables()) {
+                    s.execute("TRUNCATE TABLE " + table);
+                }
             }
             // 增量快照 signal 表同样阅后即焚(已消费的 execute-snapshot 与水位标记行无保留价值)
-            s.execute("TRUNCATE TABLE " + src.getSignalTable());
+            s.execute("TRUNCATE TABLE " + src.resolvedSignalTable());
             log.info("信号表已清空(防堆积): {} + {}",
-                    props.getMaintenance().getDdlAuditTables(), src.getSignalTable());
+                    src.getType() == DucklakeProperties.SourceType.POSTGRES
+                            ? props.getMaintenance().getDdlAuditTables() : "[]",
+                    src.resolvedSignalTable());
         } catch (SQLException e) {
             // 单项失败不影响主链;常见原因是 TRUNCATE 未授权(见 init 脚本 GRANT)或源库瞬时不可达
             log.warn("信号表清理失败: {}", e.getMessage());
