@@ -297,7 +297,7 @@ public class DuckLakeChangeConsumer
      */
     private void insertFromStaging(Connection conn, Segment seg, int idx) throws SQLException {
         TableRef ref = TableRef.parse(seg.topic());
-        // 镜像命名:湖 schema = <前缀><pg_schema>,表名原样(lake."my-public".demo / lake.public.demo)
+        // 镜像命名:湖 schema = <前缀><pg_schema>,表名原样(lake.my_public.demo / lake.public.demo)
         String lakeTable = props.getMaintenance().getSchemaPrefix() + ref.pgSchema() + "." + ref.table();
         ensureTable(conn, lakeTable, seg.schema());
 

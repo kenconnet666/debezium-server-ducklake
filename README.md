@@ -140,7 +140,7 @@ SELECT count(*) FROM lake.public.demo;
 | `engine.heartbeat-action-query` | 空 | **强烈建议配置**：零流量时唯一能触发 LSN 确认的机制（prod profile 已带默认 UPSERT 语句） |
 | `engine.dry-run` | `false` | 诊断：空转不写湖测纯解码吞吐。⚠️ 生产必须 false（offset 照推进=丢数据） |
 | `maintenance.enabled` | `true` | 湖维护调度总开关 |
-| `maintenance.schema-prefix` | 空 | 湖 schema 前缀：空=纯镜像（源 `public.demo` → 湖 `lake.public.demo`）；多个源库实例共享同一湖时各配前缀隔离（如 `erp-` → `lake."erp-public".demo`） |
+| `maintenance.schema-prefix` | 空 | 湖 schema 前缀：空=纯镜像（源 `public.demo` → 湖 `lake.public.demo`）；多个源库实例共享同一湖时各配前缀隔离（如 `erp_` → `lake.erp_public.demo`；仅小写字母/数字/下划线） |
 | `maintenance.follow-drop-table` | `true` | 源 DROP TABLE/DROP SCHEMA 跟随真删湖表（false=湖表保留） |
 | `maintenance.follow-drop-column` | `true` | DDL 删列跟随真删（false=湖保留历史列） |
 | `maintenance.follow-type-change` | `true` | 类型严格跟随三级策略 |

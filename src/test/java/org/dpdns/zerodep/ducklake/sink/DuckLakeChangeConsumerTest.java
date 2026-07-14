@@ -393,20 +393,21 @@ class DuckLakeChangeConsumerTest {
                 .isEqualTo(new DuckLakeChangeConsumer.TableRef("public", "only"));
     }
 
-    /** 湖 schema 前缀:多源库实例共享同一湖时以前缀隔离命名空间(含连字符,验证全链引号化) */
+    /** 湖 schema 前缀:多源库实例共享同一湖时以前缀隔离命名空间——前缀限定合法标识符
+     *  (下划线),用户查询无需引号 */
     @Test
     void schemaPrefixIsolatesLakeNamespace() throws Exception {
-        props.getMaintenance().setSchemaPrefix("my-");
+        props.getMaintenance().setSchemaPrefix("my_");
         try {
             consumer.handleBatch(List.of(
                     rowEvent("zadmin.public.t12", 1, "a", "c", 1200),
-                    rowEvent("zadmin.public.t12", 1, "a2", "u", 1201)   // upsert 路径也过引号链
+                    rowEvent("zadmin.public.t12", 1, "a2", "u", 1201)   // upsert 路径全链过一遍
             ), committer());
         } finally {
             props.getMaintenance().setSchemaPrefix("");
         }
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT count(*), max(name) FROM lake.\"my-public\".t12")) {
+             ResultSet rs = s.executeQuery("SELECT count(*), max(name) FROM lake.my_public.t12")) {
             rs.next();
             assertThat(rs.getLong(1)).isEqualTo(1);
             assertThat(rs.getString(2)).isEqualTo("a2");

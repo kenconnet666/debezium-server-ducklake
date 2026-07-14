@@ -41,8 +41,9 @@ public class DuckLakeEngine {
     /** ATTACH 后的湖别名，全模块 SQL 统一用 lake.<schema>.<table> 引用 */
     public static final String LAKE = "lake";
 
-    /** 湖内两段名 schema.table → "schema"."table"——湖 schema 可带用户前缀（如 my-public，
-     *  含连字符等非标识符字符），所有 SQL 拼接必须经引号化 */
+    /** 湖内两段名 schema.table → "schema"."table"。前缀已被启动校验约束为合法标识符
+     *  （查询侧因此无需引号），此处引号化是对 PG 侧任意命名对象（引号建的大写/特殊字符
+     *  表名）的防御——对普通标识符加引号语义等价、零副作用 */
     public static String quoted(String lakeTable) {
         int dot = lakeTable.indexOf('.');
         return '"' + lakeTable.substring(0, dot) + "\".\"" + lakeTable.substring(dot + 1) + '"';
@@ -73,6 +74,14 @@ public class DuckLakeEngine {
     @PostConstruct
     public void init() throws SQLException {
         DucklakeProperties.Lake lake = props.getLake();
+
+        // 湖 schema 前缀 fail-fast:限定小写字母/数字/下划线,保证湖 schema 是普通合法标识符
+        // (用户查询 lake.my_public.demo 无需引号;连字符等会迫使全生态带引号引用,体验差)
+        String prefix = props.getMaintenance().getSchemaPrefix();
+        if (!prefix.matches("[a-z0-9_]*")) {
+            throw new IllegalStateException(
+                    "ducklake.maintenance.schema-prefix 仅允许小写字母/数字/下划线(如 \"my_\"),当前值: \"" + prefix + '"');
+        }
 
         // ① 锚连接：instance 级初始化，一次生效、全 instance 共享。
         // 扩展三件套：ducklake(湖格式) + postgres(DuckLake 的 PG catalog 走它) + httpfs(S3)。
