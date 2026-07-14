@@ -204,6 +204,7 @@ DuckDB 的 Parquet writer 按 row group 容量**预分配**列缓冲（与实际
 | 湖里查不到刚写的数据 | 小批走了 Data Inlining 在 catalog 元空间，属正常——查询照常可见；物理落盘由 quick 任务定时 flush |
 | 崩溃重启后短暂"回退" | offset flush 间隔（默认 10s)内的批被按序重放（at-least-once），重放期间中间态短暂回退、追平后与主库一致；镜像 upsert 幂等，不会产生重复行 |
 | 无主键表 UPDATE/DELETE 没跟随 | 设计降级：事件无 key 无法定位湖行，insert-only（日志有每表一次的 WARN）。给源表加主键即恢复完整镜像 |
+| 源库 DELETE 报 `55000: cannot delete from table ... no replica identity` | `FOR ALL TABLES` publication 的 PG 约束：无主键（无 replica identity）的表**连源库自己的 DELETE/UPDATE 都被拒**。修法：`ALTER TABLE <表> ADD COLUMN id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY;` + `REPLICA IDENTITY FULL`（顺带恢复湖侧完整镜像）|
 | 源 TRUNCATE 后湖没清空 | TRUNCATE 事件暂不跟随（见数据语义节）；用 `DELETE FROM` 替代或湖侧手动清 |
 
 ## 性能参考
