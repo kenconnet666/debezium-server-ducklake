@@ -181,7 +181,7 @@ public class LakeMaintenanceJobs {
      * 源库信号表阅后即焚：TRUNCATE 不产生复制事件（Debezium 默认 skipped.operations=t），
      * 已提交信号早在 WAL/复制流内、消费与表内容无关，任意时刻清空都安全；重快照后无历史信号
      * 也安全（rename/删列应用有列存在性幂等兜底）。⚠️ 不能用 DELETE 清——会产生墓碑事件流进
-     * DdlApplier（其 __op 过滤只是兜底）。需要 GRANT TRUNCATE ON sys_ddl_log TO dbuser_cdc。
+     * DdlApplier（其 __op 过滤只是兜底）。需要 GRANT TRUNCATE ON dbz_ddl_log TO dbuser_cdc。
      */
     private void truncateDdlSignals() {
         DucklakeProperties.Source src = props.getSource();

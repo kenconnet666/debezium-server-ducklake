@@ -28,7 +28,7 @@ EOF
 
 # ── DDL 审计流 + signal 表 + 心跳表(湖侧 DDL 跟随/类型重建兜底/防空闲 WAL 扣留)──
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-'EOSQL'
-    CREATE TABLE public.sys_ddl_log (
+    CREATE TABLE public.dbz_ddl_log (
         id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         ev              text NOT NULL,
         tag             text,
@@ -46,8 +46,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-'
       FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
         IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
            AND r.schema_name NOT LIKE 'pg_temp%'
-           AND r.object_identity <> 'public.sys_ddl_log' THEN
-          INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
+           AND r.object_identity <> 'public.dbz_ddl_log' THEN
+          INSERT INTO public.dbz_ddl_log(ev, tag, object_type, object_identity, query_text)
           VALUES ('ddl_command_end', r.command_tag, r.object_type, r.object_identity, current_query());
         END IF;
       END LOOP;
@@ -61,8 +61,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-'
         IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
            AND r.schema_name NOT LIKE 'pg_temp%'
            AND r.object_type IN ('table', 'table column')
-           AND r.object_identity NOT LIKE 'public.sys_ddl_log%' THEN
-          INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
+           AND r.object_identity NOT LIKE 'public.dbz_ddl_log%' THEN
+          INSERT INTO public.dbz_ddl_log(ev, tag, object_type, object_identity, query_text)
           VALUES ('sql_drop', tg_tag, r.object_type, r.object_identity, current_query());
         END IF;
       END LOOP;
@@ -73,7 +73,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-'
     CREATE EVENT TRIGGER trg_capture_drop ON sql_drop
         WHEN TAG IN ('ALTER TABLE', 'DROP TABLE', 'DROP SCHEMA') EXECUTE FUNCTION fn_capture_drop();
 
-    GRANT TRUNCATE ON public.sys_ddl_log TO dbuser_cdc;
+    GRANT TRUNCATE ON public.dbz_ddl_log TO dbuser_cdc;
 
     CREATE TABLE public.dbz_signal (
         id varchar(42) PRIMARY KEY, type varchar(32) NOT NULL, data varchar(2048));

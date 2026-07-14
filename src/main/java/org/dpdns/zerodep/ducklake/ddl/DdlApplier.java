@@ -21,7 +21,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * DDL 信号流消费：PG event trigger（ddl_command_end + sql_drop）写入 sys_ddl_log，
+ * DDL 信号流消费：PG event trigger（ddl_command_end + sql_drop）写入 dbz_ddl_log，
  * 该表随 publication 被 Debezium 当普通表抓走，到这里翻译应用到湖侧——**纯跟随，不留档**
  * （2026-07-08 起湖侧 meta.ddl_history 审计已裁撤；信号表本身由维护任务每日 TRUNCATE 阅后即焚）。
  * <p>
@@ -60,7 +60,7 @@ public class DdlApplier {
     private final SyncState syncState;
 
     /**
-     * 处理一段连续的 sys_ddl_log 事件（由消费者在湖事务内调用，与数据写入同序同事务）。
+     * 处理一段连续的 dbz_ddl_log 事件（由消费者在湖事务内调用，与数据写入同序同事务）。
      *
      * @param cacheInvalidator 湖表结构被本方法改动后回调（消费者失效其 knownColumns 缓存）；
      *                         以回调而非直引消费者，避免 consumer↔applier 循环依赖

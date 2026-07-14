@@ -154,6 +154,6 @@ public class DucklakeProperties {
         private String schemaPrefix = "";
         /** DDL 信号源表（PG 侧 event trigger 写入，随 publication 复制过来；阅后即焚，
          *  由维护任务每日 TRUNCATE 防堆积——TRUNCATE 不产生复制事件） */
-        private List<String> ddlAuditTables = List.of("sys_ddl_log");
+        private List<String> ddlAuditTables = List.of("dbz_ddl_log");
     }
 }

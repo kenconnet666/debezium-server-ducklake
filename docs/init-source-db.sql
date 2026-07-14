@@ -31,9 +31,9 @@ END $$;
 -- CREATE ROLE lake_admin LOGIN PASSWORD 'changeme';
 -- CREATE DATABASE ducklake_catalog OWNER lake_admin;   -- 重跑报 already exists 可忽略
 
--- ④ DDL 审计流：event trigger 把 DDL 写进 sys_ddl_log，
+-- ④ DDL 审计流：event trigger 把 DDL 写进 dbz_ddl_log，
 --    该表在 publication 内随流复制，服务端 DdlApplier 据此跟随 rename/删列
-CREATE TABLE IF NOT EXISTS public.sys_ddl_log (
+CREATE TABLE IF NOT EXISTS public.dbz_ddl_log (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     ev text NOT NULL, tag text, object_type text, object_identity text, query_text text,
     xid bigint NOT NULL DEFAULT (pg_current_xact_id()::text::bigint),
@@ -47,8 +47,8 @@ BEGIN
   FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
     IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
        AND r.schema_name NOT LIKE 'pg_temp%'
-       AND r.object_identity <> 'public.sys_ddl_log' THEN
-      INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
+       AND r.object_identity <> 'public.dbz_ddl_log' THEN
+      INSERT INTO public.dbz_ddl_log(ev, tag, object_type, object_identity, query_text)
       VALUES ('ddl_command_end', r.command_tag, r.object_type, r.object_identity, current_query());
     END IF;
   END LOOP;
@@ -62,8 +62,8 @@ BEGIN
     IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
        AND r.schema_name NOT LIKE 'pg_temp%'
        AND r.object_type IN ('table', 'table column')
-       AND r.object_identity NOT LIKE 'public.sys_ddl_log%' THEN
-      INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
+       AND r.object_identity NOT LIKE 'public.dbz_ddl_log%' THEN
+      INSERT INTO public.dbz_ddl_log(ev, tag, object_type, object_identity, query_text)
       VALUES ('sql_drop', tg_tag, r.object_type, r.object_identity, current_query());
     END IF;
   END LOOP;
@@ -76,7 +76,7 @@ DROP EVENT TRIGGER IF EXISTS trg_capture_drop;
 CREATE EVENT TRIGGER trg_capture_drop ON sql_drop
     WHEN TAG IN ('ALTER TABLE', 'DROP TABLE', 'DROP SCHEMA') EXECUTE FUNCTION fn_capture_drop();
 
-GRANT TRUNCATE ON public.sys_ddl_log TO dbuser_cdc;  -- 维护任务定期清空防堆积
+GRANT TRUNCATE ON public.dbz_ddl_log TO dbuser_cdc;  -- 维护任务定期清空防堆积
 
 -- ⑤ Debezium 增量快照 signal 表（source channel）：
 --    类型严格跟随的"重建+重拉"兜底经它触发；连接器的快照水位标记也写在此表

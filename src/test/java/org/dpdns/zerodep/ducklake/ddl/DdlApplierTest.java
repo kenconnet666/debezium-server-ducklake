@@ -36,7 +36,7 @@ class DdlApplierTest {
     private List<String> invalidated;
     private List<String> rebuilds;
 
-    private static final Schema DDL_SCHEMA = SchemaBuilder.struct().name("sys_ddl_log.Value")
+    private static final Schema DDL_SCHEMA = SchemaBuilder.struct().name("dbz_ddl_log.Value")
             .field("id", Schema.OPTIONAL_INT64_SCHEMA)
             .field("ev", Schema.STRING_SCHEMA)
             .field("tag", Schema.OPTIONAL_STRING_SCHEMA)

@@ -236,7 +236,7 @@ class DuckLakeChangeConsumerTest {
 
     @Test
     void ddlAuditTopicRoutesToApplierNotDataTable() throws Exception {
-        Schema ddlSchema = SchemaBuilder.struct().name("sys_ddl_log.Value")
+        Schema ddlSchema = SchemaBuilder.struct().name("dbz_ddl_log.Value")
                 .field("id", Schema.INT64_SCHEMA)
                 .field("ev", Schema.STRING_SCHEMA)
                 .field("tag", Schema.OPTIONAL_STRING_SCHEMA)
@@ -254,15 +254,15 @@ class DuckLakeChangeConsumerTest {
                 .put("occurred_at", "2026-07-07T10:00:00+08:00").put("__lsn", 300L);
 
         consumer.handleBatch(List.of(
-                event(new SourceRecord(Map.of(), Map.of(), "zadmin.public.sys_ddl_log", ddlSchema, ddlRow))
+                event(new SourceRecord(Map.of(), Map.of(), "zadmin.public.dbz_ddl_log", ddlSchema, ddlRow))
         ), committer());
 
         // 信号被 DdlApplier 消费(计数推进)
         assertThat(syncState.getDdlAudited().count()).isEqualTo(1);
         try (Statement s = conn.createStatement()) {
-            // 没有被当业务表建出 public.sys_ddl_log
+            // 没有被当业务表建出 public.dbz_ddl_log
             try (ResultSet rs = s.executeQuery(
-                    "SELECT count(*) FROM information_schema.tables WHERE table_catalog='lake' AND table_schema='public' AND table_name='sys_ddl_log'")) {
+                    "SELECT count(*) FROM information_schema.tables WHERE table_catalog='lake' AND table_schema='public' AND table_name='dbz_ddl_log'")) {
                 rs.next();
                 assertThat(rs.getLong(1)).isZero();
             }

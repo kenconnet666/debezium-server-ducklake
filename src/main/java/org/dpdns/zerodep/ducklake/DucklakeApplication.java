@@ -12,7 +12,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  * <ul>
  *   <li>Debezium Embedded Engine 流式消费 PG18 逻辑复制（pgoutput，槽 dbz_ducklake）</li>
  *   <li>按表 append 写入 DuckLake（内嵌 DuckDB，catalog=PG 库 ducklake_catalog，数据=rustfs S3）</li>
- *   <li>DDL 审计流（sys_ddl_log，event trigger 捕获）翻译应用到湖侧</li>
+ *   <li>DDL 审计流（dbz_ddl_log，event trigger 捕获）翻译应用到湖侧</li>
  *   <li>湖维护定时任务（flush_inlined/merge/expire/cleanup，@Scheduled，零 Spark）</li>
  *   <li>同步水位线接口 /api/ducklake/watermark 与 Micrometer 指标</li>
  * </ul>

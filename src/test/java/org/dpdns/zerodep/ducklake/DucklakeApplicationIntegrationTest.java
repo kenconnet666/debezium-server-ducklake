@@ -73,7 +73,7 @@ class DucklakeApplicationIntegrationTest {
             s.execute("CREATE DATABASE ducklake_catalog OWNER dbuser_zadmin");
 
             s.execute("""
-                    CREATE TABLE sys_ddl_log (
+                    CREATE TABLE dbz_ddl_log (
                         id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                         ev text NOT NULL, tag text, object_type text, object_identity text, query_text text,
                         xid bigint NOT NULL DEFAULT (pg_current_xact_id()::text::bigint),
@@ -87,8 +87,8 @@ class DucklakeApplicationIntegrationTest {
                       FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
                         IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
                            AND r.schema_name NOT LIKE 'pg_temp%'
-                           AND r.object_identity <> 'public.sys_ddl_log' THEN
-                          INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
+                           AND r.object_identity <> 'public.dbz_ddl_log' THEN
+                          INSERT INTO public.dbz_ddl_log(ev, tag, object_type, object_identity, query_text)
                           VALUES ('ddl_command_end', r.command_tag, r.object_type, r.object_identity, current_query());
                         END IF;
                       END LOOP;
@@ -102,8 +102,8 @@ class DucklakeApplicationIntegrationTest {
                         IF r.schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
                            AND r.schema_name NOT LIKE 'pg_temp%'
                            AND r.object_type IN ('table', 'table column')
-                           AND r.object_identity NOT LIKE 'public.sys_ddl_log%' THEN
-                          INSERT INTO public.sys_ddl_log(ev, tag, object_type, object_identity, query_text)
+                           AND r.object_identity NOT LIKE 'public.dbz_ddl_log%' THEN
+                          INSERT INTO public.dbz_ddl_log(ev, tag, object_type, object_identity, query_text)
                           VALUES ('sql_drop', tg_tag, r.object_type, r.object_identity, current_query());
                         END IF;
                       END LOOP;
@@ -128,7 +128,7 @@ class DucklakeApplicationIntegrationTest {
             // Debezium 增量快照 signal 表(类型严格跟随的重建+重拉兜底;连接器写快照水位也在此表)
             s.execute("CREATE TABLE dbz_signal (id varchar(42) PRIMARY KEY, type varchar(32) NOT NULL, data varchar(2048))");
             s.execute("GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON public.dbz_signal TO dbuser_cdc");
-            s.execute("GRANT TRUNCATE ON public.sys_ddl_log TO dbuser_cdc");
+            s.execute("GRANT TRUNCATE ON public.dbz_ddl_log TO dbuser_cdc");
         }
     }
 
