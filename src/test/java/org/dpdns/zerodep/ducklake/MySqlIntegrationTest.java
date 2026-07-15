@@ -125,8 +125,11 @@ class MySqlIntegrationTest {
     @Test
     @Order(1)
     void snapshotLandsInLakeWithMysqlTypes() {
-        // MySQL 首启快照较慢(容器初始化+FLUSH TABLES WITH READ LOCK 流程),放宽到 120s
-        await().atMost(Duration.ofSeconds(120)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() ->
+        // MySQL 首启快照较慢(容器初始化+FLUSH TABLES WITH READ LOCK 流程),放宽到 120s。
+        // ignoreExceptions:湖 schema/表由快照首批数据建出,建成前 SELECT 抛 Catalog Error,
+        // 应视作"未就绪"继续等(对齐 PG 版 pkfix 用例的写法)
+        await().atMost(Duration.ofSeconds(120)).pollInterval(Duration.ofSeconds(1))
+                .ignoreExceptions().untilAsserted(() ->
                 assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test")).isEqualTo(3L));
         assertThat(syncState.getEngineRunning().get()).isEqualTo(1);
     }
@@ -137,8 +140,9 @@ class MySqlIntegrationTest {
         // TINYINT(1)→BOOLEAN(TinyIntOneToBooleanConverter,快照/流式两阶段一致)
         assertThat(lakeColumnType("flag")).isEqualTo("BOOLEAN");
         // DATETIME(无时区墙钟)→TIMESTAMP;TIMESTAMP(UTC 规范化)→TIMESTAMPTZ
+        // (information_schema 的原始形态是 "TIMESTAMP WITH TIME ZONE",此处按裸查口径断言)
         assertThat(lakeColumnType("created")).isEqualTo("TIMESTAMP");
-        assertThat(lakeColumnType("updated")).isEqualTo("TIMESTAMPTZ");
+        assertThat(lakeColumnType("updated")).isEqualTo("TIMESTAMP WITH TIME ZONE");
         assertThat(lakeColumnType("amount")).startsWith("DECIMAL(38,");
         assertThat(lakeColumnType("payload")).isEqualTo("JSON");
         assertThat(lakeColumnType("tier")).isEqualTo("VARCHAR"); // ENUM→VARCHAR
@@ -231,7 +235,9 @@ class MySqlIntegrationTest {
             s.execute("CREATE TABLE shop.trunc_probe (id bigint PRIMARY KEY, v varchar(16))");
             s.execute("INSERT INTO shop.trunc_probe VALUES (1,'a'), (2,'b'), (3,'c')");
         }
-        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+        // ignoreExceptions:湖表由首批数据建出,建成前 SELECT 抛 Catalog Error 视作未就绪
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() ->
                 assertThat(lakeCount("SELECT count(*) FROM shop.trunc_probe")).isEqualTo(3L));
 
         try (Connection c = mysql(); Statement s = c.createStatement()) {

@@ -193,6 +193,18 @@
                     </annotationProcessorPaths>
                 </configuration>
             </plugin>
+            <plugin>
+                <!-- 每个测试类独立 JVM:两个 @SpringBootTest(PG/MySQL 集成测试)同 JVM 顺序跑时,
+                     先跑完的类容器已停、其 Spring 缓存上下文里的 Debezium 引擎/DuckDB ATTACH
+                     仍存活并向已死容器狂报错,交叉污染后一个类的上下文加载(CI 实测:PG 类
+                     Failed to load ApplicationContext);独立 fork 彻底隔离缓存上下文、
+                     Testcontainers 静态容器与 DuckDB 命名内存实例,代价约每类 +3s JVM 启动 -->
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <reuseForks>false</reuseForks>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 
