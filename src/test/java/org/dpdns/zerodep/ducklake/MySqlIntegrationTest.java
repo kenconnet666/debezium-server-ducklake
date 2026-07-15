@@ -389,6 +389,38 @@ class MySqlIntegrationTest {
                 .contains("\"lastSyncedAt\":\"2026-");
     }
 
+    /** 主键变更(存量表补主键):存量行的 id 回填是 DDL 内部重写、无 binlog 行事件，湖旧行
+     *  主键恒 NULL——湖表重建+当前态重灌。主路径 scanner 直拉(引擎启动时 INSTALL mysql 扩展
+     *  只读 attach 源库,DDL 段事务内就地重建直灌,秒级)；扩展装不上/源瞬断自动降级 signal
+     *  blocking 快照——两条路径断言口径相同，用例对降级健壮 */
+    @Test
+    @Order(12)
+    void primaryKeyAdditionRebuildsAndRefillsCurrentState() throws Exception {
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE shop.pkfix (name varchar(16) NOT NULL)");
+            s.execute("INSERT INTO shop.pkfix VALUES ('a'), ('b'), ('c')");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM shop.pkfix")).isEqualTo(3L));
+
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("ALTER TABLE shop.pkfix ADD COLUMN id BIGINT AUTO_INCREMENT PRIMARY KEY");
+        }
+        await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM shop.pkfix WHERE id IS NOT NULL")).isEqualTo(3L);
+            assertThat(lakeCount("SELECT count(*) FROM shop.pkfix")).isEqualTo(3L);
+        });
+
+        // 新主键此后正常镜像(DELETE 按 id 打得中)
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("DELETE FROM shop.pkfix WHERE name = 'b'");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM shop.pkfix")).isEqualTo(2L));
+    }
+
     private Long lakeCount(String sql) throws Exception {
         return engine.queryScalar(sql, Long.class);
     }

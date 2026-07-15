@@ -2,6 +2,7 @@ package org.dpdns.zerodep.ducklake.ddl;
 
 import org.dpdns.zerodep.ducklake.config.DucklakeProperties;
 import org.dpdns.zerodep.ducklake.metrics.SyncState;
+import org.dpdns.zerodep.ducklake.sink.DuckLakeEngine;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
@@ -67,7 +68,8 @@ class DdlApplierTest {
     void newApplier() {
         props = new DucklakeProperties();
         syncState = new SyncState(new SimpleMeterRegistry());
-        applier = new DdlApplier(props, syncState);
+        // engine 未 init → scanner 通道未就绪:主键变更走 rebuildRequester 老路,断言口径不变
+        applier = new DdlApplier(props, syncState, new DuckLakeEngine(props));
         invalidated = new ArrayList<>();
         rebuilds = new ArrayList<>();
     }

@@ -54,7 +54,13 @@ public class DuckLakeEngine {
      *  每批多付 3 次 catalog PG 提交 + 3 个多余 snapshot（分段指标实测 stage≈130ms 抓获） */
     public static final String MEM = "memory";
 
+    /** scanner 直拉重灌的源库 attach 别名（READ_ONLY；init 按 source.type 自动装配） */
+    public static final String SRC = "cdc_src";
+
     private final DucklakeProperties props;
+
+    /** scanner 源库 attach 是否就绪（init 尝试；失败降级 signal 快照重灌老路） */
+    private volatile boolean scannerSrcAttached;
     /** 单写者串行锁：CDC 写入、DDL 应用、维护任务全部经它 */
     private final ReentrantLock lock = new ReentrantLock(true);
     /** reader 串行锁：DuckDB 单连接非线程安全，watermark 并发请求经它排队（低频只读，串行无碍） */
@@ -161,8 +167,73 @@ public class DuckLakeEngine {
         anchor.setAutoCommit(true);
         worker.setAutoCommit(true);
         reader.setAutoCommit(true);
+        attachScannerSource();
         log.info("DuckLake 已 ATTACH：catalog={}@{}:{} dataPath={}",
                 lake.getCatalogDb(), lake.getCatalogHost(), lake.getCatalogPort(), lake.getDataPath());
+    }
+
+    /**
+     * scanner 直拉重灌的源库常驻 attach（scanner-refill 开启时）：按 source.type 自动
+     * INSTALL/LOAD 对应扩展（postgres 已随 catalog 装载；mysql 按需装）并只读 ATTACH 源库。
+     * instance 级一次生效、全连接可见；事务内不能 ATTACH，故必须启动期完成。
+     * 失败仅告警降级（scannerSrcAttached=false → 重建重灌回退 signal 快照老路），
+     * 不阻断启动——CDC 主链路（Debezium 解码）不依赖此通道。
+     */
+    private void attachScannerSource() {
+        if (!props.getMaintenance().isScannerRefill()) {
+            return;
+        }
+        DucklakeProperties.Source src = props.getSource();
+        // SQL 字面量层转义（值本身不加内层引号，与 scanner 连接串键值语法对齐）
+        String pwd = String.valueOf(src.getPassword()).replace("'", "''");
+        try (Statement s = anchor.createStatement()) {
+            String attach = switch (src.getType()) {
+                case POSTGRES ->
+                        // connect_timeout:源不可达时快速失败降级,不拖启动(libpq 标准参数)
+                        ("ATTACH IF NOT EXISTS 'dbname=%s host=%s port=%d user=%s password=%s connect_timeout=5' "
+                                + "AS %s (TYPE postgres, READ_ONLY)")
+                                .formatted(src.getDbname(), src.getHostname(), src.getPort(), src.getUser(), pwd, SRC);
+                case MYSQL -> {
+                    s.execute("INSTALL mysql");
+                    s.execute("LOAD mysql");
+                    yield ("ATTACH IF NOT EXISTS 'host=%s port=%d user=%s password=%s database=%s' "
+                            + "AS %s (TYPE mysql, READ_ONLY)")
+                            .formatted(src.getHostname(), src.getPort(), src.getUser(), pwd, src.getDbname(), SRC);
+                }
+            };
+            s.execute(attach);
+            // 轻量探活:attach 惰性建连的实现下,确保重灌时刻才发现源不可达的概率降到最低
+            s.execute("SELECT 1");
+            scannerSrcAttached = true;
+            log.info("scanner 重灌源已就绪: {} {}:{} (只读 attach 别名 {})",
+                    src.getType(), src.getHostname(), src.getPort(), SRC);
+        } catch (SQLException e) {
+            scannerSrcAttached = false;
+            log.warn("scanner 重灌源 attach 失败(重建重灌回退 signal 快照;可关 ducklake.maintenance.scanner-refill 消除本告警): {}",
+                    e.getMessage());
+        }
+    }
+
+    /** scanner 直拉重灌通道是否就绪（false=调用方走 signal 快照老路） */
+    public boolean isScannerSrcAttached() {
+        return scannerSrcAttached;
+    }
+
+    /**
+     * 源表在 scanner attach 下的完全限定引用（重灌 SELECT 的 FROM 目标）。
+     * PG：attach 覆盖整库 → {@code cdc_src."schema"."table"}；
+     * MySQL：attach 绑定单 database（{@code source.dbname}）→ 同库表用两段
+     * {@code cdc_src."table"}，其他库的表本通道够不到返回 null（调用方回退 signal 路）。
+     */
+    public String scannerSrcRef(String schemaOrDb, String table) {
+        if (!scannerSrcAttached) {
+            return null;
+        }
+        DucklakeProperties.Source src = props.getSource();
+        return switch (src.getType()) {
+            case POSTGRES -> SRC + ".\"" + schemaOrDb + "\".\"" + table + '"';
+            case MYSQL -> schemaOrDb.equals(src.getDbname()) ? SRC + ".\"" + table + '"' : null;
+        };
     }
 
     /** 在单写者锁内执行一段湖操作（CDC 批写入 / DDL 应用 / 维护 SQL 共用此入口） */

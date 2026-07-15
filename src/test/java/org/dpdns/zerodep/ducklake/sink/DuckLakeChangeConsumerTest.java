@@ -74,7 +74,8 @@ class DuckLakeChangeConsumerTest {
                 return action.run(conn);
             }
         };
-        consumer = new DuckLakeChangeConsumer(stub, props, new DdlApplier(props, syncState), syncState);
+        // stub 未 init → scannerSrcAttached=false:重建重灌走 signal 老路,与历史断言一致
+        consumer = new DuckLakeChangeConsumer(stub, props, new DdlApplier(props, syncState, stub), syncState);
     }
 
     // ---------- 事件构造 ----------

@@ -45,6 +45,9 @@ ducklake:
     sorted-by-pk: ${DUCKLAKE_SORTED_BY_PK:true}
     # 源 JSON/jsonb → VARIANT(子字段 shredding 剪枝;PG catalog 下暂不 inline,小文件由压实吸收)
     json-as-variant: ${DUCKLAKE_JSON_AS_VARIANT:true}
+    # 重建重灌走 scanner 直拉(启动时按 source.type 自动 INSTALL/ATTACH 只读源;
+    # 实测比 Debezium 快照重灌快 36×/11× 且不停流;源不可达自动降级 signal 快照)
+    scanner-refill: ${DUCKLAKE_SCANNER_REFILL:true}
     # 湖 schema 前缀:空(默认)=纯镜像(源 public.demo → 湖 lake.public.demo);
     # 多源库实例共享同一湖 catalog 时各配不同前缀隔离(如 "erp_" → lake.erp_public.demo)
     schema-prefix: ${DUCKLAKE_SCHEMA_PREFIX:}

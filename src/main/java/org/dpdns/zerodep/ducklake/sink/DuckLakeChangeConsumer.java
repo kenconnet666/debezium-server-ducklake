@@ -77,6 +77,10 @@ public class DuckLakeChangeConsumer
      *  刻意不随批回滚清空：标记要跨重试存活才能兑现重建 */
     private final Set<String> pendingRebuild = new HashSet<>();
 
+    /** 重建已兑现、待 scanner 补灌历史当前态的湖表 → 主键列（批提交后独立锁段执行,
+     *  见 flushPendingRefills；直灌失败自动降级 signal 增量快照） */
+    private final Map<String, List<String>> pendingRefill = new LinkedHashMap<>();
+
     @Override
     public void handleBatch(List<ChangeEvent<SourceRecord, SourceRecord>> records,
                             DebeziumEngine.RecordCommitter<ChangeEvent<SourceRecord, SourceRecord>> committer)
@@ -161,6 +165,41 @@ public class DuckLakeChangeConsumer
         syncState.batchCommitted(data.size(), ackTs,
                 ackTs > 0 ? deliveredAt - ackTs : -1,
                 stats.stageMs(), stats.lakeTxMs());
+        flushPendingRefills();
+    }
+
+    /**
+     * 类型重建后的历史当前态补灌（scanner 直拉）：批提交（offset 已推进）后独立锁段执行——
+     * 重建+当批数据先原子落定，补灌按主键 anti-join 跳过已有行，幂等且不重复。
+     * 单表失败自动降级 signal 增量快照（湖表已按新 schema 重建，READ 事件 upsert 幂等重灌），
+     * 不影响已提交批与后续消费。
+     */
+    private void flushPendingRefills() {
+        if (pendingRefill.isEmpty()) {
+            return;
+        }
+        for (var it = pendingRefill.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, List<String>> e = it.next();
+            it.remove();
+            String lakeTable = e.getKey();
+            try {
+                engine.withLock(conn -> {
+                    String srcRef = ddlApplier.srcRefOf(lakeTable);
+                    if (srcRef == null) {
+                        throw new SQLException("scanner 源引用不可得(通道降级或 MySQL 跨库)");
+                    }
+                    Map<String, String> cols = knownColumns.get(lakeTable);
+                    if (cols == null) {
+                        cols = loadColumns(conn, lakeTable);
+                    }
+                    ddlApplier.refillFromScanner(conn, lakeTable, cols, srcRef, e.getValue());
+                    return null;
+                });
+            } catch (Exception ex) {
+                log.error("scanner 补灌失败,降级增量快照重灌: {} ({})", lakeTable, ex.getMessage());
+                requestSnapshot(lakeTable, "incremental");
+            }
+        }
     }
 
     /** 段类型：DATA=常规数据镜像；TRUNCATE=源 TRUNCATE 跟随（MySQL op=t，湖表清空）；
@@ -438,7 +477,13 @@ public class DuckLakeChangeConsumer
             }
             knownColumns.remove(lakeTable);
             syncState.getDdlApplied().increment();
-            log.warn("按新类型重建湖表(历史当前态由增量快照重灌): {}", lakeTable);
+            if (engine.isScannerSrcAttached() && !keyColumns.isEmpty()) {
+                // 历史当前态由批提交后的 scanner 直灌补齐(anti-join 跳过当批已落行)
+                pendingRefill.put(lakeTable, List.copyOf(keyColumns));
+                log.warn("按新类型重建湖表(历史当前态将由 scanner 直灌): {}", lakeTable);
+            } else {
+                log.warn("按新类型重建湖表(历史当前态由增量快照重灌): {}", lakeTable);
+            }
         }
         Map<String, String> cols = knownColumns.get(lakeTable);
         if (cols == null) {
@@ -518,10 +563,11 @@ public class DuckLakeChangeConsumer
             log.warn("湖内 CAST 重写失败(历史值超新类型范围等),转重建+增量快照重拉: {} ({})",
                     lakeTable, e.getMessage());
         }
-        // ③ 不能在当前(已有失败语句的)湖事务里继续 DROP/重建——标记重建 + 触发增量快照,
-        //    抛错让本批走既有重试:重试批在干净事务开头完成 DROP 重建(见 ensureTable),
-        //    当批数据按新类型写入,历史当前态由增量快照重灌
-        if (pendingRebuild.add(lakeTable)) {
+        // ③ 不能在当前(已有失败语句的)湖事务里继续 DROP/重建——标记重建,抛错让本批走既有
+        //    重试:重试批在干净事务开头完成 DROP 重建(见 ensureTable),当批数据按新类型写入,
+        //    历史当前态重灌二选一:scanner 就绪 → 重建后 pendingRefill 直灌(见 flushPendingRefills);
+        //    否则此刻就触发增量快照(signal 老路)
+        if (pendingRebuild.add(lakeTable) && !(engine.isScannerSrcAttached() && !keyColumns.isEmpty())) {
             requestSnapshot(lakeTable, "incremental");
         }
         throw new SQLException("湖列类型无法就地转换,已安排重建+增量快照重拉,本批将重试: "
