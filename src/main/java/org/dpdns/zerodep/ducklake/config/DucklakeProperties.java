@@ -174,6 +174,11 @@ public class DucklakeProperties {
          *  （PG 的 FOR ALL TABLES publication 默认 publish truncate；MySQL binlog 原生支持），
          *  经 TruncateRescueTransform 穿过 unwrap 的硬编码丢弃后按段应用 */
         private boolean followTruncate = true;
+        /** 新建湖表自动 SET SORTED BY (主键) + sort_on_insert=false（DuckLake 无索引，
+         *  排序聚簇是查询加速正道，见 README 查询优化节）：写入热路径不排序零成本，
+         *  分层压实时自动按主键重排——min/max 统计变紧，主键/范围过滤的文件剪枝立竿见影。
+         *  仅对启用后新建的湖表生效；存量表可手动 ALTER TABLE ... SET SORTED BY 补挂 */
+        private boolean sortedByPk = true;
         /** DDL 信号流里跟随源库 DROP TABLE 真删湖表（默认 true=镜像语义；false=湖表保留。
          *  真删后时间旅行窗口内旧 snapshot 仍可 AT (TIMESTAMP ...) 回看该表） */
         private boolean followDropTable = true;

@@ -364,7 +364,7 @@ public class DuckLakeChangeConsumer
         TableRef ref = TableRef.parse(seg.topic());
         // 镜像命名:湖 schema = <前缀><源 schema|db>,表名原样(lake.my_public.demo / lake.shop.orders)
         String lakeTable = props.getMaintenance().getSchemaPrefix() + ref.pgSchema() + "." + ref.table();
-        ensureTable(conn, lakeTable, seg.schema());
+        ensureTable(conn, lakeTable, seg.schema(), seg.keyColumns());
 
         List<Field> fields = seg.schema().fields().stream()
                 .filter(f -> !META_COLS.contains(f.name())).toList();
@@ -426,9 +426,10 @@ public class DuckLakeChangeConsumer
         }
     }
 
-    /** 首见建表（湖 schema 一并按需建）；schema 出现新字段则 ALTER ADD COLUMN，
-     *  已有字段类型漂移则按白名单安全放宽（与 DDL 信号流的 rename/删列应用幂等互补） */
-    private void ensureTable(Connection conn, String lakeTable, Schema schema) throws SQLException {
+    /** 首见建表（湖 schema 一并按需建，有主键则挂排序聚簇）；schema 出现新字段则
+     *  ALTER ADD COLUMN，已有字段类型漂移则按白名单安全放宽（与 DDL 信号流幂等互补） */
+    private void ensureTable(Connection conn, String lakeTable, Schema schema,
+                             List<String> keyColumns) throws SQLException {
         // 类型无法就地转换的表:上一批已标记重建并触发增量快照,本批(干净事务)开头先 DROP,
         // 随后走建表分支按事件 schema 的新类型重建,当批数据正常写入
         if (pendingRebuild.remove(lakeTable)) {
@@ -457,6 +458,7 @@ public class DuckLakeChangeConsumer
                 s.execute("CREATE SCHEMA IF NOT EXISTS " + DuckLakeEngine.LAKE + ".\"" + lakeSchema + '"');
                 s.execute(ddl.toString());
             }
+            ddlApplier.applySortedByPk(conn, lakeTable, keyColumns);
             cols = loadColumns(conn, lakeTable);
             knownColumns.put(lakeTable, cols);
             log.info("湖表就绪: {} ({} 列)", lakeTable, cols.size());
@@ -475,7 +477,7 @@ public class DuckLakeChangeConsumer
                 cols.put(f.name(), want);
                 log.warn("湖表加列: {}.{} ({})", lakeTable, f.name(), want);
             } else if (!have.equals(want)) {
-                followTypeChange(conn, lakeTable, schema, f.name(), have, want, cols);
+                followTypeChange(conn, lakeTable, schema, f.name(), have, want, cols, keyColumns);
             }
         }
     }
@@ -490,7 +492,7 @@ public class DuckLakeChangeConsumer
      */
     private void followTypeChange(Connection conn, String lakeTable, Schema schema,
                                   String col, String have, String want,
-                                  Map<String, String> cols) throws SQLException {
+                                  Map<String, String> cols, List<String> keyColumns) throws SQLException {
         if (!props.getMaintenance().isFollowTypeChange()) {
             if (typeDriftWarned.add(lakeTable + "." + col)) {
                 log.warn("湖列类型与事件漂移(followTypeChange=false 仅告警): {}.{} 湖={} 事件={}",
@@ -510,7 +512,7 @@ public class DuckLakeChangeConsumer
                     lakeTable, col, have, want, e.getMessage());
         }
         try {
-            rewriteTableWithCasts(conn, lakeTable, schema, cols);
+            rewriteTableWithCasts(conn, lakeTable, schema, cols, keyColumns);
             return;
         } catch (SQLException e) {
             log.warn("湖内 CAST 重写失败(历史值超新类型范围等),转重建+增量快照重拉: {} ({})",
@@ -532,7 +534,7 @@ public class DuckLakeChangeConsumer
      * 大表有全量重写 IO 代价（类型变更本就是低频运维动作）。
      */
     private void rewriteTableWithCasts(Connection conn, String lakeTable, Schema schema,
-                                       Map<String, String> cols) throws SQLException {
+                                       Map<String, String> cols, List<String> keyColumns) throws SQLException {
         Map<String, String> want = new LinkedHashMap<>();
         for (Field f : schema.fields()) {
             if (!META_COLS.contains(f.name())) {
@@ -560,6 +562,8 @@ public class DuckLakeChangeConsumer
             s.execute("DROP TABLE " + qTable);
             s.execute("ALTER TABLE " + qTmp + " RENAME TO \"" + tableName + '"');
         }
+        // 表已换新(旧表属性随 DROP 消失),排序聚簇重挂
+        ddlApplier.applySortedByPk(conn, lakeTable, keyColumns);
         Map<String, String> fresh = loadColumns(conn, lakeTable);
         cols.clear();
         cols.putAll(fresh);

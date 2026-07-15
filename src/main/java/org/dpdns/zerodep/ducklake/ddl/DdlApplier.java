@@ -458,17 +458,34 @@ public class DdlApplier {
         String[] parts = identity.split("\\.");
         DucklakeProperties.Source src = props.getSource();
         Map<String, String> cols = new LinkedHashMap<>();
-        try (Connection c = java.sql.DriverManager.getConnection(src.jdbcUrl(), src.getUser(), src.getPassword());
-             PreparedStatement ps = c.prepareStatement(
-                     "SELECT column_name, data_type, udt_name, numeric_precision, numeric_scale "
-                             + "FROM information_schema.columns WHERE table_schema=? AND table_name=? "
-                             + "ORDER BY ordinal_position")) {
-            ps.setString(1, parts[0]);
-            ps.setString(2, parts[1]);
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    cols.put(rs.getString(1), pgTypeToDuck(rs.getString(2), rs.getString(3),
-                            (Integer) rs.getObject(4), (Integer) rs.getObject(5)));
+        List<String> pk = new ArrayList<>();
+        try (Connection c = java.sql.DriverManager.getConnection(src.jdbcUrl(), src.getUser(), src.getPassword())) {
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT column_name, data_type, udt_name, numeric_precision, numeric_scale "
+                            + "FROM information_schema.columns WHERE table_schema=? AND table_name=? "
+                            + "ORDER BY ordinal_position")) {
+                ps.setString(1, parts[0]);
+                ps.setString(2, parts[1]);
+                try (var rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        cols.put(rs.getString(1), pgTypeToDuck(rs.getString(2), rs.getString(3),
+                                (Integer) rs.getObject(4), (Integer) rs.getObject(5)));
+                    }
+                }
+            }
+            // 主键列(排序聚簇用;查询失败不致命,无主键同形态)
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT kcu.column_name FROM information_schema.table_constraints tc "
+                            + "JOIN information_schema.key_column_usage kcu "
+                            + "  ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema "
+                            + "WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema=? AND tc.table_name=? "
+                            + "ORDER BY kcu.ordinal_position")) {
+                ps.setString(1, parts[0]);
+                ps.setString(2, parts[1]);
+                try (var rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        pk.add(rs.getString(1));
+                    }
                 }
             }
         } catch (SQLException e) {
@@ -476,7 +493,7 @@ public class DdlApplier {
             return;
         }
         try {
-            createTableInLake(conn, lakeTable, cols, null, Map.of(), cacheInvalidator);
+            createTableInLake(conn, lakeTable, cols, null, Map.of(), pk, cacheInvalidator);
         } catch (SQLException e) {
             log.warn("湖侧建空表失败(跳过,首批数据将兜底建表): {} ({})", lakeTable, e.getMessage());
         }
@@ -501,7 +518,8 @@ public class DdlApplier {
             }
         }
         try {
-            createTableInLake(conn, lakeTable, cols, str(table, "comment"), colComments, cacheInvalidator);
+            createTableInLake(conn, lakeTable, cols, str(table, "comment"), colComments,
+                    stringList(table, "primaryKeyColumnNames"), cacheInvalidator);
         } catch (SQLException e) {
             log.warn("湖侧建空表失败(跳过,首批数据将兜底建表): {} ({})", lakeTable, e.getMessage());
         }
@@ -582,10 +600,10 @@ public class DdlApplier {
     }
 
     /** 建湖空表原语：表已存在则跳过（不动现有形态，列对齐交给数据驱动 ensureTable）；
-     *  湖 schema 按需建；表/列注释一并应用（幂等覆盖） */
+     *  湖 schema 按需建；表/列注释一并应用（幂等覆盖）；有主键则挂排序聚簇 */
     private void createTableInLake(Connection conn, String lakeTable, Map<String, String> cols,
                                    String tableComment, Map<String, String> colComments,
-                                   Consumer<String> cacheInvalidator) throws SQLException {
+                                   List<String> keyColumns, Consumer<String> cacheInvalidator) throws SQLException {
         if (cols.isEmpty() || tableExists(conn, lakeTable)) {
             return;
         }
@@ -609,6 +627,7 @@ public class DdlApplier {
             commentInLake(conn, "COLUMN " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
                     + ".\"" + c.getKey() + "\"", quoteLiteral(c.getValue()));
         }
+        applySortedByPk(conn, lakeTable, keyColumns);
         cacheInvalidator.accept(lakeTable);
         syncState.getDdlApplied().increment();
         log.info("湖侧建空表(DDL 跟随): {} ({} 列)", lakeTable, cols.size());
@@ -699,6 +718,46 @@ public class DdlApplier {
         log.warn("湖侧跟随 TRUNCATE(清空): {}", lakeTable);
     }
 
+    /** lake 是否真 DuckLake catalog（进程内一次探测缓存）：单测以普通内存库伪装 lake，
+     *  其上执行 SET SORTED BY 会失败并 abort 整个湖事务（DuckDB 事务内语句失败即事务死，
+     *  try-catch 救不回）——必须先探测再执行，不能靠异常兜底 */
+    private volatile Boolean lakeIsDucklake;
+
+    /**
+     * 湖表排序聚簇（maintenance.sorted-by-pk）：SET SORTED BY (主键) + sort_on_insert=false——
+     * 写入热路径不排序，分层压实时自动按键重排（DuckLake Sorted Compaction），
+     * min/max 统计变紧、主键/范围过滤的文件剪枝显著受益（DuckLake 无索引，这是查询加速正道）。
+     * 供消费者数据驱动建表、类型重写换表与本类 DDL 建表三路共用。
+     */
+    public void applySortedByPk(Connection conn, String lakeTable, List<String> keyColumns) throws SQLException {
+        if (!props.getMaintenance().isSortedByPk() || keyColumns == null || keyColumns.isEmpty()) {
+            return;
+        }
+        if (lakeIsDucklake == null) {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT type FROM duckdb_databases() WHERE database_name = ?")) {
+                ps.setString(1, DuckLakeEngine.LAKE);
+                try (var rs = ps.executeQuery()) {
+                    lakeIsDucklake = rs.next() && "ducklake".equalsIgnoreCase(rs.getString(1));
+                }
+            }
+        }
+        if (!lakeIsDucklake) {
+            log.debug("湖表排序聚簇跳过(lake 非 DuckLake catalog): {}", lakeTable);
+            return;
+        }
+        String keys = String.join(", ", keyColumns.stream().map(k -> '"' + k + '"').toList());
+        String[] parts = lakeTable.split("\\.", 2);
+        try (Statement s = conn.createStatement()) {
+            s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                    + " SET SORTED BY (" + keys + ")");
+            s.execute("CALL " + DuckLakeEngine.LAKE + ".set_option('sort_on_insert', 'false', "
+                    + "table_name => '" + parts[1].replace("'", "''") + "', "
+                    + "schema => '" + parts[0].replace("'", "''") + "')");
+        }
+        log.info("湖表排序聚簇已挂(压实时按主键重排): {} SORTED BY ({})", lakeTable, keys);
+    }
+
     /** COMMENT ON 执行（值须已是合法字面量）。失败仅告警——注释是元数据锦上添花，
      *  不值得让 CDC 批进入重试 */
     private void commentInLake(Connection conn, String target, String valueLiteral) {
@@ -770,6 +829,16 @@ public class DdlApplier {
         }
         Object v = row.get(field);
         return v instanceof List<?> list ? (List<Struct>) list : List.of();
+    }
+
+    /** Struct 的字符串数组字段 → List<String>（字段缺失/空返回空列表） */
+    @SuppressWarnings("unchecked")
+    private static List<String> stringList(Struct row, String field) {
+        if (row.schema().field(field) == null) {
+            return List.of();
+        }
+        Object v = row.get(field);
+        return v instanceof List<?> list ? (List<String>) list : List.of();
     }
 
     private static Long asLong(Struct row, String field) {

@@ -182,6 +182,10 @@ SELECT count(*) FROM lake.public.demo;
 
 DuckLake **不支持二级索引/CREATE INDEX**，官方列为 "unlikely to be supported"（OLAP 湖格式的定位——大数据量下索引维护成本不可接受；强制主键/唯一约束同理不支持）。查询加速的正道是**数据布局 + 统计剪枝**三板斧，按需对热点表启用（DuckDB 客户端连湖执行，一次生效）：
 
+**本服务默认已对有主键的新建湖表自动挂 `SORTED BY (主键)` + `sort_on_insert=false`**
+（`maintenance.sorted-by-pk`，默认 true）——写入零成本，压实即重排；存量表或想换排序键
+（如按时间列）时手动执行：
+
 ```sql
 -- ① 排序聚簇(最推荐):写入不排序(不拖累 CDC 热路径),定期压实时自动按此键重排——
 --    文件/row-group 的 min-max 统计变"紧",时间/主键过滤的文件剪枝立竿见影
@@ -215,6 +219,7 @@ SET enable_object_cache = true;
 | `source.table-exclude-list` | 空 | 排除表（正则，`schema.table` / `db.table` 形式） |
 | `source.signal-table` | 空 | 增量快照 signal 表（类型重建兜底经它触发）。空=按类型推导：PG `public.dbz_signal` / MySQL `<dbname>.dbz_signal` |
 | `maintenance.follow-truncate` | `true` | 源 `TRUNCATE TABLE` 跟随清空湖表（两源通用，见变更跟随矩阵） |
+| `maintenance.sorted-by-pk` | `true` | 新建湖表自动 `SET SORTED BY (主键)`+`sort_on_insert=false`（压实时重排，剪枝受益；见查询优化节） |
 | `lake.catalog-*` | — | DuckLake catalog 的 PG 连接（同时承载 Debezium offset 表） |
 | `lake.data-path` | `s3://lake/ducklake/` | 数据文件根路径（S3 或本地目录） |
 | `lake.memory-limit` | `1536MB` | 内嵌 DuckDB 内存上限。⚠️ 须给足"常驻+批工作集"，过小会 OOM crash loop |
