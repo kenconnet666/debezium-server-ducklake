@@ -70,8 +70,12 @@ final class TypeMapper {
                 case ISO_DATE -> {
                     return "DATE";
                 }
-                case ISO_TIME, ZONED_TIME -> {
+                case ISO_TIME -> {
                     return "TIME";
+                }
+                case ZONED_TIME -> {
+                    // PG timetz:保全时区偏移(DuckLake 支持 TIMETZ,1.5.4 实测;旧映射 TIME 丢偏移)
+                    return "TIMETZ";
                 }
                 case ISO_TIMESTAMP -> {
                     return "TIMESTAMP";
@@ -200,7 +204,11 @@ final class TypeMapper {
         if (t.endsWith("[]")) {
             return normalizeDuckType(t.substring(0, t.length() - 2)) + "[]";
         }
-        return "TIMESTAMP WITH TIME ZONE".equals(t) ? "TIMESTAMPTZ" : t;
+        return switch (t) {
+            case "TIMESTAMP WITH TIME ZONE" -> "TIMESTAMPTZ";
+            case "TIME WITH TIME ZONE" -> "TIMETZ";
+            default -> t;
+        };
     }
 
     /**
@@ -269,17 +277,29 @@ final class TypeMapper {
         };
     }
 
-    /** 空间逻辑类型 Struct{wkb,srid} → WKB 字节（wkb 字段缺失/空值返回 null） */
+    /** 空间逻辑类型 Struct{wkb,srid[,x,y]} → WKB 字节。⚠️ PG 内建 point（非 PostGIS）只给
+     *  x/y、wkb 为空——从坐标手工构造 21 字节 WKB point（1 字节序+4 类型+8x+8y），
+     *  否则该列落湖恒 NULL（值丢失，实排查发现的缺口） */
     private static byte[] geometryWkb(Object value) {
-        if (!(value instanceof org.apache.kafka.connect.data.Struct s) || s.schema().field("wkb") == null) {
+        if (!(value instanceof org.apache.kafka.connect.data.Struct s)) {
             return null;
         }
-        Object wkb = s.get("wkb");
-        return switch (wkb) {
-            case null -> null;
-            case ByteBuffer bb -> toBytes(bb);
-            default -> (byte[]) wkb;
-        };
+        if (s.schema().field("wkb") != null) {
+            Object wkb = s.get("wkb");
+            if (wkb instanceof ByteBuffer bb) {
+                return toBytes(bb);
+            }
+            if (wkb instanceof byte[] b && b.length > 0) {
+                return b;
+            }
+        }
+        if (s.schema().field("x") != null && s.schema().field("y") != null
+                && s.get("x") instanceof Double x && s.get("y") instanceof Double y) {
+            java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(21).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            buf.put((byte) 1).putInt(1).putDouble(x).putDouble(y); // little-endian WKB point
+            return buf.array();
+        }
+        return null;
     }
 
     /**
@@ -304,7 +324,7 @@ final class TypeMapper {
             return "TRY_CAST(" + quoted + " AS " + duckType + ")";
         }
         return switch (duckType) {
-            case "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL" ->
+            case "DATE", "TIME", "TIMETZ", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL" ->
                     "TRY_CAST(" + quoted + " AS " + duckType + ")";
             default -> "CAST(" + quoted + " AS " + duckType + ")";
         };

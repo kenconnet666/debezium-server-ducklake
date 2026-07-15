@@ -570,7 +570,8 @@ public class DdlApplier {
             case "timestamp without time zone" -> "TIMESTAMP";
             case "timestamp with time zone" -> "TIMESTAMPTZ";
             case "date" -> "DATE";
-            case "time without time zone", "time with time zone" -> "TIME";
+            case "time without time zone" -> "TIME";
+            case "time with time zone" -> "TIMETZ";
             case "bytea" -> "BLOB";
             case "json", "jsonb" -> "JSON";
             case "uuid" -> "UUID";

@@ -60,8 +60,31 @@ class TypeMapperTest {
         assertThat(TypeMapper.duckType(logical("io.debezium.time.IsoTime"))).isEqualTo("TIME");
         assertThat(TypeMapper.duckType(logical("io.debezium.time.IsoTimestamp"))).isEqualTo("TIMESTAMP");
         assertThat(TypeMapper.duckType(logical("io.debezium.time.ZonedTimestamp"))).isEqualTo("TIMESTAMPTZ");
+        // PG timetz 保全时区偏移(旧映射 TIME 丢偏移)
+        assertThat(TypeMapper.duckType(logical("io.debezium.time.ZonedTime"))).isEqualTo("TIMETZ");
         assertThat(TypeMapper.duckType(logical("io.debezium.data.Json"))).isEqualTo("JSON");
         assertThat(TypeMapper.duckType(logical("io.debezium.data.Uuid"))).isEqualTo("UUID");
+        assertThat(TypeMapper.normalizeDuckType("TIME WITH TIME ZONE")).isEqualTo("TIMETZ");
+    }
+
+    /** PG 内建 point(非 PostGIS)只给 x/y 且 wkb 为空——从坐标构造 WKB,否则该列落湖恒 NULL */
+    @Test
+    void pgBuiltinPointWithoutWkbIsRescuedFromCoordinates() throws SQLException {
+        Schema point = SchemaBuilder.struct().name("io.debezium.data.geometry.Point")
+                .field("x", Schema.FLOAT64_SCHEMA)
+                .field("y", Schema.FLOAT64_SCHEMA)
+                .field("wkb", Schema.OPTIONAL_BYTES_SCHEMA)
+                .field("srid", Schema.OPTIONAL_INT32_SCHEMA)
+                .optional().build();
+        Struct v = new Struct(point).put("x", 3.5).put("y", -7.25); // wkb 缺失(PG 内建 point 形态)
+        String staged = TypeMapper.stagingText(point, v);
+        assertThat(staged).isNotNull();
+        // 真 DuckDB 回读:WKB 字节完整落 BLOB(spatial 扩展可进一步解析,此处验证字节往返)
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT octet_length(unhex('" + staged + "'))")) {
+            rs.next();
+            assertThat(rs.getLong(1)).isEqualTo(21L); // 1 字节序+4 类型+8x+8y
+        }
     }
 
     @Test
