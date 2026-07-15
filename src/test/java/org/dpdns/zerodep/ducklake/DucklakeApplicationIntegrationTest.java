@@ -114,8 +114,9 @@ class DucklakeApplicationIntegrationTest {
                     + "WHEN TAG IN ('ALTER TABLE', 'DROP TABLE', 'DROP SCHEMA') EXECUTE FUNCTION fn_capture_drop()");
 
             s.execute("CREATE TABLE cdc_test (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
-                    + "name text NOT NULL, big_content text, amount numeric(12,2) DEFAULT 0)");
-            s.execute("INSERT INTO cdc_test (name, amount) VALUES ('alpha', 10.50), ('beta', 20.00), ('gamma', 99.99)");
+                    + "name text NOT NULL, big_content text, amount numeric(12,2) DEFAULT 0, tags text[])");
+            s.execute("INSERT INTO cdc_test (name, amount, tags) VALUES "
+                    + "('alpha', 10.50, ARRAY['a,b','c']), ('beta', 20.00, NULL), ('gamma', 99.99, ARRAY[]::text[])");
 
             // 非 public schema:默认整库同步下应自动捕获并映射为湖表 app.orders(快照+增量)
             s.execute("CREATE SCHEMA app");
@@ -348,6 +349,73 @@ class DucklakeApplicationIntegrationTest {
         }
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
                 assertThat(lakeCount("SELECT count(*) FROM public.pkfix")).isEqualTo(2L));
+    }
+
+    /** PG 数组 → DuckDB LIST:列型 VARCHAR[]、值往返(含逗号元素)、NULL/空数组保真 */
+    @Test
+    @Order(71)
+    void pgArrayLandsAsDuckList() throws Exception {
+        assertThat(lakeColumnType("tags")).isEqualTo("VARCHAR[]");
+        assertThat(engine.queryScalar(
+                "SELECT tags[1] FROM public.cdc_test WHERE name='alpha'", String.class)).isEqualTo("a,b");
+        assertThat(engine.queryScalar(
+                "SELECT len(tags) FROM public.cdc_test WHERE name='gamma'", Long.class)).isZero();
+        assertThat(engine.queryScalar(
+                "SELECT count(*) FROM public.cdc_test WHERE name='beta' AND tags IS NULL", Long.class)).isEqualTo(1L);
+    }
+
+    /** DDL 驱动建空表 + 表改名跟随(PG 增量 DDL 生效;存量空表 PG 无事件覆盖不到,见 README) */
+    @Test
+    @Order(72)
+    void emptyTableCreateAndRenameFollow() throws Exception {
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE empty_probe (id bigint PRIMARY KEY, v text)");
+        }
+        // 不插任何数据:湖空表应由 DDL 审计流直接建出
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() ->
+                assertThat(engine.queryScalar("SELECT count(*) FROM public.empty_probe", Long.class)).isZero());
+
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("ALTER TABLE empty_probe RENAME TO renamed_probe");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() -> {
+            assertThat(engine.queryScalar("SELECT count(*) FROM public.renamed_probe", Long.class)).isZero();
+            assertThat(engine.queryScalar("SELECT count(*) FROM information_schema.tables "
+                    + "WHERE table_catalog='lake' AND table_schema='public' AND table_name='empty_probe'",
+                    Long.class)).isZero();
+        });
+    }
+
+    /** 源 TRUNCATE 跟随(PG 与 MySQL 同通路:op=t 放行 + trescue 改装穿 unwrap) */
+    @Test
+    @Order(73)
+    void truncateFollowsToLake() throws Exception {
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE trunc_probe (id bigint PRIMARY KEY, v text)");
+            s.execute("INSERT INTO trunc_probe VALUES (1,'a'), (2,'b'), (3,'c')");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() ->
+                assertThat(engine.queryScalar("SELECT count(*) FROM public.trunc_probe", Long.class)).isEqualTo(3L));
+
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("TRUNCATE trunc_probe");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+                assertThat(engine.queryScalar("SELECT count(*) FROM public.trunc_probe", Long.class)).isZero());
+        // TRUNCATE 后新增照常镜像(段序语义)
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("INSERT INTO trunc_probe VALUES (10,'fresh')");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+                assertThat(engine.queryScalar("SELECT count(*) FROM public.trunc_probe", Long.class)).isEqualTo(1L));
     }
 
     @Test

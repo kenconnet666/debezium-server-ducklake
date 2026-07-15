@@ -90,6 +90,8 @@ class MySqlIntegrationTest {
             s.execute("INSERT INTO shop.cdc_test (name, amount, flag, payload, tier) VALUES "
                     + "('alpha', 10.50, true, '{\"k\": 1}', 'gold'), ('beta', 20.00, false, NULL, 'silver'), "
                     + "('gamma', 99.99, true, '{\"k\": 3}', 'silver')");
+            // 存量空表:无任何数据事件,湖表应由快照期 schema change(历史 CREATE)直接建出
+            s.execute("CREATE TABLE shop.empty_seed (id bigint PRIMARY KEY, note varchar(64) COMMENT '备注') COMMENT='存量空表'");
         }
     }
 
@@ -285,6 +287,46 @@ class MySqlIntegrationTest {
             rs.next();
             assertThat(rs.getLong(1)).isGreaterThan(0);
         }
+    }
+
+    /** DDL 驱动建空表:存量空表借快照期历史 CREATE 补齐(含表/列注释),流式 CREATE 即刻建 */
+    @Test
+    @Order(9)
+    void emptyTablesCreatedByDdlWithComments() throws Exception {
+        // 存量空表(快照期已建):0 行 + 注释落湖
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM shop.empty_seed")).isZero());
+        assertThat(engine.queryScalar("SELECT comment FROM duckdb_tables() "
+                + "WHERE database_name='lake' AND schema_name='shop' AND table_name='empty_seed'", String.class))
+                .isEqualTo("存量空表");
+        assertThat(engine.queryScalar("SELECT comment FROM duckdb_columns() WHERE database_name='lake' "
+                + "AND schema_name='shop' AND table_name='empty_seed' AND column_name='note'", String.class))
+                .isEqualTo("备注");
+
+        // 流式 CREATE 空表:不插数据即建
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE shop.empty_live (id bigint PRIMARY KEY, v varchar(16))");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM shop.empty_live")).isZero());
+    }
+
+    /** MySQL TIME 毒丸(合法值域 ±838h 超湖 TIME 24h):行不丢、链路不断(TRY_CAST 置 NULL 或
+     *  Debezium 侧钳制,两者皆可——钉死"不 crash loop"这一行为) */
+    @Test
+    @Order(10)
+    void poisonTimeValuesDoNotBreakPipeline() throws Exception {
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE shop.poison_t (id bigint PRIMARY KEY, dur time)");
+            s.execute("INSERT INTO shop.poison_t VALUES (1, '838:59:59'), (2, '-100:00:00'), (3, '12:34:56')");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM shop.poison_t")).isEqualTo(3L));
+        // 正常值保真;毒丸行存在(值 NULL 或钳制值均可)
+        assertThat(lakeCount("SELECT count(*) FROM shop.poison_t WHERE id=3 AND dur='12:34:56'")).isEqualTo(1L);
     }
 
     @Test

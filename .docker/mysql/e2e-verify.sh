@@ -78,6 +78,15 @@ msrc "SET SESSION cte_max_recursion_depth=1001;
       SELECT n, CONCAT('row-',n), n*1.5 FROM g"
 wait_for "1000 行 INSERT 落湖(当前态 1000)" 120 "1000" lakecount
 
+# 多轮删改后 delete file 会重复计数,lakecount 公式仅单一数据文件时段可作精确断言
+echo "── 3.5 TRUNCATE 跟随(两源同通路,紧跟单一数据文件时段) ──"
+msrc "TRUNCATE TABLE $TBL"
+wait_for "源 TRUNCATE → 湖表清空(当前态 0)" 60 "0" lakecount
+msrc "SET SESSION cte_max_recursion_depth=1001;
+      INSERT INTO $TBL(id,name,val) WITH RECURSIVE g(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM g WHERE n<1000)
+      SELECT n, CONCAT('row-',n), n*1.5 FROM g"
+wait_for "TRUNCATE 后重灌照常镜像(当前态 1000)" 120 "1000" lakecount
+
 echo "── 4. UPDATE/DELETE 镜像跟随 ──"
 msrc "UPDATE $TBL SET val = val + 100 WHERE id <= 100"
 msrc "DELETE FROM $TBL WHERE id > 950"
@@ -90,12 +99,6 @@ wait_for "湖表出现 note 列(加列跟随)" 120 "1" hasnote
 wait_for "新列行落湖(当前态 951)" 60 "951" lakecount
 msrc "ALTER TABLE $TBL RENAME COLUMN note TO remark"
 wait_for "RENAME COLUMN 湖侧真 rename(remark 列)" 60 "1" hasremark
-
-echo "── 6. TRUNCATE 跟随(MySQL 增强) ──"
-msrc "TRUNCATE TABLE $TBL"
-wait_for "源 TRUNCATE → 湖表清空(当前态 0)" 60 "0" lakecount
-msrc "INSERT INTO $TBL(id,name,val) VALUES (1,'fresh',1.0)"
-wait_for "TRUNCATE 后新增照常镜像(当前态 1)" 60 "1" lakecount
 
 echo "── 7. 心跳闭环(offset 持续推进) ──"
 hb=$(msrc "SELECT count(*) FROM dbz_heartbeat")

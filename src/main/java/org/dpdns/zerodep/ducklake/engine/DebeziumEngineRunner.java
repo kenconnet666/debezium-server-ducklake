@@ -177,10 +177,6 @@ public class DebeziumEngineRunner implements SmartLifecycle {
                 p.setProperty("event.converting.failure.handling.mode", "warn");
                 // 列/表 COMMENT 进 schema change 事件(湖侧注释跟随的前提)
                 p.setProperty("include.schema.comments", "true");
-                // 默认 skipped.operations=t 会吞 TRUNCATE——跟随开启时显式放行 op=t 数据事件
-                if (props.getMaintenance().isFollowTruncate()) {
-                    p.setProperty("skipped.operations", "none");
-                }
                 // 会话时区透传(空=Debezium 自动查询服务端时区,官方默认行为)
                 if (!src.getConnectionTimeZone().isBlank()) {
                     p.setProperty("driver.connectionTimeZone", src.getConnectionTimeZone());
@@ -189,6 +185,12 @@ public class DebeziumEngineRunner implements SmartLifecycle {
         }
         if (!src.getTableExcludeList().isBlank()) {
             p.setProperty("table.exclude.list", src.getTableExcludeList());
+        }
+        // 源 TRUNCATE 跟随(两源通用):默认 skipped.operations=t 会吞 op=t 事件,显式放行——
+        // PG 的 FOR ALL TABLES publication 默认就 publish truncate,MySQL binlog 原生支持;
+        // trescue SMT 把 op=t 改装为标记行穿过 unwrap(见下),消费者按段清空湖表
+        if (props.getMaintenance().isFollowTruncate()) {
+            p.setProperty("skipped.operations", "none");
         }
         p.setProperty("snapshot.mode", eng.getSnapshotMode());
 

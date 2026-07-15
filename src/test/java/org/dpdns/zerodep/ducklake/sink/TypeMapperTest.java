@@ -46,8 +46,8 @@ class TypeMapperTest {
     @Test
     void decimalMapsWithScale() {
         assertThat(TypeMapper.duckType(Decimal.schema(2))).isEqualTo("DECIMAL(38,2)");
-        // scale 上限保护:DECIMAL(38,38) 非法,压到 37
-        assertThat(TypeMapper.duckType(Decimal.schema(38))).isEqualTo("DECIMAL(38,37)");
+        // 超限(s>37/p>38)不再有损压缩,落 VARCHAR 保全精度(见 oversizedDecimalFallsBackToVarchar)
+        assertThat(TypeMapper.duckType(Decimal.schema(38))).isEqualTo("VARCHAR");
     }
 
     @Test
@@ -213,6 +213,52 @@ class TypeMapperTest {
             assertThat(rs.getObject(2)).isNull();
             assertThat(rs.getObject(3, java.time.LocalTime.class)).isEqualTo(java.time.LocalTime.of(12, 34, 56));
         }
+    }
+
+    /** DECIMAL 超过 DuckDB 上限(p>38 或 s>37)落 VARCHAR 保全精度(无损优先,不阻塞链路) */
+    @Test
+    void oversizedDecimalFallsBackToVarchar() {
+        Schema p45 = Decimal.builder(2).parameter("connect.decimal.precision", "45").optional().build();
+        assertThat(TypeMapper.duckType(p45)).isEqualTo("VARCHAR");
+        assertThat(TypeMapper.duckType(Decimal.schema(40))).isEqualTo("VARCHAR");  // scale>37
+        // 边界内正常映射(无 precision 参数默认按 38 处理)
+        assertThat(TypeMapper.duckType(Decimal.schema(2))).isEqualTo("DECIMAL(38,2)");
+    }
+
+    /** PG 数组 → DuckDB LIST:类型推导 + staging list 字面量编码 + TRY_CAST 真引擎往返 */
+    @Test
+    void pgArrayMapsToDuckListWithRoundTrip() throws SQLException {
+        Schema longArr = SchemaBuilder.array(Schema.OPTIONAL_INT64_SCHEMA).optional().build();
+        Schema strArr = SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build();
+        assertThat(TypeMapper.duckType(longArr)).isEqualTo("BIGINT[]");
+        assertThat(TypeMapper.duckType(strArr)).isEqualTo("VARCHAR[]");
+        // 嵌套数组 / BYTES 元素:staging 文本表达不了,整列 VARCHAR 兜底
+        assertThat(TypeMapper.duckType(SchemaBuilder.array(longArr).build())).isEqualTo("VARCHAR");
+        assertThat(TypeMapper.duckType(SchemaBuilder.array(Schema.BYTES_SCHEMA).build())).isEqualTo("VARCHAR");
+        assertThat(TypeMapper.castExpr("c", "BIGINT[]")).isEqualTo("TRY_CAST(\"c\" AS BIGINT[])");
+
+        // 毒元素全覆盖往返:含逗号/含双引号/NULL 元素经 staging 编码 → TRY_CAST 还原
+        String staged = TypeMapper.stagingText(strArr, java.util.Arrays.asList("a,b", "c\"d", null));
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT t[1], t[2], t[3] FROM (SELECT TRY_CAST('" + staged + "' AS VARCHAR[]) AS t)")) {
+            rs.next();
+            assertThat(rs.getString(1)).isEqualTo("a,b");
+            assertThat(rs.getString(2)).isEqualTo("c\"d");
+            assertThat(rs.getString(3)).isNull();
+        }
+        String nums = TypeMapper.stagingText(longArr, java.util.List.of(1L, 2L, 3L));
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT list_sum(TRY_CAST('" + nums + "' AS BIGINT[]))")) {
+            rs.next();
+            assertThat(rs.getLong(1)).isEqualTo(6L);
+        }
+    }
+
+    /** LIST 列的 information_schema 形态归一(否则 TIMESTAMPTZ[] 恒判漂移,每批误触类型跟随) */
+    @Test
+    void normalizeHandlesListSuffix() {
+        assertThat(TypeMapper.normalizeDuckType("TIMESTAMP WITH TIME ZONE[]")).isEqualTo("TIMESTAMPTZ[]");
+        assertThat(TypeMapper.normalizeDuckType("BIGINT[]")).isEqualTo("BIGINT[]");
     }
 
     @Test

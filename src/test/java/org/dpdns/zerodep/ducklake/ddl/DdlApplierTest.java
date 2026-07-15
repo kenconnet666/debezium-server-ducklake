@@ -296,6 +296,9 @@ class DdlApplierTest {
 
     private static final Schema CHANGE_TABLE_COLUMN = SchemaBuilder.struct().name("Column")
             .field("name", Schema.STRING_SCHEMA)
+            .field("typeName", Schema.OPTIONAL_STRING_SCHEMA)
+            .field("length", Schema.OPTIONAL_INT32_SCHEMA)
+            .field("scale", Schema.OPTIONAL_INT32_SCHEMA)
             .field("comment", Schema.OPTIONAL_STRING_SCHEMA)
             .optional().build();
     private static final Schema CHANGE_TABLE = SchemaBuilder.struct().name("Table")
@@ -456,6 +459,64 @@ class DdlApplierTest {
         applyChange(changeEvent("shop", "ALTER TABLE m7 ADD PRIMARY KEY (id)",
                 tableChange("ALTER", "\"shop\".\"m7\"")));
         assertThat(rebuilds).containsExactly("shop.m7");
+    }
+
+    /** MySQL CREATE(含快照期历史 CREATE):tableChanges 全列结构即刻建湖空表,类型对齐事件口径,
+     *  表/列注释一并应用——存量空表借初始快照补齐 */
+    @Test
+    void mysqlCreateTableChangeBuildsEmptyLakeTableWithComments() throws Exception {
+        Struct idCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "id").put("typeName", "BIGINT");
+        Struct flagCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "flag")
+                .put("typeName", "TINYINT").put("length", 1).put("comment", "开关");
+        Struct amountCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "amount")
+                .put("typeName", "DECIMAL").put("length", 12).put("scale", 2);
+        Struct bigUCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "seq")
+                .put("typeName", "BIGINT UNSIGNED");
+        Struct table = new Struct(CHANGE_TABLE).put("comment", "空表测试")
+                .put("columns", List.of(idCol, flagCol, amountCol, bigUCol));
+        Struct create = new Struct(TABLE_CHANGE).put("type", "CREATE")
+                .put("id", "\"shop\".\"empty1\"").put("table", table);
+        // 快照期(snapshot=true)的历史 CREATE 也建——存量空表补齐语义
+        applyChange(changeEventWithSnapshot("shop",
+                "CREATE TABLE empty1 (id bigint, flag tinyint(1) COMMENT '开关', "
+                        + "amount decimal(12,2), seq bigint unsigned) COMMENT='空表测试'", "true", create));
+
+        assertThat(tableExists("shop", "empty1")).isTrue();
+        assertThat(columns("shop", "empty1")).containsExactly("id", "flag", "amount", "seq");
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT data_type FROM information_schema.columns WHERE table_catalog='lake' "
+                        + "AND table_schema='shop' AND table_name='empty1' ORDER BY ordinal_position")) {
+            rs.next(); assertThat(rs.getString(1)).isEqualTo("BIGINT");
+            rs.next(); assertThat(rs.getString(1)).isEqualTo("BOOLEAN");        // TINYINT(1) 口径
+            rs.next(); assertThat(rs.getString(1)).isEqualTo("DECIMAL(38,2)");
+            rs.next(); assertThat(rs.getString(1)).isEqualTo("DECIMAL(38,0)");  // BIGINT UNSIGNED precise 口径
+        }
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT comment FROM duckdb_tables() WHERE database_name='lake' AND schema_name='shop' AND table_name='empty1'")) {
+            rs.next();
+            assertThat(rs.getString(1)).isEqualTo("空表测试");
+        }
+        // 幂等:重放同 CREATE 不动已有表
+        applyChange(changeEventWithSnapshot("shop", "CREATE TABLE empty1 (id bigint)", "true", create));
+        assertThat(columns("shop", "empty1")).hasSize(4);
+    }
+
+    /** PG 表改名:object_identity 是新名,旧名从原句取;省略 COLUMN 关键字的列改名同样跟随 */
+    @Test
+    void pgRenameTableAndBareRenameColumnFollow() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE lake.public.rt1 (id BIGINT, note VARCHAR)");
+        }
+        // 表改名:ALTER TABLE rt1 RENAME TO rt2(identity 已是 public.rt2)
+        apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.rt2",
+                "ALTER TABLE rt1 RENAME TO rt2", 400)));
+        assertThat(tableExists("public", "rt1")).isFalse();
+        assertThat(tableExists("public", "rt2")).isTrue();
+
+        // 省略 COLUMN 关键字的列改名(PG 合法语法)
+        apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.rt2",
+                "ALTER TABLE rt2 RENAME note TO remark", 401)));
+        assertThat(columns("public", "rt2")).containsExactly("id", "remark");
     }
 
     // ---------- 工具 ----------

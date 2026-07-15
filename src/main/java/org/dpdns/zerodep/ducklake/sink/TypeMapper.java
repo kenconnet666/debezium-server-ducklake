@@ -52,9 +52,15 @@ final class TypeMapper {
         if (logical != null) {
             switch (logical) {
                 case Decimal.LOGICAL_NAME -> {
-                    // scale 在 schema 参数里；DuckDB DECIMAL 上限 38 位
+                    // scale 在 schema 参数里,源列精度在 Debezium 附加参数里;DuckDB DECIMAL 上限 38 位——
+                    // 源列 p>38(或 s>37)时 CAST 必溢出,落 VARCHAR 保全精度(与裸 numeric 同策略,无损优先)
                     int scale = Integer.parseInt(schema.parameters().getOrDefault(Decimal.SCALE_FIELD, "0"));
-                    return "DECIMAL(38," + Math.min(scale, 37) + ")";
+                    int precision = Integer.parseInt(
+                            schema.parameters().getOrDefault("connect.decimal.precision", "38"));
+                    if (precision > 38 || scale > 37 || scale < 0) {
+                        return "VARCHAR";
+                    }
+                    return "DECIMAL(38," + scale + ")";
                 }
                 case ISO_DATE -> {
                     return "DATE";
@@ -96,6 +102,16 @@ final class TypeMapper {
             case FLOAT64 -> "DOUBLE";
             case BOOLEAN -> "BOOLEAN";
             case BYTES -> "BLOB";
+            // PG 一维数组 → DuckDB LIST(元素类型递归推导);嵌套数组/BYTES 元素等
+            // staging 文本编码表达不了的形态退 VARCHAR 兜底
+            case ARRAY -> {
+                String elem = duckType(schema.valueSchema());
+                yield switch (elem) {
+                    case "BLOB", "VARCHAR" -> schema.valueSchema().type() == Schema.Type.STRING
+                            ? "VARCHAR[]" : "VARCHAR";
+                    default -> elem.endsWith("[]") ? "VARCHAR" : elem + "[]";
+                };
+            }
             default -> "VARCHAR";
         };
     }
@@ -164,10 +180,14 @@ final class TypeMapper {
 
     /**
      * information_schema.columns.data_type 的形态归一到 {@link #duckType} 的产出形态,
-     * 供湖列现型与事件类型比对(实测差异仅时区时间戳一处)。
+     * 供湖列现型与事件类型比对(差异仅时区时间戳一处;LIST 列递归归一元素类型,
+     * 否则 "TIMESTAMP WITH TIME ZONE[]" 与事件 "TIMESTAMPTZ[]" 恒不等,每批误触类型跟随)。
      */
     static String normalizeDuckType(String infoSchemaType) {
         String t = infoSchemaType == null ? "" : infoSchemaType.toUpperCase();
+        if (t.endsWith("[]")) {
+            return normalizeDuckType(t.substring(0, t.length() - 2)) + "[]";
+        }
         return "TIMESTAMP WITH TIME ZONE".equals(t) ? "TIMESTAMPTZ" : t;
     }
 
@@ -212,6 +232,24 @@ final class TypeMapper {
             // BLOB 经 hex 编码过 VARCHAR staging,投影侧 unhex 还原(见 castExpr)
             case BYTES -> java.util.HexFormat.of()
                     .formatHex(value instanceof ByteBuffer bb ? toBytes(bb) : (byte[]) value);
+            // 数组 → DuckDB list 字面量文本(与 castExpr 的 TRY_CAST ... [] 配对):
+            // 元素文本递归复用本方法(时间/decimal 元素编码一致),统一双引号包裹+转义,
+            // NULL 元素用裸 NULL 字面量
+            case ARRAY -> {
+                StringBuilder sb = new StringBuilder("[");
+                java.util.List<?> list = (java.util.List<?>) value;
+                for (int i = 0; i < list.size(); i++) {
+                    Object elem = list.get(i);
+                    sb.append(i > 0 ? ", " : "");
+                    if (elem == null) {
+                        sb.append("NULL");
+                    } else {
+                        String text = stagingText(schema.valueSchema(), elem);
+                        sb.append('"').append(text == null ? "" : text.replace("\"", "\\\"")).append('"');
+                    }
+                }
+                yield sb.append(']').toString();
+            }
             default -> value.toString();
         };
     }
@@ -245,6 +283,10 @@ final class TypeMapper {
         }
         if ("BLOB".equals(duckType)) {
             return "unhex(" + quoted + ")";
+        }
+        // LIST 与时间族同属"文本解析型 cast":个别毒丸值置 NULL 保数据链不断
+        if (duckType.endsWith("[]")) {
+            return "TRY_CAST(" + quoted + " AS " + duckType + ")";
         }
         return switch (duckType) {
             case "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ" ->

@@ -182,9 +182,9 @@ public class LakeMaintenanceJobs {
      * 重快照后无历史信号也安全（rename/删列应用有列存在性幂等兜底）。
      * ⚠️ 不能用 DELETE 清——会产生墓碑事件流进 DdlApplier（其 __op 过滤只是兜底）。
      * 需要 GRANT TRUNCATE（PG）/ DROP 权限（MySQL 的 TRUNCATE 走 DROP 权限）。
-     * PG：TRUNCATE 不产生复制事件（Debezium 默认 skipped.operations=t）。
-     * MySQL：TRUNCATE 是 DDL 会进 binlog——signal 表从不落湖（行事件被连接器内部消费），
-     * 消费者对未落湖表的 TRUNCATE 静默跳过，无副作用。
+     * followTruncate 放行 op=t 后，本清理的 TRUNCATE 会产生事件——信号表从不落湖
+     * （dbz_ddl_log 走 DdlApplier 路由、dbz_signal 被连接器内部消费），消费者对
+     * 未落湖表的 TRUNCATE 段静默跳过，无副作用。
      * DDL 审计表是 PG event trigger 专属基建，MySQL 模式不存在、跳过。
      */
     private void truncateDdlSignals() {

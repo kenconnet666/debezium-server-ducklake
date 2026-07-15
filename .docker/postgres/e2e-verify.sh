@@ -82,6 +82,12 @@ psrc "CREATE TABLE $TBL(id int PRIMARY KEY, name text, val numeric(12,2), create
 psrc "INSERT INTO $TBL(id,name,val) SELECT g, 'row-'||g, g*1.5 FROM generate_series(1,1000) g" >/dev/null
 wait_for "1000 行 INSERT 落湖(当前态 1000)" 120 "1000" lakecount
 
+echo "── 3.5 TRUNCATE 跟随(两源同通路;紧跟单一数据文件时段,计数口径精确) ──"
+psrc "TRUNCATE $TBL" >/dev/null
+wait_for "源 TRUNCATE → 湖表清空(当前态 0)" 60 "0" lakecount
+psrc "INSERT INTO $TBL(id,name,val) SELECT g, 'row-'||g, g*1.5 FROM generate_series(1,1000) g" >/dev/null
+wait_for "TRUNCATE 后重灌照常镜像(当前态 1000)" 120 "1000" lakecount
+
 echo "── 4. UPDATE/DELETE 镜像跟随 ──"
 psrc "UPDATE $TBL SET val = val + 100 WHERE id <= 100" >/dev/null
 psrc "DELETE FROM $TBL WHERE id > 950" >/dev/null

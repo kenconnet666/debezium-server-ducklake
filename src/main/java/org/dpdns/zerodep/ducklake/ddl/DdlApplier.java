@@ -35,16 +35,26 @@ import java.util.regex.Pattern;
  * 其余跟随分工（两前端一致）：加列与类型安全放宽交给数据驱动 ensureTable 幂等处理；删列默认跟随真删
  * （followDropColumn=false 时保留湖列留历史）；DROP TABLE 默认跟随真删湖表（followDropTable=false
  * 时保留；快照重放的历史 DDL 一律跳过——快照给的是当前态，活表不能被历史 DDL 误删）；
- * 建表延迟到首批数据；重复应用靠"列存在性检查"天然幂等。
+ * CREATE TABLE 即刻建湖空表（PG 连源库读列定义 / MySQL 用 tableChanges 全列结构，
+ * IF-NOT-EXISTS 幂等；类型映射尽力对齐事件推导口径，偏差由数据驱动 followTypeChange 自愈）；
+ * 重复应用靠"列/表存在性检查"天然幂等。
  */
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class DdlApplier {
 
-    /** RENAME COLUMN old TO new（PG 双引号 / MySQL 8.0 反引号或裸名通用） */
+    /** RENAME [COLUMN] old TO new（PG 允许省略 COLUMN 关键字；双引号/反引号/裸名通用）。
+     *  负前瞻排除 "RENAME TO"（表改名，另路处理）与 RENAME INDEX/KEY */
     private static final Pattern RENAME_COLUMN = Pattern.compile(
-            "RENAME\\s+COLUMN\\s+[\"`]?([\\w$]+)[\"`]?\\s+TO\\s+[\"`]?([\\w$]+)[\"`]?", Pattern.CASE_INSENSITIVE);
+            "RENAME\\s+(?:COLUMN\\s+)?(?!TO\\b|INDEX\\b|KEY\\b)[\"`]?([\\w$]+)[\"`]?\\s+TO\\s+[\"`]?([\\w$]+)[\"`]?",
+            Pattern.CASE_INSENSITIVE);
+
+    /** [PG] 表改名：ALTER TABLE [IF EXISTS] [ONLY] <旧名> RENAME TO <新名>——旧名从原句取
+     *  （event trigger 的 object_identity 给的是改名后的新标识） */
+    private static final Pattern PG_RENAME_TABLE = Pattern.compile(
+            "ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:ONLY\\s+)?(?:[\"]?[\\w$]+[\"]?\\.)?[\"]?([\\w$]+)[\"]?"
+                    + "\\s+RENAME\\s+TO\\s+[\"]?([\\w$]+)[\"]?", Pattern.CASE_INSENSITIVE);
 
     /** COMMENT ON TABLE/COLUMN ... IS <值>——取 IS 之后原样搬运（'文本'/NULL 的字面量
      *  语法 PG 与 DuckDB 兼容，含 '' 转义;E'...' 等 PG 特有形式匹配不上则跳过） */
@@ -150,6 +160,11 @@ public class DdlApplier {
                     applyDropColumns(conn, group.getValue(), cacheInvalidator);
                 } else if ("COMMENT".equals(tag)) {
                     applyComment(conn, str(row, "object_type"), str(row, "object_identity"), query);
+                } else if ("CREATE TABLE".equals(tag) && "table".equals(str(row, "object_type"))) {
+                    // DDL 驱动建空表:连源库读列定义(源表已删则自然跳过)——湖表形态即刻跟随,
+                    // 不再等首批数据;IF-NOT-EXISTS 幂等,快照重放安全;类型以映射表尽力对齐
+                    // 事件推导口径,偏差由数据驱动 followTypeChange 自愈(空表重写零成本)
+                    createTableFromPgSource(conn, str(row, "object_identity"), cacheInvalidator);
                 }
                 // 主键变更(独立于上面分支;快照重放的历史 DDL 跳过——当前态本就完整,重灌无意义):
                 // 存量行主键回填无 CDC 事件,湖旧行主键恒 NULL → 重建+增量快照重灌
@@ -217,16 +232,28 @@ public class DdlApplier {
         }
     }
 
-    /** rename 应用：列存在性检查保证幂等（快照重放旧 DDL 时安全跳过） */
+    /** rename 应用（列改名或表改名，存在性检查保证幂等，快照重放旧 DDL 时安全跳过）。
+     *  表改名：object_identity 是改名后的 schema.<新名>，旧表名从原句正则取 */
     private void applyRenameIfAny(Connection conn, String objectIdentity, String query,
                                   Consumer<String> cacheInvalidator) throws SQLException {
-        Matcher m = RENAME_COLUMN.matcher(query);
-        if (!m.find() || objectIdentity == null) {
+        if (objectIdentity == null) {
             return;
         }
-        String lakeTable = lakeTableOf(objectIdentity);
-        if (lakeTable != null) {
-            renameColumnInLake(conn, lakeTable, m.group(1), m.group(2), cacheInvalidator);
+        Matcher col = RENAME_COLUMN.matcher(query);
+        if (col.find()) {
+            String lakeTable = lakeTableOf(objectIdentity);
+            if (lakeTable != null) {
+                renameColumnInLake(conn, lakeTable, col.group(1), col.group(2), cacheInvalidator);
+            }
+            return;
+        }
+        Matcher tbl = PG_RENAME_TABLE.matcher(query);
+        if (tbl.find()) {
+            String schema = objectIdentity.split("\\.")[0];
+            String from = lakeTableOf(schema + "." + tbl.group(1));
+            if (from != null) {
+                renameTableInLake(conn, from, tbl.group(2), cacheInvalidator);
+            }
         }
     }
 
@@ -282,6 +309,13 @@ public class DdlApplier {
                             dropTableInLake(conn, lakeTable, cacheInvalidator);
                         }
                     }
+                }
+            }
+            // ⓪ CREATE TABLE（结构化，快照期也做——历史 CREATE 把存量空表一并补齐）：
+            //    tableChanges 自带全列定义+注释,湖表形态即刻跟随,不再等首批数据
+            for (Struct tc : tableChanges) {
+                if ("CREATE".equals(str(tc, "type"))) {
+                    createTableFromMysqlChange(conn, db, tc, cacheInvalidator);
                 }
             }
             if (ddl == null || db == null || db.isBlank()) {
@@ -411,6 +445,171 @@ public class DdlApplier {
                 }
             }
         }
+    }
+
+    // ============================ DDL 驱动建空表（两源前端 + 类型映射） ============================
+
+    /** [PG] 连源库读 information_schema 列定义建湖空表（表已删/连接瞬断则跳过，数据驱动兜底） */
+    private void createTableFromPgSource(Connection conn, String identity, Consumer<String> cacheInvalidator) {
+        String lakeTable = identity == null ? null : lakeTableOf(identity);
+        if (lakeTable == null) {
+            return;
+        }
+        String[] parts = identity.split("\\.");
+        DucklakeProperties.Source src = props.getSource();
+        Map<String, String> cols = new LinkedHashMap<>();
+        try (Connection c = java.sql.DriverManager.getConnection(src.jdbcUrl(), src.getUser(), src.getPassword());
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT column_name, data_type, udt_name, numeric_precision, numeric_scale "
+                             + "FROM information_schema.columns WHERE table_schema=? AND table_name=? "
+                             + "ORDER BY ordinal_position")) {
+            ps.setString(1, parts[0]);
+            ps.setString(2, parts[1]);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    cols.put(rs.getString(1), pgTypeToDuck(rs.getString(2), rs.getString(3),
+                            (Integer) rs.getObject(4), (Integer) rs.getObject(5)));
+                }
+            }
+        } catch (SQLException e) {
+            log.warn("建空表读源列定义失败(跳过,首批数据将兜底建表): {} ({})", identity, e.getMessage());
+            return;
+        }
+        try {
+            createTableInLake(conn, lakeTable, cols, null, Map.of(), cacheInvalidator);
+        } catch (SQLException e) {
+            log.warn("湖侧建空表失败(跳过,首批数据将兜底建表): {} ({})", lakeTable, e.getMessage());
+        }
+    }
+
+    /** [MySQL] 以 tableChanges 的全列结构建湖空表（快照期历史 CREATE 也建=存量空表补齐），
+     *  表/列注释一并应用 */
+    private void createTableFromMysqlChange(Connection conn, String db, Struct tc,
+                                            Consumer<String> cacheInvalidator) {
+        String lakeTable = lakeTableOfChangeId(db, str(tc, "id"));
+        if (lakeTable == null || !(tc.schema().field("table") != null && tc.get("table") instanceof Struct table)) {
+            return;
+        }
+        Map<String, String> cols = new LinkedHashMap<>();
+        Map<String, String> colComments = new LinkedHashMap<>();
+        for (Struct col : structList(table, "columns")) {
+            String name = str(col, "name");
+            cols.put(name, mysqlTypeToDuck(str(col, "typeName"), asLong(col, "length"), asLong(col, "scale")));
+            String comment = str(col, "comment");
+            if (comment != null && !comment.isBlank()) {
+                colComments.put(name, comment);
+            }
+        }
+        try {
+            createTableInLake(conn, lakeTable, cols, str(table, "comment"), colComments, cacheInvalidator);
+        } catch (SQLException e) {
+            log.warn("湖侧建空表失败(跳过,首批数据将兜底建表): {} ({})", lakeTable, e.getMessage());
+        }
+    }
+
+    /** PG information_schema 类型 → DuckDB 列型（对齐事件推导口径：isostring+precise；
+     *  拿不准一律 VARCHAR，数据到达后 followTypeChange 自愈——空表阶段类型偏差零成本） */
+    private static String pgTypeToDuck(String dataType, String udtName, Integer precision, Integer scale) {
+        return switch (dataType == null ? "" : dataType) {
+            case "bigint" -> "BIGINT";
+            case "integer" -> "INTEGER";
+            case "smallint" -> "SMALLINT";
+            case "numeric", "decimal" -> scale == null || precision == null
+                    ? "VARCHAR"   // 裸 numeric:无固定 scale,字符串保精度(与事件口径一致)
+                    : (precision > 38 || scale > 37 || scale < 0 ? "VARCHAR" : "DECIMAL(38," + scale + ")");
+            case "real" -> "FLOAT";
+            case "double precision" -> "DOUBLE";
+            case "boolean" -> "BOOLEAN";
+            case "timestamp without time zone" -> "TIMESTAMP";
+            case "timestamp with time zone" -> "TIMESTAMPTZ";
+            case "date" -> "DATE";
+            case "time without time zone", "time with time zone" -> "TIME";
+            case "bytea" -> "BLOB";
+            case "json", "jsonb" -> "JSON";
+            case "uuid" -> "UUID";
+            case "ARRAY" -> switch (udtName == null ? "" : udtName) {
+                case "_int8" -> "BIGINT[]";
+                case "_int4" -> "INTEGER[]";
+                case "_int2" -> "SMALLINT[]";
+                case "_text", "_varchar", "_bpchar" -> "VARCHAR[]";
+                case "_float4" -> "FLOAT[]";
+                case "_float8" -> "DOUBLE[]";
+                case "_bool" -> "BOOLEAN[]";
+                case "_date" -> "DATE[]";
+                case "_timestamp" -> "TIMESTAMP[]";
+                case "_timestamptz" -> "TIMESTAMPTZ[]";
+                case "_uuid" -> "UUID[]";
+                default -> "VARCHAR";  // numeric[]/嵌套等:元素精度拿不到,兜底待数据自愈
+            };
+            default -> "VARCHAR";  // enum/自定义/网络类型等,与事件 VARCHAR 兜底一致
+        };
+    }
+
+    /** MySQL tableChanges 的 typeName → DuckDB 列型（对齐事件推导口径：
+     *  TinyIntOneToBooleanConverter + bigint.unsigned=precise + isostring） */
+    private static String mysqlTypeToDuck(String typeName, Long length, Long scale) {
+        String tn = typeName == null ? "" : typeName.toUpperCase();
+        boolean unsigned = tn.contains("UNSIGNED");
+        String base = tn.replace(" UNSIGNED", "").replace(" ZEROFILL", "").trim();
+        return switch (base) {
+            case "TINYINT" -> length != null && length == 1 ? "BOOLEAN" : "SMALLINT";
+            case "BOOLEAN", "BOOL" -> "BOOLEAN";
+            case "SMALLINT" -> unsigned ? "INTEGER" : "SMALLINT";
+            case "MEDIUMINT" -> "INTEGER";
+            case "INT", "INTEGER" -> unsigned ? "BIGINT" : "INTEGER";
+            case "BIGINT" -> unsigned ? "DECIMAL(38,0)" : "BIGINT";
+            case "DECIMAL", "NUMERIC" -> {
+                long p = length == null ? 10 : length;
+                long s = scale == null ? 0 : scale;
+                yield p > 38 || s > 37 || s < 0 ? "VARCHAR" : "DECIMAL(38," + s + ")";
+            }
+            case "FLOAT" -> "FLOAT";
+            case "DOUBLE", "REAL" -> "DOUBLE";
+            case "BIT" -> length != null && length == 1 ? "BOOLEAN" : "BLOB";
+            case "DATETIME" -> "TIMESTAMP";
+            case "TIMESTAMP" -> "TIMESTAMPTZ";
+            case "DATE" -> "DATE";
+            case "TIME" -> "TIME";
+            case "YEAR" -> "INTEGER";
+            case "JSON" -> "JSON";
+            case "BINARY", "VARBINARY", "TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB" -> "BLOB";
+            case "GEOMETRY", "POINT", "LINESTRING", "POLYGON", "MULTIPOINT",
+                 "MULTILINESTRING", "MULTIPOLYGON", "GEOMETRYCOLLECTION" -> "BLOB";
+            default -> "VARCHAR";  // CHAR/VARCHAR/TEXT 族/ENUM/SET 及未知类型
+        };
+    }
+
+    /** 建湖空表原语：表已存在则跳过（不动现有形态，列对齐交给数据驱动 ensureTable）；
+     *  湖 schema 按需建；表/列注释一并应用（幂等覆盖） */
+    private void createTableInLake(Connection conn, String lakeTable, Map<String, String> cols,
+                                   String tableComment, Map<String, String> colComments,
+                                   Consumer<String> cacheInvalidator) throws SQLException {
+        if (cols.isEmpty() || tableExists(conn, lakeTable)) {
+            return;
+        }
+        String schema = lakeTable.substring(0, lakeTable.indexOf('.'));
+        StringBuilder ddl = new StringBuilder("CREATE TABLE IF NOT EXISTS ")
+                .append(DuckLakeEngine.LAKE).append('.').append(DuckLakeEngine.quoted(lakeTable)).append(" (");
+        int i = 0;
+        for (Map.Entry<String, String> col : cols.entrySet()) {
+            ddl.append(i++ > 0 ? ", " : "").append('"').append(col.getKey()).append("\" ").append(col.getValue());
+        }
+        ddl.append(')');
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA IF NOT EXISTS " + DuckLakeEngine.LAKE + ".\"" + schema + '"');
+            s.execute(ddl.toString());
+        }
+        if (tableComment != null && !tableComment.isBlank()) {
+            commentInLake(conn, "TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable),
+                    quoteLiteral(tableComment));
+        }
+        for (Map.Entry<String, String> c : colComments.entrySet()) {
+            commentInLake(conn, "COLUMN " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                    + ".\"" + c.getKey() + "\"", quoteLiteral(c.getValue()));
+        }
+        cacheInvalidator.accept(lakeTable);
+        syncState.getDdlApplied().increment();
+        log.info("湖侧建空表(DDL 跟随): {} ({} 列)", lakeTable, cols.size());
     }
 
     // ============================ 湖端执行原语（双前端共用） ============================

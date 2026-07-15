@@ -170,8 +170,9 @@ public class DucklakeProperties {
         private int snapshotRetainDays = 30;
         /** DDL 信号流里跟随删除湖列（默认 true=跟随真删；false=保留历史列，新行 NULL） */
         private boolean followDropColumn = true;
-        /** [仅 MySQL] 源 TRUNCATE TABLE 跟随清空湖表（binlog 有 op=t 事件；默认 true=镜像语义）。
-         *  PG 路线暂不支持（pgoutput truncate 事件被 Debezium 默认跳过且 unwrap 丢弃，见 README） */
+        /** 源 TRUNCATE TABLE 跟随清空湖表（两源通用，默认 true=镜像语义）：放行 op=t 事件
+         *  （PG 的 FOR ALL TABLES publication 默认 publish truncate；MySQL binlog 原生支持），
+         *  经 TruncateRescueTransform 穿过 unwrap 的硬编码丢弃后按段应用 */
         private boolean followTruncate = true;
         /** DDL 信号流里跟随源库 DROP TABLE 真删湖表（默认 true=镜像语义；false=湖表保留。
          *  真删后时间旅行窗口内旧 snapshot 仍可 AT (TIMESTAMP ...) 回看该表） */
