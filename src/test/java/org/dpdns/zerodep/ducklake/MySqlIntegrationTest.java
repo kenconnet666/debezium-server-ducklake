@@ -313,6 +313,36 @@ class MySqlIntegrationTest {
                 assertThat(lakeCount("SELECT count(*) FROM shop.empty_live")).isZero());
     }
 
+    /** ADD COLUMN DDL 驱动(不等数据即建列,含 AFTER 位置语义的列序重排换表跟随) */
+    @Test
+    @Order(11)
+    void addColumnWithPositionFollowsImmediately() throws Exception {
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE shop.colpos (id bigint PRIMARY KEY, name varchar(32))");
+            s.execute("INSERT INTO shop.colpos VALUES (1,'a'), (2,'b')");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM shop.colpos")).isEqualTo(2L));
+
+        // 中间位置加列,不插任何数据——湖应即刻出列且列序对齐 id,age,name
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("ALTER TABLE shop.colpos ADD COLUMN age int COMMENT '年龄' AFTER id");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() -> {
+            String cols = engine.queryScalar("SELECT string_agg(column_name, ',' ORDER BY ordinal_position) "
+                    + "FROM information_schema.columns WHERE table_catalog='lake' "
+                    + "AND table_schema='shop' AND table_name='colpos'", String.class);
+            assertThat(cols).isEqualTo("id,age,name");
+        });
+        // 重排换表不丢数据;注释随列落湖
+        assertThat(lakeCount("SELECT count(*) FROM shop.colpos WHERE age IS NULL")).isEqualTo(2L);
+        assertThat(engine.queryScalar("SELECT comment FROM duckdb_columns() WHERE database_name='lake' "
+                + "AND schema_name='shop' AND table_name='colpos' AND column_name='age'", String.class))
+                .isEqualTo("年龄");
+    }
+
     /** MySQL TIME 毒丸(合法值域 ±838h 超湖 TIME 24h):行不丢、链路不断(TRY_CAST 置 NULL 或
      *  Debezium 侧钳制,两者皆可——钉死"不 crash loop"这一行为) */
     @Test

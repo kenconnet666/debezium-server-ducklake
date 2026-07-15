@@ -368,8 +368,11 @@ class DdlApplierTest {
             s.execute("CREATE TABLE lake.shop.m2 (id BIGINT, legacy VARCHAR)");
             s.execute("CREATE TABLE lake.shop.m3 (id BIGINT)");
         }
+        // 删列走目标态 diff(tableChanges 变更后全列不含 legacy),免正则/审计配对
+        Struct idOnly = new Struct(CHANGE_TABLE)
+                .put("columns", List.of(new Struct(CHANGE_TABLE_COLUMN).put("name", "id").put("typeName", "BIGINT")));
         applyChange(changeEvent("shop", "ALTER TABLE m2 DROP COLUMN legacy",
-                tableChange("ALTER", "\"shop\".\"m2\"")));
+                new Struct(TABLE_CHANGE).put("type", "ALTER").put("id", "\"shop\".\"m2\"").put("table", idOnly)));
         assertThat(columns("shop", "m2")).containsExactly("id");
 
         // DROP TABLE 走结构化 tableChanges type=DROP（ddl 原文无关紧要）
@@ -517,6 +520,68 @@ class DdlApplierTest {
         apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.rt2",
                 "ALTER TABLE rt2 RENAME note TO remark", 401)));
         assertThat(columns("public", "rt2")).containsExactly("id", "remark");
+    }
+
+    /** ADD COLUMN DDL 驱动即刻建列(不等数据,含注释) + 列序漂移整表重排跟随 */
+    @Test
+    void mysqlAlterSyncsNewColumnsAndColumnOrder() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
+            s.execute("CREATE TABLE lake.shop.mc1 (id BIGINT, name VARCHAR)");
+            s.execute("INSERT INTO lake.shop.mc1 VALUES (1,'a'), (2,'b')");
+        }
+        // 源 ADD COLUMN age AFTER id:目标列序 id,age,name——湖应即刻加列并重排到位
+        Struct idCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "id").put("typeName", "BIGINT");
+        Struct ageCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "age")
+                .put("typeName", "INT").put("comment", "年龄");
+        Struct nameCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "name").put("typeName", "VARCHAR");
+        Struct table = new Struct(CHANGE_TABLE).put("columns", List.of(idCol, ageCol, nameCol));
+        Struct alter = new Struct(TABLE_CHANGE).put("type", "ALTER")
+                .put("id", "\"shop\".\"mc1\"").put("table", table);
+        applyChange(changeEvent("shop", "ALTER TABLE mc1 ADD COLUMN age int COMMENT '年龄' AFTER id", alter));
+
+        assertThat(columns("shop", "mc1")).containsExactly("id", "age", "name"); // 列序=源目标态
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT count(*), max(name) FROM lake.shop.mc1 WHERE age IS NULL")) {
+            rs.next();
+            assertThat(rs.getLong(1)).as("重排换表不丢数据").isEqualTo(2);
+            assertThat(rs.getString(2)).isEqualTo("b");
+        }
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT comment FROM duckdb_columns() WHERE database_name='lake' "
+                        + "AND schema_name='shop' AND table_name='mc1' AND column_name='age'")) {
+            rs.next();
+            assertThat(rs.getString(1)).as("DDL 加列携带注释").isEqualTo("年龄");
+        }
+    }
+
+    /** follow-drop-column=false 时:源已删列在湖保留(重排追尾不丢);默认 true 则目标态 diff 删除 */
+    @Test
+    void reorderKeepsLakeOnlyHistoricalColumns() throws Exception {
+        props.getMaintenance().setFollowDropColumn(false);
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
+            s.execute("CREATE TABLE lake.shop.mc2 (id BIGINT, legacy VARCHAR, v VARCHAR)");
+            s.execute("INSERT INTO lake.shop.mc2 VALUES (1,'old','x')");
+        }
+        // 源目标态只有 v,id(legacy 在源已删但湖保留);列序 v 先 id 后 → 触发重排
+        Struct vCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "v").put("typeName", "VARCHAR");
+        Struct idCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "id").put("typeName", "BIGINT");
+        Struct table = new Struct(CHANGE_TABLE).put("columns", List.of(vCol, idCol));
+        Struct alter = new Struct(TABLE_CHANGE).put("type", "ALTER")
+                .put("id", "\"shop\".\"mc2\"").put("table", table);
+        applyChange(changeEvent("shop", "ALTER TABLE mc2 MODIFY v varchar(16) FIRST", alter));
+
+        assertThat(columns("shop", "mc2")).containsExactly("v", "id", "legacy"); // 源序+湖独有列追尾
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT legacy FROM lake.shop.mc2")) {
+            rs.next();
+            assertThat(rs.getString(1)).as("历史列数据保留").isEqualTo("old");
+        }
+        // 对照:默认 followDropColumn=true 下同形态 diff 会删多余列
+        props.getMaintenance().setFollowDropColumn(true);
+        applyChange(changeEvent("shop", "ALTER TABLE mc2 MODIFY v varchar(16) FIRST", alter));
+        assertThat(columns("shop", "mc2")).containsExactly("v", "id");
     }
 
     // ---------- 工具 ----------

@@ -554,16 +554,21 @@ public class DuckLakeChangeConsumer
         }
         String schemaName = lakeTable.substring(0, lakeTable.indexOf('.'));
         String tableName = lakeTable.substring(lakeTable.indexOf('.') + 1);
-        String qTmp = DuckLakeEngine.LAKE + ".\"" + schemaName + "\".\"" + tableName + "__typemig\"";
+        String tmpName = tableName + "__typemig";
+        String qTmp = DuckLakeEngine.LAKE + ".\"" + schemaName + "\".\"" + tmpName + "\"";
         String qTable = DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable);
+        // 三步式换表:空表阶段挂排序聚簇——含事务内 inlined 数据的表被 DuckLake 拒绝
+        // ALTER SET SORTED BY(1.0 实测),必须先建空表挂属性再灌数据
         try (Statement s = conn.createStatement()) {
             s.execute("DROP TABLE IF EXISTS " + qTmp);
-            s.execute("CREATE TABLE " + qTmp + " AS SELECT " + proj + " FROM " + qTable);
+            s.execute("CREATE TABLE " + qTmp + " AS SELECT " + proj + " FROM " + qTable + " LIMIT 0");
+        }
+        ddlApplier.applySortedByPk(conn, schemaName + "." + tmpName, keyColumns);
+        try (Statement s = conn.createStatement()) {
+            s.execute("INSERT INTO " + qTmp + " SELECT " + proj + " FROM " + qTable);
             s.execute("DROP TABLE " + qTable);
             s.execute("ALTER TABLE " + qTmp + " RENAME TO \"" + tableName + '"');
         }
-        // 表已换新(旧表属性随 DROP 消失),排序聚簇重挂
-        ddlApplier.applySortedByPk(conn, lakeTable, keyColumns);
         Map<String, String> fresh = loadColumns(conn, lakeTable);
         cols.clear();
         cols.putAll(fresh);

@@ -77,11 +77,6 @@ public class DdlApplier {
             "\\bCHANGE\\s+(?:COLUMN\\s+)?[\"`]?([\\w$]+)[\"`]?\\s+[\"`]?([\\w$]+)[\"`]?\\s",
             Pattern.CASE_INSENSITIVE);
 
-    /** MySQL 删列：DROP [COLUMN] col——负前瞻排除 DROP PRIMARY KEY/FOREIGN KEY/INDEX/分区等形态 */
-    private static final Pattern MYSQL_DROP_COLUMN = Pattern.compile(
-            "\\bDROP\\s+(?:COLUMN\\s+)?(?!(?:PRIMARY|FOREIGN|INDEX|KEY|CONSTRAINT|CHECK|PARTITION|DEFAULT)\\b)"
-                    + "[\"`]?([\\w$]+)[\"`]?", Pattern.CASE_INSENSITIVE);
-
     /** 表重命名：ALTER TABLE x RENAME [TO|AS] y（不含 RENAME COLUMN/RENAME INDEX/RENAME KEY） */
     private static final Pattern MYSQL_RENAME_TABLE_ALTER = Pattern.compile(
             "\\bRENAME\\s+(?:TO|AS)?\\s*(?!COLUMN\\b|INDEX\\b|KEY\\b)[\"`]?(?:[\\w$]+[\"`]?\\.[\"`]?)?([\\w$]+)[\"`]?",
@@ -175,8 +170,18 @@ public class DdlApplier {
                         rebuildRequester.accept(lakeTable);
                     }
                 }
-                // 其余（CREATE TABLE 等）：建表延迟到首批数据到达;
-                // 类型变更由数据驱动的 ensureTable 安全放宽跟随（TypeMapper.isSafeWidening 白名单）
+                // 列定义对齐(rename/删列已在上面应用,此处补齐):连源库读目标态——
+                // ADD COLUMN 即刻建列不等数据、列序漂移整表重排(快照重放的历史 ALTER 跳过)
+                if ("ALTER TABLE".equals(tag) && !"r".equals(str(row, "__op"))) {
+                    String identity = str(row, "object_identity");
+                    String lakeTable = identity == null ? null : lakeTableOf(identity);
+                    TableDef def = lakeTable == null ? null : readPgTableDef(identity);
+                    if (def != null && !def.cols().isEmpty()) {
+                        syncColumnsFromDefinition(conn, lakeTable, def.cols(), def.colComments(),
+                                def.pk(), cacheInvalidator, rebuildRequester);
+                    }
+                }
+                // 其余（CREATE TABLE 建空表见下方分支）:类型变更由数据驱动的 ensureTable 跟随
             }
         }
     }
@@ -342,13 +347,7 @@ public class DdlApplier {
                             renameColumnInLake(conn, targetTable, ch.group(1), ch.group(2), cacheInvalidator);
                         }
                     }
-                    // ④ DROP COLUMN（正则；漏匹配仅湖多留列，无数据正确性影响）
-                    if (props.getMaintenance().isFollowDropColumn()) {
-                        Matcher dc = MYSQL_DROP_COLUMN.matcher(ddl);
-                        while (dc.find()) {
-                            dropColumnInLake(conn, targetTable, dc.group(1), cacheInvalidator);
-                        }
-                    }
+                    // ④ 删列不再走正则——由 ⑥.5 的目标态 diff 统一跟随(免正则漏匹配)
                     // ⑤ 表重命名：ALTER TABLE x RENAME TO y（RENAME COLUMN 已在上面消费,此处负前瞻规避）
                     Matcher rt = MYSQL_RENAME_TABLE_ALTER.matcher(ddl);
                     if (rt.find() && !RENAME_COLUMN.matcher(ddl).find()) {
@@ -357,6 +356,16 @@ public class DdlApplier {
                     // ⑥ 主键变更 → 重建 + 快照重灌（对齐 PG 前端）
                     if (PRIMARY_KEY_CHANGE.matcher(ddl).find()) {
                         rebuildRequester.accept(targetTable);
+                    }
+                    // ⑥.5 列定义对齐(rename/删列已应用):tableChanges 自带变更后全列序——
+                    // ADD COLUMN 即刻建列(含 AFTER/FIRST 位置语义),列序漂移整表重排
+                    for (Struct tc : tableChanges) {
+                        if ("ALTER".equals(str(tc, "type"))
+                                && tc.schema().field("table") != null && tc.get("table") instanceof Struct table) {
+                            TableDef def = parseMysqlTableDef(table);
+                            syncColumnsFromDefinition(conn, targetTable, def.cols(), def.colComments(),
+                                    def.pk(), cacheInvalidator, rebuildRequester);
+                        }
                     }
                 }
             }
@@ -449,12 +458,12 @@ public class DdlApplier {
 
     // ============================ DDL 驱动建空表（两源前端 + 类型映射） ============================
 
-    /** [PG] 连源库读 information_schema 列定义建湖空表（表已删/连接瞬断则跳过，数据驱动兜底） */
-    private void createTableFromPgSource(Connection conn, String identity, Consumer<String> cacheInvalidator) {
-        String lakeTable = identity == null ? null : lakeTableOf(identity);
-        if (lakeTable == null) {
-            return;
-        }
+    /** 源表定义（列名→duck 类型按源列序、列注释、主键列） */
+    private record TableDef(Map<String, String> cols, Map<String, String> colComments, List<String> pk) {
+    }
+
+    /** [PG] 连源库读 information_schema 的表定义（表已删/连接瞬断返回 null，调用方跳过） */
+    private TableDef readPgTableDef(String identity) {
         String[] parts = identity.split("\\.");
         DucklakeProperties.Source src = props.getSource();
         Map<String, String> cols = new LinkedHashMap<>();
@@ -489,11 +498,39 @@ public class DdlApplier {
                 }
             }
         } catch (SQLException e) {
-            log.warn("建空表读源列定义失败(跳过,首批数据将兜底建表): {} ({})", identity, e.getMessage());
+            log.warn("读源表定义失败(跳过本次 DDL 跟随,数据驱动兜底): {} ({})", identity, e.getMessage());
+            return null;
+        }
+        return new TableDef(cols, Map.of(), pk);
+    }
+
+    /** [MySQL] 从 tableChanges 的 table 结构组装表定义 */
+    private static TableDef parseMysqlTableDef(Struct table) {
+        Map<String, String> cols = new LinkedHashMap<>();
+        Map<String, String> colComments = new LinkedHashMap<>();
+        for (Struct col : structList(table, "columns")) {
+            String name = str(col, "name");
+            cols.put(name, mysqlTypeToDuck(str(col, "typeName"), asLong(col, "length"), asLong(col, "scale")));
+            String comment = str(col, "comment");
+            if (comment != null && !comment.isBlank()) {
+                colComments.put(name, comment);
+            }
+        }
+        return new TableDef(cols, colComments, stringList(table, "primaryKeyColumnNames"));
+    }
+
+    /** [PG] 连源库读列定义建湖空表（表已删/连接瞬断则跳过，数据驱动兜底） */
+    private void createTableFromPgSource(Connection conn, String identity, Consumer<String> cacheInvalidator) {
+        String lakeTable = identity == null ? null : lakeTableOf(identity);
+        if (lakeTable == null) {
+            return;
+        }
+        TableDef def = readPgTableDef(identity);
+        if (def == null) {
             return;
         }
         try {
-            createTableInLake(conn, lakeTable, cols, null, Map.of(), pk, cacheInvalidator);
+            createTableInLake(conn, lakeTable, def.cols(), null, Map.of(), def.pk(), cacheInvalidator);
         } catch (SQLException e) {
             log.warn("湖侧建空表失败(跳过,首批数据将兜底建表): {} ({})", lakeTable, e.getMessage());
         }
@@ -507,19 +544,10 @@ public class DdlApplier {
         if (lakeTable == null || !(tc.schema().field("table") != null && tc.get("table") instanceof Struct table)) {
             return;
         }
-        Map<String, String> cols = new LinkedHashMap<>();
-        Map<String, String> colComments = new LinkedHashMap<>();
-        for (Struct col : structList(table, "columns")) {
-            String name = str(col, "name");
-            cols.put(name, mysqlTypeToDuck(str(col, "typeName"), asLong(col, "length"), asLong(col, "scale")));
-            String comment = str(col, "comment");
-            if (comment != null && !comment.isBlank()) {
-                colComments.put(name, comment);
-            }
-        }
+        TableDef def = parseMysqlTableDef(table);
         try {
-            createTableInLake(conn, lakeTable, cols, str(table, "comment"), colComments,
-                    stringList(table, "primaryKeyColumnNames"), cacheInvalidator);
+            createTableInLake(conn, lakeTable, def.cols(), str(table, "comment"), def.colComments(),
+                    def.pk(), cacheInvalidator);
         } catch (SQLException e) {
             log.warn("湖侧建空表失败(跳过,首批数据将兜底建表): {} ({})", lakeTable, e.getMessage());
         }
@@ -597,6 +625,128 @@ public class DdlApplier {
                  "MULTILINESTRING", "MULTIPOLYGON", "GEOMETRYCOLLECTION" -> "BLOB";
             default -> "VARCHAR";  // CHAR/VARCHAR/TEXT 族/ENUM/SET 及未知类型
         };
+    }
+
+    /**
+     * 列定义对齐原语（DDL 驱动的加列/删列/列序跟随）：以"源目标态"对齐湖表——
+     * ① 湖缺列 → ADD COLUMN IF NOT EXISTS（含注释），不再等首批数据；
+     * ② 湖多余列（源已删）→ 跟随删除（follow-drop-column=false 时保留追尾）——
+     *    目标态 diff 驱动，无需依赖审计配对/正则；rename 已由前置步骤应用，
+     *    未被识别的改名形态会退化为"删旧列+建新列"（旧值在时间旅行窗口内可回看）；
+     * ③ 列集合齐但顺序不同（MySQL ADD ... AFTER/FIRST、MODIFY 重排）→ 整表重写换表按目标序重排
+     *    （DuckDB/DuckLake 无列重排语法；换表在空表阶段挂排序聚簇——对含事务内 inlined
+     *    数据的表 ALTER SET SORTED BY 会被 DuckLake 拒绝——并重刷列注释）；
+     * ④ 重排失败 → rebuildRequester 兜底（重建 + blocking 快照重灌当前态）。
+     * 湖表不存在时不做事（建表另有 createTableInLake / 数据驱动 ensureTable）。
+     */
+    private void syncColumnsFromDefinition(Connection conn, String lakeTable,
+                                           Map<String, String> targetCols, Map<String, String> colComments,
+                                           List<String> keyColumns, Consumer<String> cacheInvalidator,
+                                           Consumer<String> rebuildRequester) throws SQLException {
+        if (targetCols.isEmpty() || !tableExists(conn, lakeTable)) {
+            return;
+        }
+        List<String> lakeCols = lakeColumnOrder(conn, lakeTable);
+        boolean changed = false;
+        // ① 补缺列(尾部追加;类型偏差由数据驱动 followTypeChange 自愈)
+        for (Map.Entry<String, String> col : targetCols.entrySet()) {
+            if (!lakeCols.contains(col.getKey())) {
+                try (Statement s = conn.createStatement()) {
+                    s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                            + " ADD COLUMN IF NOT EXISTS \"" + col.getKey() + "\" " + col.getValue());
+                }
+                String comment = colComments.get(col.getKey());
+                if (comment != null) {
+                    commentInLake(conn, "COLUMN " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                            + ".\"" + col.getKey() + "\"", quoteLiteral(comment));
+                }
+                syncState.getDdlApplied().increment();
+                log.warn("湖表加列(DDL 跟随,不等数据): {}.{} ({})", lakeTable, col.getKey(), col.getValue());
+                changed = true;
+            }
+        }
+        // ② 删多余列(目标态 diff,免审计配对)
+        if (props.getMaintenance().isFollowDropColumn()) {
+            for (String lakeCol : lakeCols) {
+                if (!targetCols.containsKey(lakeCol)) {
+                    dropColumnInLake(conn, lakeTable, lakeCol, cacheInvalidator);
+                    changed = true;
+                }
+            }
+        }
+        if (changed) {
+            lakeCols = lakeColumnOrder(conn, lakeTable);
+            cacheInvalidator.accept(lakeTable);
+        }
+        // ③ 列序对齐:目标序 = 源列序 + 湖独有列(follow-drop-column=false 保留的)追尾
+        List<String> targetOrder = new ArrayList<>(targetCols.keySet());
+        for (String c : lakeCols) {
+            if (!targetOrder.contains(c)) {
+                targetOrder.add(c);
+            }
+        }
+        targetOrder.retainAll(lakeCols); // 目标列可能因 followDropColumn=false 等原因未全在湖,取交集序
+        if (lakeCols.equals(targetOrder)) {
+            return;
+        }
+        try {
+            reorderTable(conn, lakeTable, targetOrder, keyColumns, colComments);
+            cacheInvalidator.accept(lakeTable);
+            syncState.getDdlApplied().increment();
+            log.warn("湖表列序跟随(整表重写换表): {} -> {}", lakeTable, targetOrder);
+        } catch (SQLException e) {
+            // ④ 重排失败(类型冲突等):重建+快照重灌兜底
+            log.warn("湖表列序重排失败,转重建+快照重灌: {} ({})", lakeTable, e.getMessage());
+            rebuildRequester.accept(lakeTable);
+        }
+    }
+
+    /** 整表重写换表按目标列序重排。三步式：AS SELECT LIMIT 0 建空表(继承列型) →
+     *  空表阶段挂排序聚簇(含事务内 inlined 数据的表被 DuckLake 拒绝 ALTER,1.0 实测) →
+     *  灌数据换表 → 重刷列注释(CREATE AS SELECT 不传递注释) */
+    private void reorderTable(Connection conn, String lakeTable, List<String> targetOrder,
+                              List<String> keyColumns, Map<String, String> colComments) throws SQLException {
+        String schemaName = lakeTable.substring(0, lakeTable.indexOf('.'));
+        String tableName = lakeTable.substring(lakeTable.indexOf('.') + 1);
+        String proj = String.join(", ", targetOrder.stream().map(c -> '"' + c + '"').toList());
+        String tmpName = tableName + "__reorder";
+        String qTmp = DuckLakeEngine.LAKE + ".\"" + schemaName + "\".\"" + tmpName + "\"";
+        String qTable = DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable);
+        try (Statement s = conn.createStatement()) {
+            s.execute("DROP TABLE IF EXISTS " + qTmp);
+            s.execute("CREATE TABLE " + qTmp + " AS SELECT " + proj + " FROM " + qTable + " LIMIT 0");
+        }
+        applySortedByPk(conn, schemaName + "." + tmpName, keyColumns);
+        try (Statement s = conn.createStatement()) {
+            s.execute("INSERT INTO " + qTmp + " SELECT " + proj + " FROM " + qTable);
+            s.execute("DROP TABLE " + qTable);
+            s.execute("ALTER TABLE " + qTmp + " RENAME TO \"" + tableName + '"');
+        }
+        for (Map.Entry<String, String> c : colComments.entrySet()) {
+            if (targetOrder.contains(c.getKey())) {
+                commentInLake(conn, "COLUMN " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                        + ".\"" + c.getKey() + "\"", quoteLiteral(c.getValue()));
+            }
+        }
+    }
+
+    /** 湖表现有列名（按 ordinal_position 序） */
+    private List<String> lakeColumnOrder(Connection conn, String lakeTable) throws SQLException {
+        String[] parts = lakeTable.split("\\.", 2);
+        List<String> cols = new ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT column_name FROM information_schema.columns "
+                        + "WHERE table_catalog=? AND table_schema=? AND table_name=? ORDER BY ordinal_position")) {
+            ps.setString(1, DuckLakeEngine.LAKE);
+            ps.setString(2, parts[0]);
+            ps.setString(3, parts[1]);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    cols.add(rs.getString(1));
+                }
+            }
+        }
+        return cols;
     }
 
     /** 建湖空表原语：表已存在则跳过（不动现有形态，列对齐交给数据驱动 ensureTable）；

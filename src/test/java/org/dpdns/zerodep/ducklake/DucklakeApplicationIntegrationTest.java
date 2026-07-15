@@ -388,6 +388,17 @@ class DucklakeApplicationIntegrationTest {
                     + "WHERE table_catalog='lake' AND table_schema='public' AND table_name='empty_probe'",
                     Long.class)).isZero();
         });
+
+        // ADD COLUMN DDL 驱动:不插任何数据,湖列应即刻出现(连源库读目标态对齐)
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            s.execute("ALTER TABLE renamed_probe ADD COLUMN note text");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() ->
+                assertThat(engine.queryScalar("SELECT count(*) FROM information_schema.columns "
+                        + "WHERE table_catalog='lake' AND table_schema='public' "
+                        + "AND table_name='renamed_probe' AND column_name='note'", Long.class)).isEqualTo(1L));
     }
 
     /** 源 TRUNCATE 跟随(PG 与 MySQL 同通路:op=t 放行 + trescue 改装穿 unwrap) */
