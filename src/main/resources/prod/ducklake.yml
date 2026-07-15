@@ -41,7 +41,7 @@ ducklake:
     heartbeat-action-query: ${DUCKLAKE_HEARTBEAT_QUERY:INSERT INTO public.dbz_heartbeat (id, ts) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET ts = now()}
   maintenance:
     enabled: true
-    # 新建湖表自动 SET SORTED BY (主键)+sort_on_insert=false(压实时重排,查询剪枝受益)
+    # 新建湖表自动 SET SORTED BY (主键)(写出与压实按键排序,查询剪枝受益)
     sorted-by-pk: ${DUCKLAKE_SORTED_BY_PK:true}
     # 湖 schema 前缀:空(默认)=纯镜像(源 public.demo → 湖 lake.public.demo);
     # 多源库实例共享同一湖 catalog 时各配不同前缀隔离(如 "erp_" → lake.erp_public.demo)

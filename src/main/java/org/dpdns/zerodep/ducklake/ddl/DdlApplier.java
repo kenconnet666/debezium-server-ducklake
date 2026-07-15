@@ -724,9 +724,12 @@ public class DdlApplier {
     private volatile Boolean lakeIsDucklake;
 
     /**
-     * 湖表排序聚簇（maintenance.sorted-by-pk）：SET SORTED BY (主键) + sort_on_insert=false——
-     * 写入热路径不排序，分层压实时自动按键重排（DuckLake Sorted Compaction），
-     * min/max 统计变紧、主键/范围过滤的文件剪枝显著受益（DuckLake 无索引，这是查询加速正道）。
+     * 湖表排序聚簇（maintenance.sorted-by-pk）：SET SORTED BY (主键)——写出与压实时自动按键排序
+     * （sort_on_insert 保持 DuckLake 默认 true：CDC 小批的写出排序毫秒级，换来每个文件即刻有序、
+     * min/max 统计即刻收紧；压实时全局重排进一步收敛），主键/范围过滤的文件剪枝显著受益
+     * （DuckLake 无索引，这是查询加速正道）。
+     * ⚠️ 刻意不调 set_option('sort_on_insert',...)：该 CALL 不允许在事务内执行（1.0 实测），
+     * 而本方法运行于湖事务中——失败会 abort 整个事务且 try-catch 救不回。
      * 供消费者数据驱动建表、类型重写换表与本类 DDL 建表三路共用。
      */
     public void applySortedByPk(Connection conn, String lakeTable, List<String> keyColumns) throws SQLException {
@@ -747,15 +750,11 @@ public class DdlApplier {
             return;
         }
         String keys = String.join(", ", keyColumns.stream().map(k -> '"' + k + '"').toList());
-        String[] parts = lakeTable.split("\\.", 2);
         try (Statement s = conn.createStatement()) {
             s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
                     + " SET SORTED BY (" + keys + ")");
-            s.execute("CALL " + DuckLakeEngine.LAKE + ".set_option('sort_on_insert', 'false', "
-                    + "table_name => '" + parts[1].replace("'", "''") + "', "
-                    + "schema => '" + parts[0].replace("'", "''") + "')");
         }
-        log.info("湖表排序聚簇已挂(压实时按主键重排): {} SORTED BY ({})", lakeTable, keys);
+        log.info("湖表排序聚簇已挂(写出与压实按主键排序): {} SORTED BY ({})", lakeTable, keys);
     }
 
     /** COMMENT ON 执行（值须已是合法字面量）。失败仅告警——注释是元数据锦上添花，

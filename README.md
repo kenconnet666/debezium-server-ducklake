@@ -182,9 +182,9 @@ SELECT count(*) FROM lake.public.demo;
 
 DuckLake **不支持二级索引/CREATE INDEX**，官方列为 "unlikely to be supported"（OLAP 湖格式的定位——大数据量下索引维护成本不可接受；强制主键/唯一约束同理不支持）。查询加速的正道是**数据布局 + 统计剪枝**三板斧，按需对热点表启用（DuckDB 客户端连湖执行，一次生效）：
 
-**本服务默认已对有主键的新建湖表自动挂 `SORTED BY (主键)` + `sort_on_insert=false`**
-（`maintenance.sorted-by-pk`，默认 true）——写入零成本，压实即重排；存量表或想换排序键
-（如按时间列）时手动执行：
+**本服务默认已对有主键的新建湖表自动挂 `SORTED BY (主键)`**（`maintenance.sorted-by-pk`，
+默认 true）——CDC 小批的写出排序毫秒级，每个文件即刻有序、min/max 即刻收紧，压实时再全局
+重排。存量表或想换排序键（如按时间列）时手动执行：
 
 ```sql
 -- ① 排序聚簇(最推荐):写入不排序(不拖累 CDC 热路径),定期压实时自动按此键重排——
@@ -219,7 +219,7 @@ SET enable_object_cache = true;
 | `source.table-exclude-list` | 空 | 排除表（正则，`schema.table` / `db.table` 形式） |
 | `source.signal-table` | 空 | 增量快照 signal 表（类型重建兜底经它触发）。空=按类型推导：PG `public.dbz_signal` / MySQL `<dbname>.dbz_signal` |
 | `maintenance.follow-truncate` | `true` | 源 `TRUNCATE TABLE` 跟随清空湖表（两源通用，见变更跟随矩阵） |
-| `maintenance.sorted-by-pk` | `true` | 新建湖表自动 `SET SORTED BY (主键)`+`sort_on_insert=false`（压实时重排，剪枝受益；见查询优化节） |
+| `maintenance.sorted-by-pk` | `true` | 新建湖表自动 `SET SORTED BY (主键)`（写出与压实按键排序，剪枝受益；见查询优化节） |
 | `lake.catalog-*` | — | DuckLake catalog 的 PG 连接（同时承载 Debezium offset 表） |
 | `lake.data-path` | `s3://lake/ducklake/` | 数据文件根路径（S3 或本地目录） |
 | `lake.memory-limit` | `1536MB` | 内嵌 DuckDB 内存上限。⚠️ 须给足"常驻+批工作集"，过小会 OOM crash loop |
@@ -381,6 +381,7 @@ PostgreSQL CDC → 分析存储的常见选型对照。⚠️ 本方案列为上
 | 数据存储 | S3 Parquet（开放格式，catalog 在 PG） | S3/HDFS Parquet/ORC（开放格式） | 本地盘为主（存算一体；3.x 起有存算分离形态） | 本地盘 MPP 分布式 |
 | CDC 端到端延迟 | **亚秒~秒级**（实测 p50 0.6s @2k 行/秒） | 分钟级为主（Flink checkpoint 驱动；激进配置 ~30s，但小文件压力大） | 秒级（典型 1~10s，攒批导入） | 批 ETL 分钟~小时；流式（gpss）秒~分钟 |
 | 当前态语义 | 镜像 upsert，查询即当前态 | delete file + 后台 compaction，查询引擎 merge-on-read | Unique Key 模型 merge-on-write | 原生 UPDATE/DELETE |
+| 二级索引 | ✗（湖格式共性：开放不可变 Parquet 无人维护索引；靠排序聚簇+统计剪枝，见查询优化节） | ✗（同为开放湖格式，仅统计/布局） | ✓ 全家桶（前缀/ZoneMap 内置，BloomFilter/NGram/倒排手动建——自管 Segment 存储，索引随 compaction 维护） | ✓ PG 索引全家桶（btree/GIN/GiST/BRIN/bitmap——每 segment 是完整 PG 实例；但官方建议分析负载少建索引） |
 | 时间旅行 | ✓ snapshot（默认保留 30 天） | ✓ snapshot | ✗（靠备份恢复） | ✗ |
 | 查询引擎 | DuckDB（任意客户端只读 ATTACH 直查，不经本服务） | Trino/Spark/Flink/DuckDB…**生态最广** | 自带（MySQL 协议，高并发点查/聚合强） | 自带（PostgreSQL 协议） |
 | 吞吐扩展 | 单实例 ~22k 行/秒；按表分片多实例横向扩 | Flink 并行度横向扩，上限最高 | 导入随 BE 横向扩 | 随 MPP 节点横向扩 |
