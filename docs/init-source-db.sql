@@ -25,7 +25,7 @@ DO $$ BEGIN
 END $$;
 
 -- ③ DuckLake catalog（湖元数据 + Debezium offset 存储）——**推荐独立 PG 实例承载**
---    （docker/docker-compose.yml 即此形态：catalog-pg 容器由 POSTGRES_USER=lake_admin /
+--    （.docker/postgres/docker-compose.yml 即此形态：catalog-pg 容器由 POSTGRES_USER=lake_admin /
 --     POSTGRES_DB=ducklake_catalog 环境变量直接建好，无需任何脚本）。
 --    仅当与源库共用同一实例时才取消下面两行注释：
 -- CREATE ROLE lake_admin LOGIN PASSWORD 'changeme';

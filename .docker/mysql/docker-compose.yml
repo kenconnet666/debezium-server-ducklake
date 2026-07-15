@@ -1,14 +1,14 @@
 # MySQL 源一键体验栈：MySQL 8.4(源库) + 元空间 PG + rustfs(S3) + debezium-server-ducklake
 # 使用:
 #   1. mvn package -DskipTests
-#   2. docker compose -f docker/docker-compose.mysql.yml up -d --build
-#   3. 写数据看落湖: docker compose -f docker/docker-compose.mysql.yml exec mysql \
+#   2. docker compose -f .docker/mysql/docker-compose.yml up -d --build
+#   3. 写数据看落湖: docker compose -f .docker/mysql/docker-compose.yml exec mysql \
 #        mysql -uroot -pchangeme shop -e "CREATE TABLE demo(id bigint AUTO_INCREMENT PRIMARY KEY, name varchar(64)); INSERT INTO demo(name) VALUES ('hello'),('mysql');"
 #      curl http://127.0.0.1:19993/api/ducklake/watermark
 # CDC 基建(CDC 账号/signal/心跳表)由 initdb 自动完成——比 PG 栈更少:无 publication、
 # 无 DDL 审计 event trigger(binlog 自带 DDL)。8.0+ 默认 ROW/FULL,conf.d 仅补 GTID。
-# 与 PG 栈(docker-compose.yml)完全独立:project 名/端口/数据目录全部错开,可并存同机;
-# 湖 catalog 与 S3 数据独立(docker/mysql/ 一个目录收纳,备份/清理一处搞定)。
+# 与 PG 源栈(.docker/postgres/)完全独立:project 名/端口/数据目录全部错开,可并存同机;
+# 每服务一个子目录,持久化数据落 <服务>/data/(备份/清理一处搞定)。
 # 镜像约定不破例:MySQL 同为自建 Debian 镜像(bookworm-slim + MySQL 官方 APT 仓库清华镜像,
 # 见 mysql/Dockerfile)——官方 mysql 镜像是 Oracle Linux base 且 8.4 无 debian 变体。
 
@@ -44,10 +44,10 @@ services:
       retries: 20
       start_period: 30s
 
-  # ── DuckLake 元空间 PG(湖 catalog + Debezium offset + MySQL schema history 三合一)──
+  # ── DuckLake 元空间 PG(湖 catalog + Debezium offset + MySQL schema history 三合一):
+  #    官方镜像即可——元空间只存元数据,无需 PG 源栈那套 pigsty 观测扩展 ──
   catalog-pg:
-    build: ./postgres
-    image: ducklake-pg18
+    image: postgres:18-bookworm
     restart: unless-stopped
     logging: *default-logging
     shm_size: 256mb
@@ -58,7 +58,8 @@ services:
     ports:
       - "15435:5432"
     volumes:
-      - ./mysql/catalog-data:/var/lib/postgresql
+      # postgres:18 起挂载点必须是 /var/lib/postgresql(数据在 18/docker 子目录)
+      - ./catalog-pg/data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lake_admin -d ducklake_catalog"]
       interval: 5s
@@ -77,7 +78,7 @@ services:
       - "19010:9000"   # S3 API
       - "19011:9001"   # 管理控制台
     volumes:
-      - ./mysql/rustfs-data:/data
+      - ./rustfs/data:/data
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9000/health || exit 1"]
       interval: 5s
@@ -95,8 +96,9 @@ services:
 
   ducklake:
     build:
-      context: ..
-      dockerfile: docker/ducklake/Dockerfile
+      # context 是仓库根:Dockerfile 要 COPY target/*.jar
+      context: ../..
+      dockerfile: .docker/mysql/ducklake/Dockerfile
     restart: unless-stopped
     logging: *default-logging
     depends_on:
@@ -139,4 +141,5 @@ services:
         limits:
           memory: 3072M
     volumes:
-      - ./mysql/duckdb-ext:/root/.duckdb
+      # DuckDB 扩展缓存(首启 INSTALL ducklake/postgres/httpfs 需外网,持久化后重启秒加载)
+      - ./ducklake/data/duckdb-ext:/root/.duckdb

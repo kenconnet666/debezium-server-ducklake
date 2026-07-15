@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 压力测试:在部署机 docker/ 目录内执行 bash bench.sh,产出吞吐/延迟基线(供 README 性能节)
+# 压力测试:在本栈目录(.docker/postgres/)内执行 bash bench.sh,产出吞吐/延迟基线(供 README 性能节)
 #   阶段1 追赶吞吐:停消费→灌 100 万行→启动→两点法计消费速率(灌入器速度不影响结果)
 #   阶段2 稳态延迟:~2k 行/s 持续 60s,采样服务端分段延迟(deliver/stage/lakeTx/batchLag)p50/p95
 #   阶段3 空闲单行:排空后单行 INSERT×5,batchLagMs 即"事件产生→落湖提交"端到端

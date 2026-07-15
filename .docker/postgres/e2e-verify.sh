@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 栈端到端冒烟验证:在部署机 docker/ 目录内执行 bash e2e-verify.sh
+# 栈端到端冒烟验证:在本栈目录(.docker/postgres/)内执行 bash e2e-verify.sh
 # 断言链:全容器健康 → 建表插数落湖 → UPDATE/DELETE 流转 → DDL 加列跟随 → 心跳闭环
 # 自建唯一名测试表(t_e2e_<时分秒>),不碰业务对象;可重复执行(每轮全新表;尾部 DROP
 # 源表后湖表随 DROP 跟随一并消失)。

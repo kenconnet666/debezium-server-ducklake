@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MySQL 栈端到端冒烟验证:在部署机 docker/ 目录内执行 bash e2e-verify-mysql.sh
+# MySQL 栈端到端冒烟验证:在本栈目录(.docker/mysql/)内执行 bash e2e-verify.sh
 # 断言链:全容器健康 → 建表插数落湖 → UPDATE/DELETE 镜像 → DDL 加列/RENAME 跟随 →
 #         TRUNCATE 跟随(MySQL 增强,PG 栈不支持) → DROP TABLE 跟随 → 心跳 → 日志零 ERROR
 # 自建唯一名测试表(t_e2e_<时分秒>),不碰业务对象;可重复执行。
@@ -7,7 +7,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-DC="docker compose -f docker-compose.mysql.yml"
+DC="docker compose"
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✓ $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ✗ $1"; }

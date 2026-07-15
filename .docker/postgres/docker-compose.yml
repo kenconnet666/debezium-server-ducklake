@@ -1,13 +1,16 @@
-# 一键体验栈：源库 PG(Debian+Pigsty 可装插件) + 独立元空间 PG + rustfs(S3) + debezium-server-ducklake
+# PG 源一键体验栈：源库 PG(Debian+Pigsty 可装插件) + 独立元空间 PG + rustfs(S3) + debezium-server-ducklake
 # 使用:
 #   1. mvn package -DskipTests
-#   2. docker compose -f docker/docker-compose.yml up -d --build
+#   2. docker compose -f .docker/postgres/docker-compose.yml up -d --build
 #   3. 建表写数据,查 watermark: curl http://127.0.0.1:19992/api/ducklake/watermark
 # CDC 基建(角色/publication/DDL 审计/signal/心跳表)由 initdb 自动完成,up 即可用。
+# 与 MySQL 源栈(.docker/mysql/)互相独立:project/端口/数据目录全错开,可并存同机。
 # 布局约定:每个服务一个子目录——Dockerfile 放 <服务>/,持久化数据落 <服务>/data/
 # (bind mount,不用 named volume;数据与栈定义同处一树,备份/清理一个目录搞定)。
 # 密码/密钥可用同目录 .env 覆盖(模板见 .env.example);不建 .env 也能 up(默认 changeme,
 # 仅限本机体验——对外部署必须改)。
+
+name: ducklake-pg
 
 # 日志轮转:长驻容器 json-file 无上限会吃满磁盘
 x-logging: &default-logging
@@ -105,8 +108,8 @@ services:
   ducklake:
     build:
       # context 是仓库根:Dockerfile 要 COPY target/*.jar
-      context: ..
-      dockerfile: docker/ducklake/Dockerfile
+      context: ../..
+      dockerfile: .docker/postgres/ducklake/Dockerfile
     # 单写者自愈模型:致命错误进程自杀,交给容器重启从上个 offset 重放(零丢失)
     restart: unless-stopped
     logging: *default-logging

@@ -37,34 +37,42 @@ PostgreSQL / MySQL → [DuckLake](https://ducklake.select/) 的流式 CDC 入湖
 
 ### 1. 一键体验（Docker Compose）
 
+两套源栈独立自包含（`.docker/postgres/` 与 `.docker/mysql/`，project/端口/数据目录全错开，可并存同机），按源库类型选一套：
+
 ```bash
 mvn package -DskipTests
-docker compose -f docker/docker-compose.yml up -d --build
+docker compose -f .docker/postgres/docker-compose.yml up -d --build   # PG 源栈
 ```
 
-栈内容：源库 PG（Debian bookworm + [Pigsty pig](https://pigsty.io/docs/pig/) 扩展仓库，
+PG 栈内容：源库 PG（Debian bookworm + [Pigsty pig](https://pigsty.io/docs/pig/) 扩展仓库，
 加插件一行 `pig ext install <name> -v 18 -y`）+ **独立元空间 PG**（catalog-pg，湖元数据
 高频小事务与源库隔离）+ rustfs(S3) + 本服务。CDC 全套基建（角色/publication/DDL 审计/
 signal/心跳表）由 initdb 自动完成——**up 即可用，无需手动初始化**。
 
 镜像统一约定：**全部 Debian 基础镜像**（本服务跑 JetBrains Runtime 25，rustfs 用官方
-gnu 二进制自建，均非 alpine），构建期换阿里云 APT 源，内置排障工具
-（`procps`/`iproute2`/`less`/`jq`）。目录布局——`docker-compose.yml` 统一编排，
-每服务一个子目录放各自 `Dockerfile`，持久化数据落各自 `<服务>/data/`（bind mount，
-备份/清理一个目录搞定）：
+gnu 二进制自建，MySQL 用 bookworm-slim + 官方 APT 仓库自建，均非 alpine/Oracle Linux），
+构建期换国内源，内置排障工具（`procps`/`iproute2`/`less`/`jq`）。目录布局——每套栈
+一个 `docker-compose.yml`，每服务一个子目录放各自 `Dockerfile`，持久化数据落各自
+`<服务>/data/`（bind mount，备份/清理一个目录搞定）：
 
 ```
-docker/
-├── docker-compose.yml        # PG 源栈统一编排
-├── docker-compose.mysql.yml  # MySQL 源栈(独立 project/端口/数据目录,可与 PG 栈并存同机)
-├── e2e-verify.sh             # PG 栈端到端冒烟(建表→落湖→DDL 跟随→心跳,PASS/FAIL 汇总)
-├── e2e-verify-mysql.sh       # MySQL 栈冒烟(另含 RENAME COLUMN/TRUNCATE 跟随断言)
-├── ducklake/                 # 本服务:Debian 13 + JBR 25(Dockerfile + data/duckdb-ext 扩展缓存)
-├── postgres/                 # PG 源库:postgres:18-bookworm + pig(Dockerfile + initdb/ + data/)
-├── mysql/                    # MySQL 源库:自建 Debian 镜像(bookworm-slim + MySQL 8.4 APT 清华源,
-│                             #   Dockerfile + entrypoint.sh + conf.d/ + initdb/ + data/)
-├── catalog-pg/               # 元空间:复用 postgres 镜像(仅 data/)
-└── rustfs/                   # S3:Debian 13 + rustfs gnu 二进制 + mc(Dockerfile + data/)
+.docker/
+├── postgres/                 # PG 源完整栈(project: ducklake-pg)
+│   ├── docker-compose.yml
+│   ├── e2e-verify.sh         # 端到端冒烟(建表→落湖→DDL 跟随→心跳,PASS/FAIL 汇总)
+│   ├── bench.sh 等           # 性能基线四阶段 + 参数矩阵(README 性能节口径)
+│   ├── postgres/             # 源库:postgres:18-bookworm + pig(Dockerfile + initdb/ + data/)
+│   ├── catalog-pg/           # 元空间:复用源库镜像(仅 data/)
+│   ├── rustfs/               # S3:Debian 13 + rustfs gnu 二进制 + mc(Dockerfile + data/)
+│   └── ducklake/             # 本服务:Debian 13 + JBR 25(Dockerfile + data/duckdb-ext)
+└── mysql/                    # MySQL 源完整栈(project: ducklake-mysql)
+    ├── docker-compose.yml
+    ├── e2e-verify.sh         # 冒烟(另含 RENAME COLUMN/TRUNCATE 跟随断言)
+    ├── mysql/                # 源库:自建 Debian 镜像(bookworm-slim + MySQL 8.4 APT 清华源,
+    │                         #   Dockerfile + entrypoint.sh + conf.d/ + initdb/ + data/)
+    ├── catalog-pg/           # 元空间:官方 postgres:18-bookworm(仅 data/)
+    ├── rustfs/               # 同 PG 栈(独立实例与数据)
+    └── ducklake/             # 同 PG 栈
 ```
 
 写点数据看它流进湖：
@@ -78,16 +86,16 @@ INSERT INTO demo (name) VALUES ('hello'), ('ducklake');
 curl http://127.0.0.1:19992/api/ducklake/watermark
 ```
 
-**MySQL 源版一键栈**（MySQL 8.4 + 元空间 PG + rustfs + 本服务，与 PG 栈互不干扰）：
+**MySQL 源栈**（MySQL 8.4 + 元空间 PG + rustfs + 本服务）：
 
 ```bash
 mvn package -DskipTests
-docker compose -f docker/docker-compose.mysql.yml up -d --build
+docker compose -f .docker/mysql/docker-compose.yml up -d --build
 # 写数据(业务库 shop 由 initdb 建好;CDC 账号/signal/心跳表同样自动就绪):
-docker compose -f docker/docker-compose.mysql.yml exec mysql \
+docker compose -f .docker/mysql/docker-compose.yml exec mysql \
   mysql -uroot -pchangeme shop -e "CREATE TABLE demo(id bigint AUTO_INCREMENT PRIMARY KEY, name varchar(64)); INSERT INTO demo(name) VALUES ('hello'),('mysql');"
-curl http://127.0.0.1:19993/api/ducklake/watermark   # 湖表 lake.shop.demo
-bash docker/e2e-verify-mysql.sh                       # 端到端冒烟
+curl http://127.0.0.1:19993/api/ducklake/watermark    # 湖表 lake.shop.demo
+(cd .docker/mysql && bash e2e-verify.sh)              # 端到端冒烟
 ```
 
 ### 2. 本机开发运行（接入已有源库）
@@ -194,7 +202,7 @@ DuckDB 的 Parquet writer 按 row group 容量**预分配**列缓冲（与实际
 
 - 用 `prod` profile（全环境变量注入，变量清单见 `src/main/resources/prod/ducklake.yml` 与 compose 示例）
 - **单实例部署**：本服务是湖的唯一写入者（单写者设计规避 DuckLake 并发提交缺陷）；容器 `restart: always`——任何致命错误进程自杀交给容器重启，从上个 offset 重放，零丢失
-- JVM 参数照 `docker/ducklake/Dockerfile`：ZGC + 紧凑对象头 + `--enable-native-access=ALL-UNNAMED`（DuckDB JNI）
+- JVM 参数照 `.docker/postgres/ducklake/Dockerfile`：ZGC + 紧凑对象头 + `--enable-native-access=ALL-UNNAMED`（DuckDB JNI）
 - DuckDB 扩展缓存目录 `/root/.duckdb` 挂持久卷（否则每次重启重新下载扩展）
 
 ## 运维
@@ -232,7 +240,7 @@ DuckDB 的 Parquet writer 按 row group 容量**预分配**列缓冲（与实际
 
 ## 性能参考
 
-8C16G 单机 Docker Compose 全家桶实测（源 PG、元空间 PG、rustfs、本服务**同机**——即本仓一键体验栈原样；`docker/bench.sh` 四阶段与 `docker/bench-matrix.sh` 参数矩阵可在你的环境一键复现）：
+8C16G 单机 Docker Compose 全家桶实测（源 PG、元空间 PG、rustfs、本服务**同机**——即本仓一键体验栈原样；`.docker/postgres/bench.sh` 四阶段与 `bench-matrix.sh` 参数矩阵可在你的环境一键复现）：
 
 ### 测试环境硬件基准
 
