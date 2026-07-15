@@ -495,13 +495,14 @@ public class DdlApplier {
                     }
                 }
             }
-            // 主键列(排序聚簇用;查询失败不致命,无主键同形态)
+            // 主键列(排序聚簇/bootstrap anti-join 用)。⚠️ 必须走 pg_catalog:
+            // information_schema 的约束视图对"仅有 SELECT 权限的非 owner"不可见
+            // (CDC 账号正是这个形态,服务器实测约束行直接消失,曾致主键静默判空)
             try (PreparedStatement ps = c.prepareStatement(
-                    "SELECT kcu.column_name FROM information_schema.table_constraints tc "
-                            + "JOIN information_schema.key_column_usage kcu "
-                            + "  ON kcu.constraint_name = tc.constraint_name AND kcu.table_schema = tc.table_schema "
-                            + "WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema=? AND tc.table_name=? "
-                            + "ORDER BY kcu.ordinal_position")) {
+                    "SELECT a.attname FROM pg_index i "
+                            + "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+                            + "WHERE i.indrelid = format('%I.%I', ?::text, ?::text)::regclass AND i.indisprimary "
+                            + "ORDER BY array_position(i.indkey, a.attnum)")) {
                 ps.setString(1, parts[0]);
                 ps.setString(2, parts[1]);
                 try (var rs = ps.executeQuery()) {
@@ -515,6 +516,108 @@ public class DdlApplier {
             return null;
         }
         return new TableDef(cols, Map.of(), pk);
+    }
+
+    /**
+     * [bootstrap] 首次接入的单表落地：连源库读目标态 → 建湖表（不存在时，含注释/排序聚簇）
+     * → scanner 直拉存量（按主键 anti-join：no_data 模式下流式已并行开跑，先落的增量行
+     * 更新、不被快照读覆盖）。返回灌入行数；<b>-1 = 表已建但无主键/scanner 够不到</b>
+     * （调用方转 signal blocking 快照拉数据）。
+     */
+    public int bootstrapTable(Connection conn, String lakeTable, String srcIdentity) throws SQLException {
+        TableDef def = switch (props.getSource().getType()) {
+            case POSTGRES -> readPgTableDef(srcIdentity);
+            case MYSQL -> readMysqlTableDef(srcIdentity);
+        };
+        if (def == null || def.cols().isEmpty()) {
+            throw new SQLException("源表定义不可读: " + srcIdentity);
+        }
+        String tableComment = props.getSource().getType() == DucklakeProperties.SourceType.MYSQL
+                ? readMysqlTableComment(srcIdentity) : null;
+        createTableInLake(conn, lakeTable, def.cols(), tableComment, def.colComments(), def.pk(), t -> { });
+        String srcRef = srcRefOf(lakeTable);
+        if (def.pk().isEmpty() || srcRef == null) {
+            return -1;
+        }
+        return refillFromScanner(conn, lakeTable, def.cols(), srcRef, def.pk());
+    }
+
+    /** [MySQL] 连源库读 information_schema 的表定义（bootstrap 用；与 readPgTableDef 对照，
+     *  typeName 拼装对齐 Debezium 口径："<DATA_TYPE> UNSIGNED"，TINYINT 显示宽度取 column_type） */
+    private TableDef readMysqlTableDef(String identity) {
+        String[] parts = identity.split("\\.");
+        DucklakeProperties.Source src = props.getSource();
+        Map<String, String> cols = new LinkedHashMap<>();
+        Map<String, String> comments = new LinkedHashMap<>();
+        List<String> pk = new ArrayList<>();
+        try (Connection c = java.sql.DriverManager.getConnection(src.jdbcUrl(), src.getUser(), src.getPassword())) {
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT column_name, data_type, column_type, numeric_precision, numeric_scale, column_comment "
+                            + "FROM information_schema.columns WHERE table_schema=? AND table_name=? "
+                            + "ORDER BY ordinal_position")) {
+                ps.setString(1, parts[0]);
+                ps.setString(2, parts[1]);
+                try (var rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String name = rs.getString(1);
+                        String columnType = rs.getString(3) == null ? "" : rs.getString(3);
+                        String typeName = rs.getString(2).toUpperCase()
+                                + (columnType.toLowerCase().contains("unsigned") ? " UNSIGNED" : "");
+                        // 显示宽度/精度:TINYINT(1)→BOOLEAN 判定要 column_type 的括号数,DECIMAL 走 precision
+                        Long length = firstParenNumber(columnType);
+                        if (length == null && rs.getObject(4) != null) {
+                            length = ((Number) rs.getObject(4)).longValue();
+                        }
+                        Long scale = rs.getObject(5) == null ? null : ((Number) rs.getObject(5)).longValue();
+                        cols.put(name, mysqlTypeToDuck(typeName, length, scale));
+                        String comment = rs.getString(6);
+                        if (comment != null && !comment.isBlank()) {
+                            comments.put(name, comment);
+                        }
+                    }
+                }
+            }
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT column_name FROM information_schema.key_column_usage "
+                            + "WHERE constraint_name='PRIMARY' AND table_schema=? AND table_name=? "
+                            + "ORDER BY ordinal_position")) {
+                ps.setString(1, parts[0]);
+                ps.setString(2, parts[1]);
+                try (var rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        pk.add(rs.getString(1));
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            log.warn("读源表定义失败(bootstrap 该表转 signal 兜底): {} ({})", identity, e.getMessage());
+            return null;
+        }
+        return new TableDef(cols, comments, pk);
+    }
+
+    /** [MySQL] 表注释（bootstrap 建表带走；无注释/失败返回 null） */
+    private String readMysqlTableComment(String identity) {
+        String[] parts = identity.split("\\.");
+        DucklakeProperties.Source src = props.getSource();
+        try (Connection c = java.sql.DriverManager.getConnection(src.jdbcUrl(), src.getUser(), src.getPassword());
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT table_comment FROM information_schema.tables WHERE table_schema=? AND table_name=?")) {
+            ps.setString(1, parts[0]);
+            ps.setString(2, parts[1]);
+            try (var rs = ps.executeQuery()) {
+                String comment = rs.next() ? rs.getString(1) : null;
+                return comment == null || comment.isBlank() ? null : comment;
+            }
+        } catch (SQLException e) {
+            return null;
+        }
+    }
+
+    /** column_type 里第一个括号数字（"tinyint(1)"→1、"decimal(12,2)"→12）；无括号返回 null */
+    private static Long firstParenNumber(String columnType) {
+        Matcher m = Pattern.compile("\\((\\d+)").matcher(columnType);
+        return m.find() ? Long.parseLong(m.group(1)) : null;
     }
 
     /** [MySQL] 从 tableChanges 的 table 结构组装表定义 */

@@ -198,6 +198,12 @@ public class DucklakeProperties {
          *  快照重灌快 36×/11×，且不停流）。源不可达/扩展装不上时自动降级 signal 快照老路
          *  （blocking/incremental）。false=一律走 signal 快照 */
         private boolean scannerRefill = true;
+        /** 首次接入的存量数据也走 scanner 直拉（默认 true，需 scannerRefill 同时开启）：
+         *  首启(offset 为空)把快照降为 no_data（秒级拿位点，流式即刻开始），存量由
+         *  ScannerBootstrap 异步逐表建表+直灌（anti-join 与并行增量收敛）；无主键/跨库表
+         *  自动转 signal blocking 快照兜底；进度存 catalog 的 ducklake_bootstrap 表，
+         *  崩溃重启续跑。false=首次接入走 Debezium initial 快照老路 */
+        private boolean scannerBootstrap = true;
         /** 湖 schema 前缀：湖 schema = 前缀 + 源 PG schema（表名原样），默认空 = 纯镜像
          *  （源 public.demo → 湖 lake.public.demo，查询语感与主库一致）。
          *  配置前缀（如 "my_"）→ 湖 lake.my_public.demo——多个源库实例共享同一湖 catalog 时

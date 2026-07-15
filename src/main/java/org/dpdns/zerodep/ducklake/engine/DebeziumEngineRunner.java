@@ -49,6 +49,7 @@ public class DebeziumEngineRunner implements SmartLifecycle {
     private final DucklakeProperties props;
     private final DuckLakeChangeConsumer consumer;
     private final SyncState syncState;
+    private final ScannerBootstrap bootstrap;
 
     private DebeziumEngine<ChangeEvent<SourceRecord, SourceRecord>> engine;
     private ExecutorService executor;
@@ -56,6 +57,8 @@ public class DebeziumEngineRunner implements SmartLifecycle {
 
     @Override
     public void start() {
+        // 首次接入的存量 scanner 化评估(须在 buildProps 前:决定 snapshot.mode 是否改 no_data)
+        bootstrap.evaluate();
         engine = DebeziumEngine.create(Connect.class)
                 .using(buildProps())
                 .notifying(consumer)
@@ -76,6 +79,7 @@ public class DebeziumEngineRunner implements SmartLifecycle {
         executor.execute(engine);
         running = true;
         syncState.getEngineRunning().set(1);
+        bootstrap.runAsync(); // 接管时异步直拉存量(流式已在跑,一表一锁段交错)
         DucklakeProperties.Source src = props.getSource();
         switch (src.getType()) {
             case POSTGRES -> log.info("Debezium 引擎已启动: postgres slot={} publication={} -> DuckLake",
@@ -198,7 +202,9 @@ public class DebeziumEngineRunner implements SmartLifecycle {
         if (props.getMaintenance().isFollowTruncate()) {
             p.setProperty("skipped.operations", "none");
         }
-        p.setProperty("snapshot.mode", eng.getSnapshotMode());
+        // bootstrap 接管首次存量时降为 no_data:秒级拿一致位点+结构,流式即刻开始,
+        // 存量由 scanner 直拉(见 ScannerBootstrap;非首次/通道未就绪时维持用户配置)
+        p.setProperty("snapshot.mode", bootstrap.shouldTakeOver() ? "no_data" : eng.getSnapshotMode());
 
         // --- 增量快照 signal(source channel):类型严格跟随的"重建+重拉"兜底经此触发,
         //     连接器也在该表写快照水位标记;signal 行内部消费不进变更流 ---
