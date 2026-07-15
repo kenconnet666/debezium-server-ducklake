@@ -30,6 +30,11 @@ final class TypeMapper {
     private TypeMapper() {
     }
 
+    /** JSON→VARIANT 开关（maintenance.json-as-variant，启动时由 DuckLakeEngine 注入）：
+     *  VARIANT 的子字段 shredding 统计参与文件剪枝、查询免运行时解析；代价是 PG catalog 下
+     *  VARIANT 表暂不 inline（DuckLake 1.0 限制，小文件由压实吸收，v1.1 拟解除） */
+    static volatile boolean jsonAsVariant = true;
+
     /** Debezium isostring 时间逻辑类型名 */
     private static final String ISO_DATE = "io.debezium.time.IsoDate";
     private static final String ISO_TIME = "io.debezium.time.IsoTime";
@@ -84,7 +89,7 @@ final class TypeMapper {
                     return "TIMESTAMPTZ";
                 }
                 case PG_JSON -> {
-                    return "JSON";
+                    return jsonAsVariant ? "VARIANT" : "JSON";
                 }
                 case PG_UUID -> {
                     return "UUID";
@@ -126,6 +131,7 @@ final class TypeMapper {
                 yield switch (elem) {
                     case "BLOB", "VARCHAR" -> schema.valueSchema().type() == Schema.Type.STRING
                             ? "VARCHAR[]" : "VARCHAR";
+                    case "VARIANT" -> "JSON[]"; // json[] 数组元素保持 JSON(VARIANT[] 组合未验证)
                     default -> elem.endsWith("[]") ? "VARCHAR" : elem + "[]";
                 };
             }
@@ -324,7 +330,8 @@ final class TypeMapper {
             return "TRY_CAST(" + quoted + " AS " + duckType + ")";
         }
         return switch (duckType) {
-            case "DATE", "TIME", "TIMETZ", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL" ->
+            // VARIANT 与时间族同属"文本解析型 cast":个别异常值置 NULL 保数据链不断
+            case "DATE", "TIME", "TIMETZ", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "VARIANT" ->
                     "TRY_CAST(" + quoted + " AS " + duckType + ")";
             default -> "CAST(" + quoted + " AS " + duckType + ")";
         };

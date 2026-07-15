@@ -62,9 +62,35 @@ class TypeMapperTest {
         assertThat(TypeMapper.duckType(logical("io.debezium.time.ZonedTimestamp"))).isEqualTo("TIMESTAMPTZ");
         // PG timetz 保全时区偏移(旧映射 TIME 丢偏移)
         assertThat(TypeMapper.duckType(logical("io.debezium.time.ZonedTime"))).isEqualTo("TIMETZ");
-        assertThat(TypeMapper.duckType(logical("io.debezium.data.Json"))).isEqualTo("JSON");
         assertThat(TypeMapper.duckType(logical("io.debezium.data.Uuid"))).isEqualTo("UUID");
         assertThat(TypeMapper.normalizeDuckType("TIME WITH TIME ZONE")).isEqualTo("TIMETZ");
+    }
+
+    /** JSON→VARIANT 开关(默认开):子字段 shredding 剪枝+免运行时解析;off 回退 JSON;
+     *  真 DuckDB 验证文本 TRY_CAST 往返与子字段提取 */
+    @Test
+    void jsonMapsToVariantByDefaultWithSwitch() throws SQLException {
+        assertThat(TypeMapper.jsonAsVariant).isTrue(); // 默认开
+        assertThat(TypeMapper.duckType(logical("io.debezium.data.Json"))).isEqualTo("VARIANT");
+        assertThat(TypeMapper.castExpr("c", "VARIANT")).isEqualTo("TRY_CAST(\"c\" AS VARIANT)");
+        // json[] 数组元素保持 JSON(VARIANT[] 组合未验证,保守退回)
+        Schema jsonArr = SchemaBuilder.array(logical("io.debezium.data.Json")).optional().build();
+        assertThat(TypeMapper.duckType(jsonArr)).isEqualTo("JSON[]");
+        try {
+            TypeMapper.jsonAsVariant = false;
+            assertThat(TypeMapper.duckType(logical("io.debezium.data.Json"))).isEqualTo("JSON");
+        } finally {
+            TypeMapper.jsonAsVariant = true;
+        }
+        // 真 DuckDB:JSON 文本 → VARIANT 解析为结构(子字段可提取);非法 JSON 不失败——
+        // VARIANT 是动态类型,解析不了就装成纯字符串,原文保全不丢数据(实测行为,优于置 NULL)
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT (TRY_CAST('{\"k\": 7, \"tags\": [1,2]}' AS VARIANT)->>'k')::INT, "
+                        + "TRY_CAST('{broken' AS VARIANT)::VARCHAR")) {
+            rs.next();
+            assertThat(rs.getInt(1)).isEqualTo(7);
+            assertThat(rs.getString(2)).contains("{broken"); // 原文以字符串形态保全
+        }
     }
 
     /** PG 内建 point(非 PostGIS)只给 x/y 且 wkb 为空——从坐标构造 WKB,否则该列落湖恒 NULL */

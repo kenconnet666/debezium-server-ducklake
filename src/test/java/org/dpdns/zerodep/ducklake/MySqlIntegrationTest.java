@@ -148,7 +148,10 @@ class MySqlIntegrationTest {
         assertThat(lakeColumnType("created")).isEqualTo("TIMESTAMP");
         assertThat(lakeColumnType("updated")).isEqualTo("TIMESTAMP WITH TIME ZONE");
         assertThat(lakeColumnType("amount")).isEqualTo("DECIMAL(12,2)"); // 源 decimal(12,2) 忠实对应
-        assertThat(lakeColumnType("payload")).isEqualTo("JSON");
+        // JSON→VARIANT(默认开):子字段 shredding 统计参与剪枝,查询免运行时解析
+        assertThat(lakeColumnType("payload")).isEqualTo("VARIANT");
+        assertThat(engine.queryScalar(
+                "SELECT (payload->>'k')::INT FROM shop.cdc_test WHERE name='alpha'", Integer.class)).isEqualTo(1);
         assertThat(lakeColumnType("tier")).isEqualTo("VARCHAR"); // ENUM→VARCHAR
         // BIGINT UNSIGNED → UBIGINT 原生映射(快照路径:uint64 最大值无损)
         assertThat(lakeColumnType("big_u")).isEqualTo("UBIGINT");

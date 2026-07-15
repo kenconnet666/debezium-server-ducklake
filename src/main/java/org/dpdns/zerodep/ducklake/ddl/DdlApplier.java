@@ -505,7 +505,7 @@ public class DdlApplier {
     }
 
     /** [MySQL] 从 tableChanges 的 table 结构组装表定义 */
-    private static TableDef parseMysqlTableDef(Struct table) {
+    private TableDef parseMysqlTableDef(Struct table) {
         Map<String, String> cols = new LinkedHashMap<>();
         Map<String, String> colComments = new LinkedHashMap<>();
         for (Struct col : structList(table, "columns")) {
@@ -555,7 +555,7 @@ public class DdlApplier {
 
     /** PG information_schema 类型 → DuckDB 列型（对齐事件推导口径：isostring+precise；
      *  拿不准一律 VARCHAR，数据到达后 followTypeChange 自愈——空表阶段类型偏差零成本） */
-    private static String pgTypeToDuck(String dataType, String udtName, Integer precision, Integer scale) {
+    private String pgTypeToDuck(String dataType, String udtName, Integer precision, Integer scale) {
         return switch (dataType == null ? "" : dataType) {
             case "bigint" -> "BIGINT";
             case "integer" -> "INTEGER";
@@ -573,7 +573,7 @@ public class DdlApplier {
             case "time without time zone" -> "TIME";
             case "time with time zone" -> "TIMETZ";
             case "bytea" -> "BLOB";
-            case "json", "jsonb" -> "JSON";
+            case "json", "jsonb" -> props.getMaintenance().isJsonAsVariant() ? "VARIANT" : "JSON";
             case "uuid" -> "UUID";
             case "interval" -> "INTERVAL";
             case "ARRAY" -> switch (udtName == null ? "" : udtName) {
@@ -596,7 +596,7 @@ public class DdlApplier {
 
     /** MySQL tableChanges 的 typeName → DuckDB 列型（对齐事件推导口径：
      *  TinyIntOneToBooleanConverter + bigint.unsigned=precise + isostring） */
-    private static String mysqlTypeToDuck(String typeName, Long length, Long scale) {
+    private String mysqlTypeToDuck(String typeName, Long length, Long scale) {
         String tn = typeName == null ? "" : typeName.toUpperCase();
         boolean unsigned = tn.contains("UNSIGNED");
         String base = tn.replace(" UNSIGNED", "").replace(" ZEROFILL", "").trim();
@@ -621,7 +621,7 @@ public class DdlApplier {
             case "DATE" -> "DATE";
             case "TIME" -> "TIME";
             case "YEAR" -> "INTEGER";
-            case "JSON" -> "JSON";
+            case "JSON" -> props.getMaintenance().isJsonAsVariant() ? "VARIANT" : "JSON";
             case "BINARY", "VARBINARY", "TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB" -> "BLOB";
             case "GEOMETRY", "POINT", "LINESTRING", "POLYGON", "MULTIPOINT",
                  "MULTILINESTRING", "MULTIPOLYGON", "GEOMETRYCOLLECTION" -> "BLOB";

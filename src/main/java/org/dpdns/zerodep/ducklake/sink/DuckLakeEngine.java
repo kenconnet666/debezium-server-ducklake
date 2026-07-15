@@ -82,6 +82,8 @@ public class DuckLakeEngine {
             throw new IllegalStateException(
                     "ducklake.maintenance.schema-prefix 仅允许小写字母/数字/下划线(如 \"my_\"),当前值: \"" + prefix + '"');
         }
+        // 类型映射开关注入(TypeMapper 是无状态静态工具类,进程级配置一次生效)
+        TypeMapper.jsonAsVariant = props.getMaintenance().isJsonAsVariant();
 
         // ① 锚连接：instance 级初始化，一次生效、全 instance 共享。
         // 扩展三件套：ducklake(湖格式) + postgres(DuckLake 的 PG catalog 走它) + httpfs(S3)。

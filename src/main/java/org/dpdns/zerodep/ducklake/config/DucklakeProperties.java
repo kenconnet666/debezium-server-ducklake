@@ -179,6 +179,12 @@ public class DucklakeProperties {
          *  分层压实时自动按主键重排——min/max 统计变紧，主键/范围过滤的文件剪枝立竿见影。
          *  仅对启用后新建的湖表生效；存量表可手动 ALTER TABLE ... SET SORTED BY 补挂 */
         private boolean sortedByPk = true;
+        /** 源 JSON/jsonb 列映射 DuckLake VARIANT（默认 true）：子字段 shredding 统计参与
+         *  文件剪枝、查询免运行时 JSON 解析（payload->>'k' 直取）。代价：PG catalog 下
+         *  VARIANT 表暂不参与 Data Inlining（DuckLake 1.0 限制，v1.1 拟解除）——小批直落
+         *  Parquet 小文件，由分层压实吸收。false=沿用 JSON（物理文本）列型；
+         *  存量湖表 JSON 列由类型漂移检测自动 CAST 重写迁移 */
+        private boolean jsonAsVariant = true;
         /** DDL 信号流里跟随源库 DROP TABLE 真删湖表（默认 true=镜像语义；false=湖表保留。
          *  真删后时间旅行窗口内旧 snapshot 仍可 AT (TIMESTAMP ...) 回看该表） */
         private boolean followDropTable = true;
