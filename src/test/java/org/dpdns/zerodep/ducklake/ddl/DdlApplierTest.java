@@ -488,8 +488,8 @@ class DdlApplierTest {
                         + "AND table_schema='shop' AND table_name='empty1' ORDER BY ordinal_position")) {
             rs.next(); assertThat(rs.getString(1)).isEqualTo("BIGINT");
             rs.next(); assertThat(rs.getString(1)).isEqualTo("BOOLEAN");        // TINYINT(1) 口径
-            rs.next(); assertThat(rs.getString(1)).isEqualTo("DECIMAL(38,2)");
-            rs.next(); assertThat(rs.getString(1)).isEqualTo("DECIMAL(38,0)");  // BIGINT UNSIGNED precise 口径
+            rs.next(); assertThat(rs.getString(1)).isEqualTo("DECIMAL(12,2)");  // 源精度忠实对应
+            rs.next(); assertThat(rs.getString(1)).isEqualTo("DECIMAL(20,0)");  // BIGINT UNSIGNED precise 口径
         }
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
                 "SELECT comment FROM duckdb_tables() WHERE database_name='lake' AND schema_name='shop' AND table_name='empty1'")) {

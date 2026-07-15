@@ -145,7 +145,7 @@ class MySqlIntegrationTest {
         // (information_schema 的原始形态是 "TIMESTAMP WITH TIME ZONE",此处按裸查口径断言)
         assertThat(lakeColumnType("created")).isEqualTo("TIMESTAMP");
         assertThat(lakeColumnType("updated")).isEqualTo("TIMESTAMP WITH TIME ZONE");
-        assertThat(lakeColumnType("amount")).startsWith("DECIMAL(38,");
+        assertThat(lakeColumnType("amount")).isEqualTo("DECIMAL(12,2)"); // 源 decimal(12,2) 忠实对应
         assertThat(lakeColumnType("payload")).isEqualTo("JSON");
         assertThat(lakeColumnType("tier")).isEqualTo("VARCHAR"); // ENUM→VARCHAR
         // 值正确性抽查

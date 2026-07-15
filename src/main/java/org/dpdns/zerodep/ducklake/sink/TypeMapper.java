@@ -52,15 +52,16 @@ final class TypeMapper {
         if (logical != null) {
             switch (logical) {
                 case Decimal.LOGICAL_NAME -> {
-                    // scale 在 schema 参数里,源列精度在 Debezium 附加参数里;DuckDB DECIMAL 上限 38 位——
-                    // 源列 p>38(或 s>37)时 CAST 必溢出,落 VARCHAR 保全精度(与裸 numeric 同策略,无损优先)
+                    // 忠实对应源精度:numeric(p,s) → DECIMAL(p,s)(元数据保真;width≤18 走 int64
+                    // 存储更省更快)。DuckDB 合法域 1≤p≤38、0≤s≤p(38,38 亦合法,1.5.4 实测);
+                    // 域外(p>38 / s>p / 负 s)落 VARCHAR 保全精度(无损优先,不有损压缩)
                     int scale = Integer.parseInt(schema.parameters().getOrDefault(Decimal.SCALE_FIELD, "0"));
                     int precision = Integer.parseInt(
                             schema.parameters().getOrDefault("connect.decimal.precision", "38"));
-                    if (precision > 38 || scale > 37 || scale < 0) {
+                    if (precision < 1 || precision > 38 || scale < 0 || scale > precision) {
                         return "VARCHAR";
                     }
-                    return "DECIMAL(38," + scale + ")";
+                    return "DECIMAL(" + precision + "," + scale + ")";
                 }
                 case ISO_DATE -> {
                     return "DATE";
@@ -81,9 +82,11 @@ final class TypeMapper {
                     return "UUID";
                 }
                 case VARIABLE_DECIMAL -> {
-                    // 裸 numeric 无固定 scale，DuckDB DECIMAL 必须定长——以字符串保全精度
-                    // （业务表应尽量声明 numeric(p,s)；此兜底防丢数据不防难看）
-                    return "VARCHAR";
+                    // 裸 numeric(无精度声明,scale 逐值可变)→ DuckDB 上限形态 DECIMAL(38,18):
+                    // 整数位 20 位(int64 雪花 ID 19 位无忧)+小数 18 位,可直接聚合运算;
+                    // 超 18 位小数 CAST 四舍五入(1.5.4 实测),超 20 位整数溢出阻塞保完整性——
+                    // 值域更大的列请在源侧声明 numeric(p,s) 获得忠实对应
+                    return "DECIMAL(38,18)";
                 }
                 case GEOMETRY, GEO_POINT, GEOGRAPHY -> {
                     return "BLOB";
@@ -150,11 +153,10 @@ final class TypeMapper {
                     return;
                 }
                 case VARIABLE_DECIMAL -> {
-                    // Struct{scale, value(unscaled bytes)} → BigDecimal 明文字符串
-                    ps.setString(idx, io.debezium.data.VariableScaleDecimal
+                    // Struct{scale, value(unscaled bytes)} → BigDecimal(列型 DECIMAL(38,18))
+                    ps.setBigDecimal(idx, io.debezium.data.VariableScaleDecimal
                             .toLogical((org.apache.kafka.connect.data.Struct) value)
-                            .getDecimalValue()
-                            .map(BigDecimal::toPlainString).orElse(null));
+                            .getDecimalValue().orElse(null));
                     return;
                 }
                 case GEOMETRY, GEO_POINT, GEOGRAPHY -> {

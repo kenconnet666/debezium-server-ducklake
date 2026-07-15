@@ -515,8 +515,9 @@ public class DdlApplier {
             case "integer" -> "INTEGER";
             case "smallint" -> "SMALLINT";
             case "numeric", "decimal" -> scale == null || precision == null
-                    ? "VARCHAR"   // 裸 numeric:无固定 scale,字符串保精度(与事件口径一致)
-                    : (precision > 38 || scale > 37 || scale < 0 ? "VARCHAR" : "DECIMAL(38," + scale + ")");
+                    ? "DECIMAL(38,18)"   // 裸 numeric:DuckDB 上限形态(与事件口径一致)
+                    : (precision < 1 || precision > 38 || scale < 0 || scale > precision
+                            ? "VARCHAR" : "DECIMAL(" + precision + "," + scale + ")");
             case "real" -> "FLOAT";
             case "double precision" -> "DOUBLE";
             case "boolean" -> "BOOLEAN";
@@ -557,11 +558,12 @@ public class DdlApplier {
             case "SMALLINT" -> unsigned ? "INTEGER" : "SMALLINT";
             case "MEDIUMINT" -> "INTEGER";
             case "INT", "INTEGER" -> unsigned ? "BIGINT" : "INTEGER";
-            case "BIGINT" -> unsigned ? "DECIMAL(38,0)" : "BIGINT";
+            // BIGINT UNSIGNED 对齐事件口径(bigint.unsigned=precise → Decimal(20,0))
+            case "BIGINT" -> unsigned ? "DECIMAL(20,0)" : "BIGINT";
             case "DECIMAL", "NUMERIC" -> {
                 long p = length == null ? 10 : length;
                 long s = scale == null ? 0 : scale;
-                yield p > 38 || s > 37 || s < 0 ? "VARCHAR" : "DECIMAL(38," + s + ")";
+                yield p < 1 || p > 38 || s < 0 || s > p ? "VARCHAR" : "DECIMAL(" + p + "," + s + ")";
             }
             case "FLOAT" -> "FLOAT";
             case "DOUBLE", "REAL" -> "DOUBLE";

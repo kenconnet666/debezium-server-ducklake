@@ -45,9 +45,13 @@ class TypeMapperTest {
 
     @Test
     void decimalMapsWithScale() {
+        // 无 precision 参数(仅 scale)默认按 38 宽
         assertThat(TypeMapper.duckType(Decimal.schema(2))).isEqualTo("DECIMAL(38,2)");
-        // 超限(s>37/p>38)不再有损压缩,落 VARCHAR 保全精度(见 oversizedDecimalFallsBackToVarchar)
-        assertThat(TypeMapper.duckType(Decimal.schema(38))).isEqualTo("VARCHAR");
+        // s=p=38 合法(DuckDB 1.5.4 实测 DECIMAL(38,38) 可建)
+        assertThat(TypeMapper.duckType(Decimal.schema(38))).isEqualTo("DECIMAL(38,38)");
+        // 源列声明了精度 → 忠实对应(元数据保真;width≤18 走 int64 存储更省)
+        Schema n12_2 = Decimal.builder(2).parameter("connect.decimal.precision", "12").optional().build();
+        assertThat(TypeMapper.duckType(n12_2)).isEqualTo("DECIMAL(12,2)");
     }
 
     @Test
@@ -69,8 +73,8 @@ class TypeMapperTest {
         assertThat(TypeMapper.duckType(Schema.BOOLEAN_SCHEMA)).isEqualTo("BOOLEAN");
         assertThat(TypeMapper.duckType(Schema.BYTES_SCHEMA)).isEqualTo("BLOB");
         assertThat(TypeMapper.duckType(Schema.STRING_SCHEMA)).isEqualTo("VARCHAR");
-        // 裸 numeric(无固定 scale)→ 字符串保精度
-        assertThat(TypeMapper.duckType(VariableScaleDecimal.schema())).isEqualTo("VARCHAR");
+        // 裸 numeric(无精度声明,scale 逐值可变)→ DuckDB 上限形态:20 位整数+18 位小数,可直接聚合
+        assertThat(TypeMapper.duckType(VariableScaleDecimal.schema())).isEqualTo("DECIMAL(38,18)");
     }
 
     // ---------- bind → DuckDB 回读闭环 ----------
@@ -78,7 +82,7 @@ class TypeMapperTest {
     @Test
     void bindRoundTripThroughRealDuckDb() throws SQLException {
         try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE t_bind (d DECIMAL(38,2), dt DATE, ts TIMESTAMP, tstz TIMESTAMPTZ, i BIGINT, str VARCHAR, vd VARCHAR)");
+            s.execute("CREATE TABLE t_bind (d DECIMAL(38,2), dt DATE, ts TIMESTAMP, tstz TIMESTAMPTZ, i BIGINT, str VARCHAR, vd DECIMAL(38,18))");
         }
         Schema decimalSchema = Decimal.schema(2);
         Struct variable = VariableScaleDecimal.fromLogical(VariableScaleDecimal.schema(),
@@ -103,7 +107,7 @@ class TypeMapperTest {
                     .isEqualTo(OffsetDateTime.parse("2026-07-07T12:34:56+08:00").toInstant());
             assertThat(rs.getLong(5)).isEqualTo(42L);
             assertThat(rs.getString(6)).isEqualTo("中文");
-            assertThat(rs.getString(7)).isEqualTo("12345.6789");
+            assertThat(rs.getBigDecimal(7)).isEqualByComparingTo("12345.6789"); // 裸 numeric → DECIMAL(38,18)
         }
     }
 
