@@ -574,6 +574,7 @@ public class DdlApplier {
             case "bytea" -> "BLOB";
             case "json", "jsonb" -> "JSON";
             case "uuid" -> "UUID";
+            case "interval" -> "INTERVAL";
             case "ARRAY" -> switch (udtName == null ? "" : udtName) {
                 case "_int8" -> "BIGINT[]";
                 case "_int4" -> "INTEGER[]";
@@ -604,8 +605,8 @@ public class DdlApplier {
             case "SMALLINT" -> unsigned ? "INTEGER" : "SMALLINT";
             case "MEDIUMINT" -> "INTEGER";
             case "INT", "INTEGER" -> unsigned ? "BIGINT" : "INTEGER";
-            // BIGINT UNSIGNED 对齐事件口径(bigint.unsigned=precise → Decimal(20,0))
-            case "BIGINT" -> unsigned ? "DECIMAL(20,0)" : "BIGINT";
+            // BIGINT UNSIGNED 对齐事件口径(UnsignedBigintConverter 文本出流 → UBIGINT 原生映射)
+            case "BIGINT" -> unsigned ? "UBIGINT" : "BIGINT";
             case "DECIMAL", "NUMERIC" -> {
                 long p = length == null ? 10 : length;
                 long s = scale == null ? 0 : scale;

@@ -86,10 +86,12 @@ class MySqlIntegrationTest {
                         created datetime(6) DEFAULT CURRENT_TIMESTAMP(6),
                         updated timestamp(6) NULL DEFAULT CURRENT_TIMESTAMP(6),
                         payload json NULL,
-                        tier enum('gold','silver') DEFAULT 'silver')""");
-            s.execute("INSERT INTO shop.cdc_test (name, amount, flag, payload, tier) VALUES "
-                    + "('alpha', 10.50, true, '{\"k\": 1}', 'gold'), ('beta', 20.00, false, NULL, 'silver'), "
-                    + "('gamma', 99.99, true, '{\"k\": 3}', 'silver')");
+                        tier enum('gold','silver') DEFAULT 'silver',
+                        big_u bigint unsigned NULL)""");
+            s.execute("INSERT INTO shop.cdc_test (name, amount, flag, payload, tier, big_u) VALUES "
+                    + "('alpha', 10.50, true, '{\"k\": 1}', 'gold', 18446744073709551615), "
+                    + "('beta', 20.00, false, NULL, 'silver', NULL), "
+                    + "('gamma', 99.99, true, '{\"k\": 3}', 'silver', 42)");
             // 存量空表:无任何数据事件,湖表应由快照期 schema change(历史 CREATE)直接建出
             s.execute("CREATE TABLE shop.empty_seed (id bigint PRIMARY KEY, note varchar(64) COMMENT '备注') COMMENT='存量空表'");
         }
@@ -148,10 +150,24 @@ class MySqlIntegrationTest {
         assertThat(lakeColumnType("amount")).isEqualTo("DECIMAL(12,2)"); // 源 decimal(12,2) 忠实对应
         assertThat(lakeColumnType("payload")).isEqualTo("JSON");
         assertThat(lakeColumnType("tier")).isEqualTo("VARCHAR"); // ENUM→VARCHAR
+        // BIGINT UNSIGNED → UBIGINT 原生映射(快照路径:uint64 最大值无损)
+        assertThat(lakeColumnType("big_u")).isEqualTo("UBIGINT");
+        assertThat(engine.queryScalar(
+                "SELECT big_u::VARCHAR FROM shop.cdc_test WHERE name='alpha'", String.class))
+                .isEqualTo("18446744073709551615");
         // 值正确性抽查
         assertThat(engine.queryScalar(
                 "SELECT tier FROM shop.cdc_test WHERE name='alpha'", String.class)).isEqualTo("gold");
         assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test WHERE flag")).isEqualTo(2L);
+
+        // 流式路径:binlog 原始 long 位形态的无符号还原(uint64 高位值)
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("INSERT INTO shop.cdc_test (name, amount, big_u) VALUES ('ubig_live', 1.00, 18446744073709551614)");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+                assertThat(engine.queryScalar(
+                        "SELECT big_u::VARCHAR FROM shop.cdc_test WHERE name='ubig_live'", String.class))
+                        .isEqualTo("18446744073709551614"));
     }
 
     @Test

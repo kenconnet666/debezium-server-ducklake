@@ -114,9 +114,10 @@ class DucklakeApplicationIntegrationTest {
                     + "WHEN TAG IN ('ALTER TABLE', 'DROP TABLE', 'DROP SCHEMA') EXECUTE FUNCTION fn_capture_drop()");
 
             s.execute("CREATE TABLE cdc_test (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
-                    + "name text NOT NULL, big_content text, amount numeric(12,2) DEFAULT 0, tags text[])");
-            s.execute("INSERT INTO cdc_test (name, amount, tags) VALUES "
-                    + "('alpha', 10.50, ARRAY['a,b','c']), ('beta', 20.00, NULL), ('gamma', 99.99, ARRAY[]::text[])");
+                    + "name text NOT NULL, big_content text, amount numeric(12,2) DEFAULT 0, tags text[], dur interval)");
+            s.execute("INSERT INTO cdc_test (name, amount, tags, dur) VALUES "
+                    + "('alpha', 10.50, ARRAY['a,b','c'], interval '1 year 2 months 3 days'), "
+                    + "('beta', 20.00, NULL, NULL), ('gamma', 99.99, ARRAY[]::text[], interval '4 hours')");
 
             // 非 public schema:默认整库同步下应自动捕获并映射为湖表 app.orders(快照+增量)
             s.execute("CREATE SCHEMA app");
@@ -362,6 +363,17 @@ class DucklakeApplicationIntegrationTest {
                 "SELECT len(tags) FROM public.cdc_test WHERE name='gamma'", Long.class)).isZero();
         assertThat(engine.queryScalar(
                 "SELECT count(*) FROM public.cdc_test WHERE name='beta' AND tags IS NULL", Long.class)).isEqualTo(1L);
+    }
+
+    /** PG interval → DuckDB INTERVAL:ISO8601 文本出流,湖列原生 INTERVAL 语义可运算 */
+    @Test
+    @Order(74)
+    void pgIntervalLandsAsNativeInterval() throws Exception {
+        assertThat(lakeColumnType("dur")).isEqualTo("INTERVAL");
+        assertThat(engine.queryScalar(
+                "SELECT date_part('month', dur) FROM public.cdc_test WHERE name='alpha'", Long.class)).isEqualTo(2L);
+        assertThat(engine.queryScalar(
+                "SELECT date_part('hour', dur) FROM public.cdc_test WHERE name='gamma'", Long.class)).isEqualTo(4L);
     }
 
     /** DDL 驱动建空表 + 表改名跟随(PG 增量 DDL 生效;存量空表 PG 无事件覆盖不到,见 README) */

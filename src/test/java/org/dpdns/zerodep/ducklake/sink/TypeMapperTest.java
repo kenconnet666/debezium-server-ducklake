@@ -258,6 +258,35 @@ class TypeMapperTest {
         }
     }
 
+    /** PG interval(ISO8601 文本出流) → INTERVAL;MySQL BIGINT UNSIGNED(无符号文本) → UBIGINT——
+     *  真 DuckDB 往返验证(interval 语义保全可运算;uint64 最大值无损) */
+    @Test
+    void intervalAndUnsignedBigintRoundTrip() throws SQLException {
+        assertThat(TypeMapper.duckType(logical("io.debezium.time.Interval"))).isEqualTo("INTERVAL");
+        assertThat(TypeMapper.duckType(logical("ducklake.UBigInt"))).isEqualTo("UBIGINT");
+        assertThat(TypeMapper.castExpr("c", "INTERVAL")).isEqualTo("TRY_CAST(\"c\" AS INTERVAL)");
+        assertThat(TypeMapper.castExpr("c", "UBIGINT")).isEqualTo("CAST(\"c\" AS UBIGINT)");
+
+        // Debezium ISO8601 → DuckDB 认的 PG 风格(1.5.4 实测不解析 ISO 形态,必须转换)
+        Schema iv = logical("io.debezium.time.Interval");
+        assertThat(TypeMapper.stagingText(iv, "P1Y2M3DT4H5M6.7S"))
+                .isEqualTo("1 years 2 months 3 days 4 hours 5 minutes 6.7 seconds");
+        assertThat(TypeMapper.stagingText(iv, "PT4H")).isEqualTo("4 hours");
+        assertThat(TypeMapper.stagingText(iv, "P-1Y")).isEqualTo("-1 years");
+        assertThat(TypeMapper.stagingText(iv, "garbage")).isEqualTo("garbage"); // 解析不上退原文
+
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT date_part('month', TRY_CAST('"
+                        + TypeMapper.stagingText(iv, "P1Y2M3DT4H5M6.7S") + "' AS INTERVAL)), "
+                        + "TRY_CAST('garbage' AS INTERVAL), "
+                        + "CAST('18446744073709551615' AS UBIGINT)")) {
+            rs.next();
+            assertThat(rs.getLong(1)).as("转换后 interval 可解析可运算").isEqualTo(2L);
+            assertThat(rs.getObject(2)).as("毒丸 interval 置 NULL 不断链").isNull();
+            assertThat(rs.getString(3)).isEqualTo("18446744073709551615");
+        }
+    }
+
     /** LIST 列的 information_schema 形态归一(否则 TIMESTAMPTZ[] 恒判漂移,每批误触类型跟随) */
     @Test
     void normalizeHandlesListSuffix() {

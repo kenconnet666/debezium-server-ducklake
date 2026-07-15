@@ -147,6 +147,9 @@ public class DebeziumEngineRunner implements SmartLifecycle {
                 p.setProperty("slot.name", src.getSlotName());
                 p.setProperty("publication.name", src.getPublicationName());
                 p.setProperty("publication.autocreate.mode", "disabled");
+                // interval 列以 ISO8601 字符串出流(默认是微秒数,单位语义丢失)——
+                // TypeMapper 按 Interval 逻辑名映射回 DuckDB 原生 INTERVAL
+                p.setProperty("interval.handling.mode", "string");
                 // 空=不设 include(整库全部用户 schema);空串直接下发会被当成"空列表"反而全排除
                 if (!src.getSchemaIncludeList().isBlank()) {
                     p.setProperty("schema.include.list", src.getSchemaIncludeList());
@@ -167,12 +170,15 @@ public class DebeziumEngineRunner implements SmartLifecycle {
                 p.setProperty("schema.history.internal.jdbc.connection.url", catalogUrl);
                 p.setProperty("schema.history.internal.jdbc.connection.user", lake.getCatalogUser());
                 p.setProperty("schema.history.internal.jdbc.connection.password", lake.getCatalogPassword());
-                // BIGINT UNSIGNED 上限 1.8e19 超 Long.MAX(9.2e18),默认 long 静默溢出为负——precise 走 Decimal
+                // BIGINT UNSIGNED 上限 1.8e19 超 Long.MAX(9.2e18),默认 long 静默溢出为负——
+                // precise 为未被 ubig 转换器覆盖场景的兜底;主路径由 ubig 以无符号文本出流,
+                // TypeMapper 映射 DuckDB 原生 UBIGINT(8 字节整数,替代 16 字节 Decimal(20,0))
                 p.setProperty("bigint.unsigned.handling.mode", "precise");
                 // TINYINT(1) 快照期(SHOW CREATE TABLE)与流式期(DDL 解析)schema 不一致的官方修正:
                 // 两阶段统一为 BOOLEAN,否则同列两形态会误触本项目的类型漂移重建路径
-                p.setProperty("converters", "t1b");
+                p.setProperty("converters", "t1b,ubig");
                 p.setProperty("t1b.type", "io.debezium.connector.binlog.converters.TinyIntOneToBooleanConverter");
+                p.setProperty("ubig.type", "org.dpdns.zerodep.ducklake.engine.UnsignedBigintConverter");
                 // zero-date('0000-00-00')等脏值转换失败降级告警置 NULL,不让引擎 crash loop
                 p.setProperty("event.converting.failure.handling.mode", "warn");
                 // 列/表 COMMENT 进 schema change 事件(湖侧注释跟随的前提)

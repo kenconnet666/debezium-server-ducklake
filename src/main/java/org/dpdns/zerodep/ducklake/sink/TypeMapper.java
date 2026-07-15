@@ -45,6 +45,10 @@ final class TypeMapper {
     private static final String GEOMETRY = "io.debezium.data.geometry.Geometry";
     private static final String GEO_POINT = "io.debezium.data.geometry.Point";
     private static final String GEOGRAPHY = "io.debezium.data.geometry.Geography";
+    /** PG interval（interval.handling.mode=string 下 ISO8601 文本出流）→ DuckDB 原生 INTERVAL */
+    private static final String INTERVAL = "io.debezium.time.Interval";
+    /** MySQL BIGINT UNSIGNED（UnsignedBigintConverter 以无符号文本出流）→ DuckDB UBIGINT */
+    private static final String UBIGINT = "ducklake.UBigInt";
 
     /** Connect 字段 schema → DuckDB 列类型 DDL 片段 */
     static String duckType(Schema schema) {
@@ -90,6 +94,12 @@ final class TypeMapper {
                 }
                 case GEOMETRY, GEO_POINT, GEOGRAPHY -> {
                     return "BLOB";
+                }
+                case INTERVAL -> {
+                    return "INTERVAL";
+                }
+                case UBIGINT -> {
+                    return "UBIGINT";
                 }
                 default -> {
                     // 其他逻辑类型（Enum/EnumSet/Year/Bits/Ltree/Xml…）按物理类型走下方 switch
@@ -214,6 +224,9 @@ final class TypeMapper {
                 case ZONED_TIMESTAMP, ZONED_TIME, PG_JSON, PG_UUID -> {
                     return value.toString();
                 }
+                case INTERVAL -> {
+                    return isoIntervalToDuck(value.toString());
+                }
                 case VARIABLE_DECIMAL -> {
                     return io.debezium.data.VariableScaleDecimal
                             .toLogical((org.apache.kafka.connect.data.Struct) value)
@@ -291,10 +304,41 @@ final class TypeMapper {
             return "TRY_CAST(" + quoted + " AS " + duckType + ")";
         }
         return switch (duckType) {
-            case "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ" ->
+            case "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL" ->
                     "TRY_CAST(" + quoted + " AS " + duckType + ")";
             default -> "CAST(" + quoted + " AS " + duckType + ")";
         };
+    }
+
+    /** Debezium ISO8601 期间格式（P1Y2M3DT4H5M6.7S） */
+    private static final java.util.regex.Pattern ISO_INTERVAL = java.util.regex.Pattern.compile(
+            "^P(?:(-?\\d+)Y)?(?:(-?\\d+)M)?(?:(-?\\d+)D)?(?:T(?:(-?\\d+)H)?(?:(-?\\d+)M)?(?:(-?[\\d.]+)S)?)?$");
+
+    /**
+     * ISO8601 期间 → DuckDB/PG 风格 interval 文本（"1 years 2 months 3 days 4 hours ..."）。
+     * DuckDB 1.5.4 实测完全不解析 ISO8601 形态（TRY_CAST 全 NULL），只认 PG 风格——
+     * Debezium interval.handling.mode=string 的输出必须在此转换；解析不上退原文
+     * （投影侧 TRY_CAST 兜底置 NULL，不断链）。
+     */
+    private static String isoIntervalToDuck(String iso) {
+        java.util.regex.Matcher m = ISO_INTERVAL.matcher(iso.trim());
+        if (!m.matches()) {
+            return iso;
+        }
+        StringBuilder sb = new StringBuilder();
+        append(sb, m.group(1), "years");
+        append(sb, m.group(2), "months");
+        append(sb, m.group(3), "days");
+        append(sb, m.group(4), "hours");
+        append(sb, m.group(5), "minutes");
+        append(sb, m.group(6), "seconds");
+        return sb.isEmpty() ? "0 seconds" : sb.toString();
+    }
+
+    private static void append(StringBuilder sb, String value, String unit) {
+        if (value != null) {
+            sb.append(sb.isEmpty() ? "" : " ").append(value).append(' ').append(unit);
+        }
     }
 
     /**
