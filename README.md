@@ -178,6 +178,27 @@ SELECT count(*) FROM lake.public.demo;
 
 建议为分析建独立的只读 PG 角色与 S3 只读凭据。
 
+### 查询优化（DuckLake 没有索引，加速靠数据布局）
+
+DuckLake **不支持二级索引/CREATE INDEX**，官方列为 "unlikely to be supported"（OLAP 湖格式的定位——大数据量下索引维护成本不可接受；强制主键/唯一约束同理不支持）。查询加速的正道是**数据布局 + 统计剪枝**三板斧，按需对热点表启用（DuckDB 客户端连湖执行，一次生效）：
+
+```sql
+-- ① 排序聚簇(最推荐):写入不排序(不拖累 CDC 热路径),定期压实时自动按此键重排——
+--    文件/row-group 的 min-max 统计变"紧",时间/主键过滤的文件剪枝立竿见影
+ALTER TABLE lake.public.orders SET SORTED BY (created_at ASC);
+CALL lake.set_option('sort_on_insert', false, table_name => 'orders');
+
+-- ② 分区(追加型大表可选):只影响新写入,粗粒度为宜——每批写入按分区拆文件,
+--    分区过细 × CDC 小批 = 小文件放大,且压实不跨分区合并
+ALTER TABLE lake.public.events SET PARTITIONED BY (day(created_at));
+-- 高基数键点查:ALTER TABLE ... SET PARTITIONED BY (bucket(8, user_id));
+
+-- ③ 读端缓存:远端 Parquet footer 进程内缓存,重复扫描明显提速
+SET enable_object_cache = true;
+```
+
+机制说明：DuckLake catalog 里的 `ducklake_file_column_stats`（每文件×每列 min/max/null_count）承担 zone map 角色，过滤谓词先在 catalog 层做 file skipping，选中的文件再由 DuckDB 用 Parquet row-group 统计与 bloom filter 二次跳过；`COUNT(*)` 直接由元数据回答不扫文件（DuckLake 1.0）。本服务已内置的分层压实会自动应用表上的 SORTED BY（压实即重排）。另注意：**查询延迟的大头常在 catalog PG 的元数据往返**——分析端与 catalog PG 同机房部署收益最大。乱序高基数列（UUID 等）min/max 剪枝失效，需 `bucket()` 分区或改用趋势递增键。
+
 ## 配置参考
 
 配置前缀 `ducklake`，按 profile 提供（`dev`/`prod`）。核心参数（完整见 `DucklakeProperties.java` 的注释，每个默认值都有实测依据）：
@@ -193,7 +214,7 @@ SELECT count(*) FROM lake.public.demo;
 | `source.schema-include-list` | 空 | **默认整库同步**：空=全部用户 schema/库（存量 initial 快照 + 流式增量都拉，湖 schema 一一镜像 PG schema / MySQL database，`lake.<schema|db>.<表>`，可配前缀）；需收窄填逗号分隔列表 |
 | `source.table-exclude-list` | 空 | 排除表（正则，`schema.table` / `db.table` 形式） |
 | `source.signal-table` | 空 | 增量快照 signal 表（类型重建兜底经它触发）。空=按类型推导：PG `public.dbz_signal` / MySQL `<dbname>.dbz_signal` |
-| `maintenance.follow-truncate` | `true` | [仅 MySQL] 源 `TRUNCATE TABLE` 跟随清空湖表（PG 路线暂不支持，见数据语义节） |
+| `maintenance.follow-truncate` | `true` | 源 `TRUNCATE TABLE` 跟随清空湖表（两源通用，见变更跟随矩阵） |
 | `lake.catalog-*` | — | DuckLake catalog 的 PG 连接（同时承载 Debezium offset 表） |
 | `lake.data-path` | `s3://lake/ducklake/` | 数据文件根路径（S3 或本地目录） |
 | `lake.memory-limit` | `1536MB` | 内嵌 DuckDB 内存上限。⚠️ 须给足"常驻+批工作集"，过小会 OOM crash loop |
