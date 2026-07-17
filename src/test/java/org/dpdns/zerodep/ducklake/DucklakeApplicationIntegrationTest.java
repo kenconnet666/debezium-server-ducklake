@@ -456,6 +456,42 @@ class DucklakeApplicationIntegrationTest {
                         Long.class)).isZero());
     }
 
+    /**
+     * 闭环兜底(最后执行)：把本类在源库建的所有用户表(CDC 基建 dbz_* 保留)全部 DROP,
+     * 经 CDC 跟随后源库与湖两侧都不再残留任何测试数据——"新建的数据最终都删掉",
+     * 显式验证,不依赖 Testcontainers 销毁容器来兜底清理。
+     */
+    @Test
+    @Order(1000)
+    void teardownDropsEveryCreatedTableSoSourceAndLakeEndEmpty() throws Exception {
+        // ① 源侧:动态枚举所有用户表并 DROP(排除基建表 dbz_ddl_log/dbz_signal/dbz_heartbeat)
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            var toDrop = new java.util.ArrayList<String>();
+            try (var rs = s.executeQuery(
+                    "SELECT table_schema, table_name FROM information_schema.tables "
+                    + "WHERE table_type='BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema') "
+                    + "AND table_name NOT LIKE 'dbz%'")) {
+                while (rs.next()) toDrop.add("\"" + rs.getString(1) + "\".\"" + rs.getString(2) + "\"");
+            }
+            for (String fq : toDrop) {
+                s.execute("DROP TABLE IF EXISTS " + fq + " CASCADE");
+            }
+            // 源侧用户表已清零(基建表不算)
+            try (var rs = s.executeQuery(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_type='BASE TABLE' "
+                    + "AND table_schema NOT IN ('pg_catalog','information_schema') AND table_name NOT LIKE 'dbz%'")) {
+                rs.next();
+                assertThat(rs.getLong(1)).isZero();
+            }
+        }
+        // ② 湖侧收敛:源 DROP 经 CDC 跟随后,public/app 下不再有任何用户表
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+                assertThat(engine.queryScalar(
+                        "SELECT count(*) FROM information_schema.tables "
+                                + "WHERE table_catalog='lake' AND table_schema IN ('public','app')", Long.class)).isZero());
+    }
+
     private Long lakeCount(String sql) throws Exception {
         return engine.queryScalar(sql, Long.class);
     }

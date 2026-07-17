@@ -421,6 +421,40 @@ class MySqlIntegrationTest {
                 assertThat(lakeCount("SELECT count(*) FROM shop.pkfix")).isEqualTo(2L));
     }
 
+    /**
+     * 闭环兜底(最后执行)：把本类在 MySQL 源库 shop 建的所有用户表(CDC 基建 dbz_* 保留)全部 DROP,
+     * 经 binlog schema change 跟随后源库与湖两侧都不再残留任何测试数据——"新建的数据最终都删掉",
+     * 显式验证,不依赖 Testcontainers 销毁容器来兜底清理。
+     */
+    @Test
+    @Order(1000)
+    void teardownDropsEveryCreatedTableSoSourceAndLakeEndEmpty() throws Exception {
+        // ① 源侧:动态枚举 shop 库所有用户表并 DROP(排除基建 dbz_signal 等 dbz_*)
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            var toDrop = new java.util.ArrayList<String>();
+            try (var rs = s.executeQuery(
+                    "SELECT table_name FROM information_schema.tables "
+                    + "WHERE table_schema='shop' AND table_type='BASE TABLE' AND table_name NOT LIKE 'dbz%'")) {
+                while (rs.next()) toDrop.add(rs.getString(1));
+            }
+            for (String t : toDrop) {
+                s.execute("DROP TABLE IF EXISTS shop.`" + t + "`");
+            }
+            // 源侧用户表已清零(基建表不算)
+            try (var rs = s.executeQuery(
+                    "SELECT count(*) FROM information_schema.tables "
+                    + "WHERE table_schema='shop' AND table_type='BASE TABLE' AND table_name NOT LIKE 'dbz%'")) {
+                rs.next();
+                assertThat(rs.getLong(1)).isZero();
+            }
+        }
+        // ② 湖侧收敛:源 DROP 经 binlog 跟随后,shop 下不再有任何用户表
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
+                assertThat(engine.queryScalar(
+                        "SELECT count(*) FROM information_schema.tables WHERE table_catalog='lake' "
+                                + "AND table_schema='shop' AND table_name NOT LIKE 'dbz%'", Long.class)).isZero());
+    }
+
     private Long lakeCount(String sql) throws Exception {
         return engine.queryScalar(sql, Long.class);
     }
