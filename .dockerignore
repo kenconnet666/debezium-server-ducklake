@@ -1,0 +1,36 @@
+# Docker build 上下文是仓库根(compose: context ../.. / release: context .)。
+# 现镜像只 COPY 预构建的 fat jar,故把其余全部挡在上下文外——尤其:
+#   .docker/*/data/  各栈 in-tree bind mount 的 DB/S3 数据(可达数 GB)
+#   1panel-*         误置根目录的 server 面板(数百 MB)
+# 若将来改为多阶段构建(容器内编译),需放行 src/pom.xml/.mvn/mvnw。
+
+# 版本库与 IDE
+.git
+.gitignore
+.gitattributes
+.github
+.idea
+*.iml
+
+# 源码与构建工具(镜像用预构建 jar,不在容器内编译)
+src
+pom.xml
+.mvn
+mvnw
+mvnw.cmd
+
+# 文档与素材
+docs
+.temp
+*.md
+LICENSE
+
+# 整个 .docker(compose/脚本/Dockerfile/各服务 data 目录)都不需进镜像上下文
+.docker
+
+# 误置的 server 面板
+1panel-*
+
+# 构建产物:仅保留可执行 fat jar,其余(classes/generated-sources/*.jar.original)排除
+target/*
+!target/debezium-server-ducklake-*.jar

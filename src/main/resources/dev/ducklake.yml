@@ -1,23 +1,31 @@
-# dev = 本机开发(单机 docker 栈:PG :25432 / rustfs :39000)
+# dev = 本机开发(infra 进 docker,主程序在 IntelliJ 里 Run)。
+# 端口/口令对齐 PG 栈 infra-only —— 先在 .docker/postgres/ 执行:
+#     docker compose up -d          # 只起 源库postgres/独立catalog-pg/rustfs(S3)
+# 再 IDEA 以 active profile=dev 跑主程序即可连上:
+#     源库 postgres → localhost:15432   catalog-pg → localhost:15434   rustfs(S3) → localhost:19000
+# 想以 MySQL 为源开发:改跑 .docker/mysql/ 栈,并用 prod profile + DUCKLAKE_* 环境变量(dev 档锁定 PG)。
 ducklake:
   source:
     hostname: 127.0.0.1
-    port: 25432
+    port: 15432
     user: dbuser_cdc
     password: changeme
     dbname: postgres
     slot-name: dbz_ducklake
     publication-name: dbz_publication
   lake:
+    # 独立元空间实例(与源库分离,拓扑与 prod 一致;承载湖 catalog + Debezium offset + schema history)
     catalog-host: 127.0.0.1
-    catalog-port: 25432
+    catalog-port: 15434
     catalog-db: ducklake_catalog
-    catalog-user: postgres
+    catalog-user: lake_admin
     catalog-password: changeme
     data-path: s3://lake/ducklake/
-    s3-endpoint: 127.0.0.1:39000
+    s3-endpoint: 127.0.0.1:19000
     s3-access-key: admin
     s3-secret-key: changeme
     s3-ssl: false
   maintenance:
-    enabled: false   # 开发机默认不跑维护任务
+    # 本项目主线就是 scanner refill/bootstrap 等维护特性——默认开,方便在 IDE 里调这些路径。
+    # 只想跑纯 CDC(不要维护/scanner 噪声)时改 false。
+    enabled: true

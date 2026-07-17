@@ -1,10 +1,14 @@
 # 发布：推送 tag v* 触发——测试 → 按 tag 定版打包 → GitHub Release 上传 jar
-#       → buildx 多架构(amd64/arm64)构建并推送镜像到 GHCR
+#       → buildx 多架构(amd64/arm64)构建并推送镜像到 Docker Hub + GHCR
 # 用法:  git tag v0.1.0 && git push origin v0.1.0
+# 前置:  仓库 Settings → Secrets and variables → Actions 配好 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN
+#        (token 在 hub.docker.com → Account settings → Personal access tokens 生成,权限 Read & Write)
 # 产物:  Release 附件 debezium-server-ducklake-<版本>.jar
-#        ghcr.io/<owner>/debezium-server-ducklake:<版本> 与 :latest
+#        docker.io/kenconnet/debezium-server-ducklake:<版本> 与 :latest(用户 docker pull 直接用)
+#        ghcr.io/<owner>/debezium-server-ducklake:<版本> 与 :latest(备份 registry)
 # ⚠️ 首次发布后 GHCR package 默认 private——到 GitHub → Packages → 该包
 #    → Package settings → Change visibility 改 public 才能匿名拉取。
+#    Docker Hub 仓库 kenconnet/debezium-server-ducklake 首次 push 自动创建(个人命名空间默认 public)。
 name: Release
 
 on:
@@ -65,12 +69,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker Hub 主 registry(用户直接 docker pull)。需仓库 secrets:
+      #   DOCKERHUB_USERNAME=kenconnet(登录账号)
+      #   DOCKERHUB_TOKEN=该账号的 Personal access token(Read & Write)
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # repository owner 自动小写(GHCR 要求)
-          images: ghcr.io/${{ github.repository }}
+          # 两 registry 共用同一套 tag;repository owner 自动小写(GHCR 要求)
+          images: |
+            docker.io/kenconnet/debezium-server-ducklake
+            ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest
@@ -79,7 +94,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: .docker/postgres/ducklake/Dockerfile
+          file: .docker/ducklake/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

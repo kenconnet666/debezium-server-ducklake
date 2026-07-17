@@ -1,6 +1,8 @@
-# debezium-server-ducklake 容器镜像:Debian 13 slim + JetBrains Runtime(JBR) 25
-# 构建: mvn package -DskipTests && docker build -f docker/ducklake/Dockerfile -t debezium-server-ducklake .
-# (context 必须是仓库根——要 COPY target/*.jar)
+# debezium-server-ducklake 生产镜像:Debian 13 slim + JetBrains Runtime(JBR) 25
+# ── 单一源无关镜像:mysql/postgres 由运行时 DUCKLAKE_SOURCE_TYPE 切换,故两栈与 CI 共用本文件 ──
+# 构建(context 必须是仓库根——要 COPY target/*.jar):
+#   mvn package -DskipTests
+#   docker build -f .docker/ducklake/Dockerfile -t debezium-server-ducklake .
 # 多架构(buildx): TARGETARCH=amd64/arm64 自动映射 JBR 的 x64/aarch64 变体
 FROM debian:trixie-slim
 

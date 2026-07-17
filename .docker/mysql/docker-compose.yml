@@ -1,8 +1,12 @@
 # MySQL 源一键体验栈：MySQL 8.4(源库) + 元空间 PG + rustfs(S3) + debezium-server-ducklake
-# 使用:
-#   1. mvn package -DskipTests
-#   2. docker compose -f .docker/mysql/docker-compose.yml up -d --build
-#   3. 写数据看落湖: docker compose -f .docker/mysql/docker-compose.yml exec mysql \
+# 使用(两模式,共用本文件——app 服务带 profiles:[app]):
+#   ── A. 开发:infra 进 docker,主程序在 IntelliJ 里跑 ──
+#      docker compose -f .docker/mysql/docker-compose.yml up -d          # 只起 MySQL/catalog/S3
+#      注:dev profile 默认连 PG 栈;要以 MySQL 为源在 IDE 跑,给主程序传 prod profile + MySQL 环境变量
+#   ── B. 全栈 e2e / 类生产:app 也进容器 ──
+#      mvn package -DskipTests
+#      docker compose -f .docker/mysql/docker-compose.yml --profile app up -d --build
+#   写数据看落湖: docker compose -f .docker/mysql/docker-compose.yml exec mysql \
 #        mysql -uroot -pchangeme shop -e "CREATE TABLE demo(id bigint AUTO_INCREMENT PRIMARY KEY, name varchar(64)); INSERT INTO demo(name) VALUES ('hello'),('mysql');"
 #      curl http://127.0.0.1:19993/api/ducklake/watermark
 # CDC 基建(CDC 账号/signal/心跳表)由 initdb 自动完成——比 PG 栈更少:无 publication、
@@ -95,10 +99,12 @@ services:
       && mc mb -p rfs/lake && exit 0"
 
   ducklake:
+    # profiles=app:plain `up` 只起 infra;全栈 e2e 用 `--profile app up`
+    profiles: ["app"]
     build:
       # context 是仓库根:Dockerfile 要 COPY target/*.jar
       context: ../..
-      dockerfile: .docker/mysql/ducklake/Dockerfile
+      dockerfile: .docker/ducklake/Dockerfile
     restart: unless-stopped
     logging: *default-logging
     depends_on:
