@@ -29,3 +29,9 @@ ducklake:
     # 本项目主线就是 scanner refill/bootstrap 等维护特性——默认开,方便在 IDE 里调这些路径。
     # 只想跑纯 CDC(不要维护/scanner 噪声)时改 false。
     enabled: true
+
+# dev 专属:日志同时落文件,方便 tail —— logs/ducklake-dev.log(相对运行工作目录=项目根)。
+# prod 走容器 docker logs,不设此项,不受影响。
+logging:
+  file:
+    name: logs/ducklake-dev.log
