@@ -6,7 +6,9 @@
 # 多架构(buildx): TARGETARCH=amd64/arm64 自动映射 JBR 的 x64/aarch64 变体
 FROM debian:trixie-slim
 
-ARG TARGETARCH=amd64
+# ⚠️ 不能给默认值:TARGETARCH 由 BuildKit 按 --platform 自动注入,给了默认(如 =amd64)
+#    会盖过自动值,导致 arm64 一路误取 x64 JBR、真机跑不起来(v0.1.0 首发多架构即栽在此)。
+ARG TARGETARCH
 
 # APT 换阿里云镜像(deb822 格式,主源+security 同域名替换) + 基础工具:
 #   curl/ca-certificates(下载 JBR+健康检查) libstdc++6/zlib1g(DuckDB JNI 链接)
@@ -21,17 +23,19 @@ RUN sed -i -e 's|deb.debian.org|mirrors.aliyun.com|g' -e 's|security.debian.org|
     && rm -rf /var/lib/apt/lists/*
 
 # JBR 25 runtime(非 SDK,更小;cache-redirector 为 JetBrains 官方分发 CDN);
-# tar 顶层单目录,strip 后落 /opt/jbr
-RUN case "$TARGETARCH" in \
+# tar 顶层单目录,strip 后落 /opt/jbr。arch 优先用 BuildKit 注入的 TARGETARCH,空则 dpkg 探测。
+# 构建期不跑 java -version:多架构下 arm64 层是 QEMU 模拟,执行异架构 JVM 易挂;
+# 只需下载解压,真机运行时自然可用。
+RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
+    && case "$ARCH" in \
         amd64)  JBR_ARCH=x64 ;; \
         arm64)  JBR_ARCH=aarch64 ;; \
-        *) echo "unsupported arch: $TARGETARCH" && exit 1 ;; \
+        *) echo "unsupported arch: $ARCH" && exit 1 ;; \
     esac \
     && curl -fsSL "https://cache-redirector.jetbrains.com/intellij-jbr/jbr-25.0.3-linux-${JBR_ARCH}-b508.16.tar.gz" -o /tmp/jbr.tar.gz \
     && mkdir -p /opt/jbr \
     && tar -xzf /tmp/jbr.tar.gz -C /opt/jbr --strip-components=1 \
-    && rm /tmp/jbr.tar.gz \
-    && /opt/jbr/bin/java -version
+    && rm /tmp/jbr.tar.gz
 
 ENV JAVA_HOME=/opt/jbr \
     PATH=/opt/jbr/bin:$PATH \
