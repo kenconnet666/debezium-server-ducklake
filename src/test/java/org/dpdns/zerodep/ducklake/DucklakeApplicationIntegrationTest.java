@@ -14,9 +14,9 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.web.client.RestClient;
-import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -42,7 +42,7 @@ import static org.awaitility.Awaitility.await;
 class DucklakeApplicationIntegrationTest {
 
     @Container
-    static final PostgreSQLContainer<?> PG = new PostgreSQLContainer<>("postgres:18-alpine")
+    static final PostgreSQLContainer PG = new PostgreSQLContainer("postgres:18-alpine")
             .withDatabaseName("postgres").withUsername("postgres").withPassword("test")
             .withCommand("postgres", "-c", "wal_level=logical");
 

@@ -60,18 +60,24 @@ import java.util.regex.Pattern;
 @Slf4j
 class RawMySqlReader {
 
-    private record ColDef(String name, ColumnType mysqlType, String duckType, boolean key,
-                          boolean unsigned, String[] enumValues, String[] setValues) {
+    private record PhysicalCol(String name, ColumnType mysqlType, int metadata, boolean key,
+                               boolean unsigned, List<String> enumValues, List<String> setValues) {
     }
 
-    private record TableInfo(long tableId, String database, String table, List<ColDef> cols) {
+    private record TableShape(String database, String table, List<PhysicalCol> cols) {
+    }
+
+    private record ColDef(String name, ColumnType mysqlType, String duckType, boolean key,
+                          boolean unsigned, List<String> enumValues, List<String> setValues) {
+    }
+
+    private record TableInfo(String database, String table, String lakeTable, List<ColDef> cols) {
         List<String> keyColumns() {
             return cols.stream().filter(ColDef::key).map(ColDef::name).toList();
         }
+    }
 
-        String sourceName() {
-            return database + "." + table;
-        }
+    private record CachedTable(TableShape shape, TableInfo table) {
     }
 
     private record PendingRow(TableInfo table, boolean deleted, String[] values) {
@@ -81,7 +87,12 @@ class RawMySqlReader {
                                  String keyMatch, String partition) {
     }
 
-    private record WriteTiming(long stageMs, long lakeTxMs) {
+    private record StagingTiming(long ddlNanos, long appenderNanos) {
+    }
+
+    private record WriteTiming(long stageMs, long lakeTxMs, long planNanos, long ensureNanos,
+                               long stagingDdlNanos, long appenderNanos, long mirrorDmlNanos,
+                               long lakeCommitNanos, long cleanupNanos) {
     }
 
     private final DucklakeProperties props;
@@ -96,11 +107,13 @@ class RawMySqlReader {
     private final List<Pattern> excludes;
     private final Set<String> infrastructureTables;
 
+    /** table-id 只在当前 binlog 文件内绑定；结构缓存按源表保留并由 DDL/shape 变化失效。 */
     private final Map<Long, TableInfo> tables = new HashMap<>();
+    private final Map<String, CachedTable> tableDefinitions = new HashMap<>();
     /** 当前源事务中的行；只有 XID/COMMIT 到达后才移入 committed。 */
-    private final List<PendingRow> transactionRows = new ArrayList<>();
+    private List<PendingRow> transactionRows = new ArrayList<>();
     /** 已提交但为攒批尚未落湖的行。 */
-    private final List<PendingRow> committed = new ArrayList<>();
+    private List<PendingRow> committed = new ArrayList<>();
     private final Map<String, Map<String, String>> knownColumns = new HashMap<>();
     private final Map<TableInfo, TableSqlParts> sqlCache = new HashMap<>();
     private final Set<String> noKeyWarned = new HashSet<>();
@@ -108,10 +121,11 @@ class RawMySqlReader {
 
     private volatile BinaryLogClient client;
     private volatile boolean stopped;
-    private boolean inTransaction;
     private String currentFilename;
     private RawMySqlOffset.Position committedPosition;
+    private long committedMaxSourceTsMs;
     private long lastFlushMs = System.currentTimeMillis();
+    private long decodeNanos;
 
     RawMySqlReader(DucklakeProperties props, DuckLakeEngine engine, DdlApplier ddlApplier,
                    SyncState syncState, RawMySqlOffset offset, String sourceName) {
@@ -238,26 +252,36 @@ class RawMySqlReader {
             if (!transactionRows.isEmpty()) {
                 throw new IllegalStateException("binlog rotate 出现在未提交源事务中");
             }
+            // MySQL table-id 的作用域不跨 binlog 文件；保留按源表的结构缓存即可。
+            tables.clear();
             currentFilename = rotate.getBinlogFilename();
             RawMySqlOffset.Position p = new RawMySqlOffset.Position(
                     currentFilename, rotate.getBinlogPosition(), currentGtidSet());
-            offset.save(sourceName, p);
+            saveStandaloneOffset(p);
             return;
         }
         if (data instanceof TableMapEventData map) {
+            long started = System.nanoTime();
             parseTableMap(map);
+            decodeNanos += System.nanoTime() - started;
         } else if (data instanceof WriteRowsEventData rows) {
+            long started = System.nanoTime();
             parseWrite(rows);
+            decodeNanos += System.nanoTime() - started;
         } else if (data instanceof UpdateRowsEventData rows) {
+            long started = System.nanoTime();
             parseUpdate(rows);
+            decodeNanos += System.nanoTime() - started;
         } else if (data instanceof DeleteRowsEventData rows) {
+            long started = System.nanoTime();
             parseDelete(rows);
+            decodeNanos += System.nanoTime() - started;
         } else if (data instanceof XidEventData) {
-            commitTransaction(positionOf(event));
+            commitTransaction(positionOf(event), event.getHeader().getTimestamp());
         } else if (data instanceof QueryEventData query) {
             handleQuery(event, query);
         }
-        maybeFlush(false);
+        maybeFlush();
     }
 
     private void handleQuery(Event event, QueryEventData query) throws Exception {
@@ -267,16 +291,14 @@ class RawMySqlReader {
             if (!transactionRows.isEmpty()) {
                 throw new IllegalStateException("BEGIN 前仍有未完成行事件");
             }
-            inTransaction = true;
             return;
         }
         if ("ROLLBACK".equals(normalized)) {
             transactionRows.clear();
-            inTransaction = false;
             return;
         }
         if ("COMMIT".equals(normalized)) {
-            commitTransaction(positionOf(event));
+            commitTransaction(positionOf(event), event.getHeader().getTimestamp());
             return;
         }
 
@@ -286,20 +308,33 @@ class RawMySqlReader {
             throw new IllegalStateException("自动提交 QueryEvent 前存在未完成行事务: " + sql);
         }
         flushCommitted(true);
-        if (isTableDdl(normalized) && databaseIncluded(query.getDatabase())) {
+        boolean appliedDdl = isTableDdl(normalized) && databaseIncluded(query.getDatabase());
+        if (appliedDdl) {
             log.debug("RawMySQL DDL: db={} sql={}", query.getDatabase(), sql);
-            applyDdl(query.getDatabase(), sql);
+            applyDdl(query.getDatabase(), sql, event.getHeader().getTimestamp());
         }
         RawMySqlOffset.Position p = positionOf(event);
-        if (p != null) offset.save(sourceName, p);
-        inTransaction = false;
+        if (p != null) {
+            saveStandaloneOffset(p);
+            if (!appliedDdl) {
+                syncState.sourceReflectedThrough(event.getHeader().getTimestamp());
+            }
+        }
     }
 
-    private void commitTransaction(RawMySqlOffset.Position position) throws Exception {
-        committed.addAll(transactionRows);
-        transactionRows.clear();
-        inTransaction = false;
+    private void commitTransaction(RawMySqlOffset.Position position, long sourceTsMs) throws Exception {
+        if (!transactionRows.isEmpty()) {
+            if (committed.isEmpty()) {
+                List<PendingRow> reusable = committed;
+                committed = transactionRows;
+                transactionRows = reusable;
+            } else {
+                committed.addAll(transactionRows);
+                transactionRows.clear();
+            }
+        }
         if (position != null) committedPosition = position;
+        committedMaxSourceTsMs = Math.max(committedMaxSourceTsMs, sourceTsMs);
         if (committed.size() >= eng.getMaxBatchSize()) flushCommitted(true);
     }
 
@@ -321,32 +356,53 @@ class RawMySqlReader {
         if (metadata.getSimplePrimaryKeys() != null) keyIndexes.addAll(metadata.getSimplePrimaryKeys());
         if (metadata.getPrimaryKeysWithPrefix() != null) keyIndexes.addAll(metadata.getPrimaryKeysWithPrefix().keySet());
 
-        Map<String, String> liveTypes = ddlApplier.mysqlColumnTypes(map.getDatabase(), map.getTable());
-        boolean liveMatches = new ArrayList<>(liveTypes.keySet()).equals(names);
         BitSet signedness = metadata.getSignedness();
         List<String[]> enumMetadata = metadata.getEnumStrValues();
         List<String[]> setMetadata = metadata.getSetStrValues();
         int enumIndex = 0;
         int setIndex = 0;
-        List<ColDef> cols = new ArrayList<>(names.size());
+        List<PhysicalCol> physicalCols = new ArrayList<>(names.size());
         for (int i = 0; i < names.size(); i++) {
             ColumnType type = effectiveType(map.getColumnTypes()[i], map.getColumnMetadata()[i]);
             boolean unsigned = signedness != null && signedness.get(i);
-            String[] enumValues = type == ColumnType.ENUM && enumMetadata != null && enumIndex < enumMetadata.size()
-                    ? enumMetadata.get(enumIndex++) : null;
-            String[] setValues = type == ColumnType.SET && setMetadata != null && setIndex < setMetadata.size()
-                    ? setMetadata.get(setIndex++) : null;
-            String rawType = rawDuckType(type, map.getColumnMetadata()[i], unsigned);
-            String duckType = liveMatches ? liveTypes.getOrDefault(names.get(i), rawType) : rawType;
-            cols.add(new ColDef(names.get(i), type, DuckType.normalize(duckType),
+            List<String> enumValues = type == ColumnType.ENUM && enumMetadata != null
+                    && enumIndex < enumMetadata.size() ? immutableValues(enumMetadata.get(enumIndex++)) : null;
+            List<String> setValues = type == ColumnType.SET && setMetadata != null
+                    && setIndex < setMetadata.size() ? immutableValues(setMetadata.get(setIndex++)) : null;
+            physicalCols.add(new PhysicalCol(names.get(i), type, map.getColumnMetadata()[i],
                     keyIndexes.contains(i), unsigned, enumValues, setValues));
         }
-        TableInfo info = new TableInfo(map.getTableId(), map.getDatabase(), map.getTable(), List.copyOf(cols));
+
+        TableShape shape = new TableShape(map.getDatabase(), map.getTable(), List.copyOf(physicalCols));
+        CachedTable cached = tableDefinitions.get(full);
+        TableInfo info;
+        if (cached != null && cached.shape().equals(shape)) {
+            info = cached.table();
+        } else {
+            Map<String, String> liveTypes = ddlApplier.mysqlColumnTypes(map.getDatabase(), map.getTable());
+            boolean liveMatches = new ArrayList<>(liveTypes.keySet()).equals(names);
+            List<ColDef> cols = new ArrayList<>(physicalCols.size());
+            for (PhysicalCol col : physicalCols) {
+                String rawType = rawDuckType(col.mysqlType(), col.metadata(), col.unsigned());
+                String duckType = liveMatches ? liveTypes.getOrDefault(col.name(), rawType) : rawType;
+                cols.add(new ColDef(col.name(), col.mysqlType(), DuckType.normalize(duckType),
+                        col.key(), col.unsigned(), col.enumValues(), col.setValues()));
+            }
+            info = new TableInfo(map.getDatabase(), map.getTable(),
+                    lakeTableName(map.getDatabase(), map.getTable()), List.copyOf(cols));
+            CachedTable replaced = tableDefinitions.put(full, new CachedTable(shape, info));
+            if (replaced != null) sqlCache.remove(replaced.table());
+        }
+
         TableInfo old = tables.put(map.getTableId(), info);
         if (!info.equals(old)) {
             sqlCache.remove(old);
-            log.info("RawMySQL 感知表: {} ({}列, key={})", full, cols.size(), info.keyColumns());
+            log.info("RawMySQL 感知表: {} ({}列, key={})", full, info.cols().size(), info.keyColumns());
         }
+    }
+
+    private static List<String> immutableValues(String[] values) {
+        return values == null ? null : List.of(values.clone());
     }
 
     private void parseWrite(WriteRowsEventData rows) throws IOException {
@@ -417,8 +473,8 @@ class RawMySqlReader {
         }
         if (col.mysqlType() == ColumnType.ENUM && value instanceof Number n) {
             int index = n.intValue();
-            return col.enumValues() != null && index > 0 && index <= col.enumValues().length
-                    ? col.enumValues()[index - 1] : String.valueOf(index);
+            return col.enumValues() != null && index > 0 && index <= col.enumValues().size()
+                    ? col.enumValues().get(index - 1) : String.valueOf(index);
         }
         if (col.mysqlType() == ColumnType.SET && value instanceof Number n) {
             return decodeSet(n.longValue(), col.setValues());
@@ -461,9 +517,8 @@ class RawMySqlReader {
             case DATETIME, DATETIME_V2 -> DateTimeFormatter.ISO_LOCAL_DATE_TIME.format(
                     LocalDateTime.ofInstant(instant, ZoneOffset.UTC));
             case TIME, TIME_V2 -> {
-                long value = micros;
-                boolean negative = value < 0;
-                long abs = Math.abs(value);
+                boolean negative = micros < 0;
+                long abs = Math.abs(micros);
                 long hours = abs / 3_600_000_000L;
                 long minutes = abs / 60_000_000L % 60;
                 long secs = abs / 1_000_000L % 60;
@@ -476,21 +531,21 @@ class RawMySqlReader {
         };
     }
 
-    private static String decodeSet(long mask, String[] values) {
+    private static String decodeSet(long mask, List<String> values) {
         if (values == null) return Long.toUnsignedString(mask);
         List<String> selected = new ArrayList<>();
-        for (int i = 0; i < values.length; i++) {
-            if ((mask & (1L << i)) != 0) selected.add(values[i]);
+        for (int i = 0; i < values.size(); i++) {
+            if ((mask & (1L << i)) != 0) selected.add(values.get(i));
         }
         return String.join(",", selected);
     }
 
     // ───────────────────────── batch → staging → lake ─────────────────────────
 
-    private void maybeFlush(boolean force) throws Exception {
+    private void maybeFlush() throws Exception {
         long timeout = Math.max(500L, eng.getPollIntervalMs() * 50L);
-        if (!force && System.currentTimeMillis() - lastFlushMs < timeout) return;
-        flushCommitted(force);
+        if (System.currentTimeMillis() - lastFlushMs < timeout) return;
+        flushCommitted(false);
     }
 
     private void flushCommitted(boolean force) throws Exception {
@@ -500,7 +555,11 @@ class RawMySqlReader {
             // 可能从已经过期的旧 binlog 开始。这里只保存最近完整 COMMIT，不越过源事务边界。
             if (committedPosition != null
                     && (force || System.currentTimeMillis() - lastFlushMs >= timeout)) {
-                offset.save(sourceName, committedPosition);
+                saveStandaloneOffset(committedPosition);
+                recordStage(SyncState.Stage.DECODE, decodeNanos);
+                decodeNanos = 0;
+                syncState.sourceReflectedThrough(committedMaxSourceTsMs);
+                committedMaxSourceTsMs = 0;
                 committedPosition = null;
                 lastFlushMs = System.currentTimeMillis();
             } else if (force) {
@@ -511,45 +570,80 @@ class RawMySqlReader {
         if (!force && committed.size() < eng.getMaxBatchSize()
                 && System.currentTimeMillis() - lastFlushMs < timeout) return;
 
-        List<PendingRow> batch = new ArrayList<>(committed);
+        List<PendingRow> batch = committed;
+        int rowCount = batch.size();
         RawMySqlOffset.Position position = committedPosition;
+        long maxSourceTsMs = committedMaxSourceTsMs;
         long t0 = System.currentTimeMillis();
-        WriteTiming timing = engine.withLock(conn -> writeBatch(conn, batch));
-        if (position != null) offset.save(sourceName, position);
+        DuckLakeEngine.LockedResult<WriteTiming> locked;
+        long offsetNanos = 0;
+        try {
+            locked = engine.withLockTimed(conn -> writeBatch(conn, batch));
+            if (position != null) {
+                long offsetStarted = System.nanoTime();
+                offset.save(sourceName, position);
+                offsetNanos = System.nanoTime() - offsetStarted;
+            }
+        } catch (Exception e) {
+            syncState.batchFailed();
+            throw e;
+        }
+        WriteTiming timing = locked.value();
         committed.clear();
         committedPosition = null;
+        committedMaxSourceTsMs = 0;
         long elapsed = System.currentTimeMillis() - t0;
         lastFlushMs = System.currentTimeMillis();
-        syncState.batchCommitted(batch.size(), System.currentTimeMillis(), 0,
+        syncState.batchCommitted(rowCount, maxSourceTsMs, deliverLag(t0, maxSourceTsMs),
                 timing.stageMs(), timing.lakeTxMs());
-        log.debug("RawMySQL 落湖 {} 行 {}ms offset={}:{}", batch.size(), elapsed,
+        recordBatchTiming(timing, locked.waitNanos(), offsetNanos);
+        decodeNanos = 0;
+        log.debug("RawMySQL 落湖 {} 行 {}ms offset={}:{}", rowCount, elapsed,
                 position == null ? "?" : position.filename(), position == null ? 0 : position.position());
     }
 
     private WriteTiming writeBatch(Connection conn, List<PendingRow> batch) throws SQLException {
         long stageStarted = System.nanoTime();
+        long planStarted = System.nanoTime();
         Map<String, List<PendingRow>> byTable = new LinkedHashMap<>();
         Map<String, TableInfo> tableInfo = new LinkedHashMap<>();
         for (PendingRow row : batch) {
-            String key = lakeTableName(row.table());
+            String key = row.table().lakeTable();
             byTable.computeIfAbsent(key, ignored -> new ArrayList<>()).add(row);
             tableInfo.putIfAbsent(key, row.table());
         }
+        long planNanos = System.nanoTime() - planStarted;
 
         int index = 0;
+        long stagingDdlNanos = 0;
+        long appenderNanos = 0;
         for (Map.Entry<String, List<PendingRow>> entry : byTable.entrySet()) {
-            stageRows(conn, tableInfo.get(entry.getKey()), entry.getValue(), index++);
+            StagingTiming timing = stageRows(conn, tableInfo.get(entry.getKey()), entry.getValue(), index++);
+            stagingDdlNanos += timing.ddlNanos();
+            appenderNanos += timing.appenderNanos();
         }
         long stageMs = (System.nanoTime() - stageStarted) / 1_000_000L;
         long lakeStarted = System.nanoTime();
         long lakeTxMs;
+        long ensureNanos = 0;
+        long mirrorDmlNanos = 0;
+        long lakeCommitNanos;
+        long cleanupNanos;
         conn.setAutoCommit(false);
         try {
             index = 0;
             for (Map.Entry<String, List<PendingRow>> entry : byTable.entrySet()) {
-                applyStaging(conn, tableInfo.get(entry.getKey()), index++);
+                TableInfo table = tableInfo.get(entry.getKey());
+                long ensureStarted = System.nanoTime();
+                ensureTable(conn, table.lakeTable(), table);
+                ensureNanos += System.nanoTime() - ensureStarted;
+                long mirrorStarted = System.nanoTime();
+                applyStaging(conn, table, index++);
+                mirrorDmlNanos += System.nanoTime() - mirrorStarted;
             }
+            long commitStarted = System.nanoTime();
             conn.commit();
+            lakeCommitNanos = System.nanoTime() - commitStarted;
             lakeTxMs = (System.nanoTime() - lakeStarted) / 1_000_000L;
         } catch (SQLException e) {
             conn.rollback();
@@ -557,20 +651,26 @@ class RawMySqlReader {
             sqlCache.clear();
             throw e;
         } finally {
+            long cleanupStarted = System.nanoTime();
             conn.setAutoCommit(true);
             dropStagings(conn, byTable.size());
+            cleanupNanos = System.nanoTime() - cleanupStarted;
         }
-        return new WriteTiming(stageMs, lakeTxMs);
+        return new WriteTiming(stageMs, lakeTxMs, planNanos, ensureNanos, stagingDdlNanos,
+                appenderNanos, mirrorDmlNanos, lakeCommitNanos, cleanupNanos);
     }
 
-    private void stageRows(Connection conn, TableInfo table, List<PendingRow> rows, int index)
+    private StagingTiming stageRows(Connection conn, TableInfo table, List<PendingRow> rows, int index)
             throws SQLException {
         TableSqlParts parts = sqlCache.computeIfAbsent(table, this::buildSqlParts);
         String name = "stg_raw_mysql_" + index;
+        long ddlStarted = System.nanoTime();
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE OR REPLACE TABLE " + DuckLakeEngine.MEM + ".main." + name
                     + " (" + parts.stageCols() + ")");
         }
+        long ddlNanos = System.nanoTime() - ddlStarted;
+        long appenderStarted = System.nanoTime();
         DuckDBConnection duck = conn.unwrap(DuckDBConnection.class);
         try (DuckDBAppender appender = duck.createAppender(DuckLakeEngine.MEM, "main", name)) {
             long seq = 0;
@@ -579,16 +679,16 @@ class RawMySqlReader {
                 for (String value : row.values()) {
                     if (value == null) appender.appendNull(); else appender.append(value);
                 }
-                appender.append(row.deleted() ? "true" : "false");
+                appender.append(Boolean.toString(row.deleted()));
                 appender.append(seq++);
                 appender.endRow();
             }
         }
+        return new StagingTiming(ddlNanos, System.nanoTime() - appenderStarted);
     }
 
     private void applyStaging(Connection conn, TableInfo table, int index) throws SQLException {
-        String lakeTable = lakeTableName(table);
-        ensureTable(conn, lakeTable, table);
+        String lakeTable = table.lakeTable();
         TableSqlParts parts = sqlCache.computeIfAbsent(table, this::buildSqlParts);
         String staging = DuckLakeEngine.MEM + ".main.stg_raw_mysql_" + index;
         String lake = DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable);
@@ -608,7 +708,7 @@ class RawMySqlReader {
             s.execute("INSERT INTO " + lake + " (" + parts.cols() + ") SELECT " + parts.projection()
                     + " FROM (SELECT * FROM " + staging
                     + " QUALIFY row_number() OVER (PARTITION BY " + parts.partition()
-                    + " ORDER BY \"__seq\" DESC) = 1)"
+                    + " ORDER BY \"__seq\" DESC) = 1) latest"
                     + " WHERE COALESCE(\"__deleted\", 'false') <> 'true'");
         }
     }
@@ -704,7 +804,7 @@ class RawMySqlReader {
         return out;
     }
 
-    private void applyDdl(String database, String ddl) throws SQLException {
+    private void applyDdl(String database, String ddl, long sourceTsMs) throws SQLException {
         long t0 = System.currentTimeMillis();
         engine.withLock(conn -> {
             conn.setAutoCommit(false);
@@ -721,19 +821,23 @@ class RawMySqlReader {
             }
             return null;
         });
-        syncState.batchCommitted(0, System.currentTimeMillis(), 0,
+        syncState.batchCommitted(0, sourceTsMs, deliverLag(t0, sourceTsMs),
                 0, System.currentTimeMillis() - t0);
     }
 
     private void invalidate(String lakeTable) {
-        if (lakeTable.endsWith(".*")) {
-            String prefix = lakeTable.substring(0, lakeTable.length() - 1);
-            knownColumns.keySet().removeIf(k -> k.startsWith(prefix));
-            sqlCache.keySet().removeIf(t -> lakeTableName(t).startsWith(prefix));
-        } else {
-            knownColumns.remove(lakeTable);
-            sqlCache.keySet().removeIf(t -> lakeTableName(t).equals(lakeTable));
-        }
+        boolean wildcard = lakeTable.endsWith(".*");
+        String target = wildcard ? lakeTable.substring(0, lakeTable.length() - 1) : lakeTable;
+        knownColumns.keySet().removeIf(name -> matchesLakeTable(name, target, wildcard));
+        noKeyWarned.removeIf(name -> matchesLakeTable(name, target, wildcard));
+        sqlCache.keySet().removeIf(table -> matchesLakeTable(table.lakeTable(), target, wildcard));
+        tables.entrySet().removeIf(entry -> matchesLakeTable(entry.getValue().lakeTable(), target, wildcard));
+        tableDefinitions.entrySet().removeIf(entry ->
+                matchesLakeTable(entry.getValue().table().lakeTable(), target, wildcard));
+    }
+
+    private static boolean matchesLakeTable(String candidate, String target, boolean wildcard) {
+        return wildcard ? candidate.startsWith(target) : candidate.equals(target);
     }
 
     private void dropStagings(Connection conn, int count) {
@@ -744,6 +848,38 @@ class RawMySqlReader {
         } catch (SQLException e) {
             log.debug("RawMySQL staging 清理失败（下批覆盖）: {}", e.getMessage());
         }
+    }
+
+    private void recordBatchTiming(WriteTiming timing, long lockWaitNanos, long offsetNanos) {
+        recordStage(SyncState.Stage.DECODE, decodeNanos);
+        recordStage(SyncState.Stage.PLAN, timing.planNanos());
+        recordStage(SyncState.Stage.LOCK_WAIT, lockWaitNanos);
+        recordStage(SyncState.Stage.ENSURE, timing.ensureNanos());
+        recordStage(SyncState.Stage.STAGING_DDL, timing.stagingDdlNanos());
+        recordStage(SyncState.Stage.APPENDER, timing.appenderNanos());
+        recordStage(SyncState.Stage.MIRROR_DML, timing.mirrorDmlNanos());
+        recordStage(SyncState.Stage.LAKE_COMMIT, timing.lakeCommitNanos());
+        recordStage(SyncState.Stage.CLEANUP, timing.cleanupNanos());
+        recordStage(SyncState.Stage.OFFSET_ACK, offsetNanos);
+    }
+
+    private void recordStage(SyncState.Stage stage, long nanos) {
+        syncState.recordStage(SyncState.Reader.MYSQL, stage, nanos);
+    }
+
+    private void saveStandaloneOffset(RawMySqlOffset.Position position) {
+        long started = System.nanoTime();
+        try {
+            offset.save(sourceName, position);
+        } catch (RuntimeException e) {
+            syncState.batchFailed();
+            throw e;
+        }
+        recordStage(SyncState.Stage.OFFSET_ACK, System.nanoTime() - started);
+    }
+
+    private static long deliverLag(long deliveredAtMs, long sourceTsMs) {
+        return sourceTsMs <= 0 ? 0 : Math.max(0, deliveredAtMs - sourceTsMs);
     }
 
     // ───────────────────────── source contract / helpers ─────────────────────────
@@ -888,7 +1024,7 @@ class RawMySqlReader {
         };
     }
 
-    private String lakeTableName(TableInfo table) {
-        return props.getMaintenance().getSchemaPrefix() + table.database() + "." + table.table();
+    private String lakeTableName(String database, String table) {
+        return props.getMaintenance().getSchemaPrefix() + database + "." + table;
     }
 }

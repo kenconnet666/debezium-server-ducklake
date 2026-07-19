@@ -89,11 +89,12 @@ class MySqlIntegrationTest {
                         updated timestamp(6) NULL DEFAULT CURRENT_TIMESTAMP(6),
                         payload json NULL,
                         tier enum('gold','silver') DEFAULT 'silver',
+                        labels set('red','blue','green') DEFAULT '',
                         big_u bigint unsigned NULL)""");
-            s.execute("INSERT INTO shop.cdc_test (name, amount, flag, payload, tier, big_u) VALUES "
-                    + "('alpha', 10.50, true, '{\"k\": 1}', 'gold', 18446744073709551615), "
-                    + "('beta', 20.00, false, NULL, 'silver', NULL), "
-                    + "('gamma', 99.99, true, '{\"k\": 3}', 'silver', 42)");
+            s.execute("INSERT INTO shop.cdc_test (name, amount, flag, payload, tier, labels, big_u) VALUES "
+                    + "('alpha', 10.50, true, '{\"k\": 1}', 'gold', 'red,green', 18446744073709551615), "
+                    + "('beta', 20.00, false, NULL, 'silver', 'blue', NULL), "
+                    + "('gamma', 99.99, true, '{\"k\": 3}', 'silver', '', 42)");
             // 存量空表:无任何数据事件,湖表应由快照期 schema change(历史 CREATE)直接建出
             s.execute("CREATE TABLE shop.empty_seed (id bigint PRIMARY KEY, note varchar(64) COMMENT '备注') COMMENT='存量空表'");
             // 兼容旧部署的过滤表：用于验证零捕获行事务仍推进持久化 binlog offset。
@@ -158,6 +159,7 @@ class MySqlIntegrationTest {
         assertThat(engine.queryScalar(
                 "SELECT (payload->>'k')::INT FROM shop.cdc_test WHERE name='alpha'", Integer.class)).isEqualTo(1);
         assertThat(lakeColumnType("tier")).isEqualTo("VARCHAR"); // ENUM→VARCHAR
+        assertThat(lakeColumnType("labels")).isEqualTo("VARCHAR"); // SET→VARCHAR
         // BIGINT UNSIGNED → UBIGINT 原生映射(快照路径:uint64 最大值无损)
         assertThat(lakeColumnType("big_u")).isEqualTo("UBIGINT");
         assertThat(engine.queryScalar(
@@ -166,6 +168,8 @@ class MySqlIntegrationTest {
         // 值正确性抽查
         assertThat(engine.queryScalar(
                 "SELECT tier FROM shop.cdc_test WHERE name='alpha'", String.class)).isEqualTo("gold");
+        assertThat(engine.queryScalar(
+                "SELECT labels FROM shop.cdc_test WHERE name='alpha'", String.class)).isEqualTo("red,green");
         assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test WHERE flag")).isEqualTo(2L);
 
         // 流式路径:binlog 原始 long 位形态的无符号还原(uint64 高位值)
@@ -176,6 +180,17 @@ class MySqlIntegrationTest {
                 assertThat(engine.queryScalar(
                         "SELECT big_u::VARCHAR FROM shop.cdc_test WHERE name='ubig_live'", String.class))
                         .isEqualTo("18446744073709551614"));
+
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("INSERT INTO shop.cdc_test (name, amount, tier, labels) "
+                    + "VALUES ('enum_set_live', 2.00, 'gold', 'red,blue')");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(250)).untilAsserted(() -> {
+            assertThat(engine.queryScalar(
+                    "SELECT tier FROM shop.cdc_test WHERE name='enum_set_live'", String.class)).isEqualTo("gold");
+            assertThat(engine.queryScalar(
+                    "SELECT labels FROM shop.cdc_test WHERE name='enum_set_live'", String.class)).isEqualTo("red,blue");
+        });
     }
 
     @Test
@@ -490,6 +505,24 @@ class MySqlIntegrationTest {
             assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test WHERE name='replay_once'")).isEqualTo(1L);
             assertThat(rawOffset().gtidSet()).isEqualTo(committed.gtidSet());
             assertThat(syncState.getEngineRunning().get()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    @Order(16)
+    void binlogRotateRebindsTableIdsWithoutLosingTypeMetadata() throws Exception {
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("FLUSH BINARY LOGS");
+            s.execute("INSERT INTO shop.cdc_test (name, price, tier, labels, hits) "
+                    + "VALUES ('after_rotate', 7.77, 'gold', 'blue,green', 5000000000)");
+        }
+
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(250)).untilAsserted(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test "
+                    + "WHERE name='after_rotate' AND price=7.77 AND hits=5000000000")).isEqualTo(1L);
+            assertThat(engine.queryScalar(
+                    "SELECT labels FROM shop.cdc_test WHERE name='after_rotate'", String.class))
+                    .isEqualTo("blue,green");
         });
     }
 

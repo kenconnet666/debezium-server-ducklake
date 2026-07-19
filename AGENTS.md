@@ -2,7 +2,8 @@
 
 ## Project profile
 
-- Java 25 and Debezium 3.6 embedded engine.
+- Java 25 and Spring Boot 4.1. PostgreSQL uses pgjdbc pgoutput; MySQL uses Debezium's
+  low-level binlog protocol client. The runtime does not use Debezium Engine or Kafka Connect.
 - Use the Maven Wrapper: `./mvnw.cmd` on Windows or `./mvnw` in Bash. A global `mvn` executable is not required.
 - Unit tests use in-memory DuckDB and do not need Docker.
 - Integration tests use Testcontainers for PostgreSQL/MySQL and require the Docker Desktop Linux engine.

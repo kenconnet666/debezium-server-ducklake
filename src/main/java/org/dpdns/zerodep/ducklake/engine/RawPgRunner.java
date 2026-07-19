@@ -34,6 +34,7 @@ public class RawPgRunner implements SmartLifecycle {
 
     private ExecutorService executor;
     private RawPgReader reader;
+    private RawPgOffset offset;
     private volatile boolean running = false;
 
     @Override
@@ -45,13 +46,20 @@ public class RawPgRunner implements SmartLifecycle {
         DucklakeProperties.Lake lake = props.getLake();
         String catalogUrl = "jdbc:postgresql://%s:%d/%s"
                 .formatted(lake.getCatalogHost(), lake.getCatalogPort(), lake.getCatalogDb());
-        RawPgOffset offset = new RawPgOffset(catalogUrl, lake.getCatalogUser(), lake.getCatalogPassword());
+        offset = new RawPgOffset(catalogUrl, lake.getCatalogUser(), lake.getCatalogPassword());
 
-        // 评估首次接入的存量 scanner 化（首次 lsn=0 或崩溃续跑有 pending 行时接管）
-        long startLsn = offset.load(src.getSlotName());
-        bootstrap.evaluateForRawPg(startLsn);
+        long startLsn;
+        try {
+            // 评估首次接入的存量 scanner 化（首次 lsn=0 或崩溃续跑有 pending 行时接管）
+            startLsn = offset.load(src.getSlotName());
+            bootstrap.evaluateForRawPg(startLsn);
+        } catch (RuntimeException | Error e) {
+            closeOffset();
+            throw e;
+        }
 
-        reader = new RawPgReader(props, engine, ddlApplier, syncState, offset);
+        RawPgReader activeReader = new RawPgReader(props, engine, ddlApplier, syncState, offset);
+        reader = activeReader;
         long preparedStartLsn = startLsn;
 
         // running=true 在 executor 启动前设置，防止线程启动后立即报错时 if(running) 误判
@@ -62,19 +70,24 @@ public class RawPgRunner implements SmartLifecycle {
             try {
                 // 必须先建立 slot/replication stream，再允许 scanner 读取源快照；否则两者之间
                 // 提交的变更既不在快照里，也可能早于 slot 起点，形成不可恢复的首启缺口。
-                reader.run(preparedStartLsn, bootstrap::runAsync);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                log.info("RawPgReader 已停止（interrupted）");
-            } catch (Exception e) {
+                activeReader.run(preparedStartLsn, bootstrap::runAsync);
+                if (running && !activeReader.isStopped()) {
+                    throw new IllegalStateException("pgoutput replication stream 非预期退出");
+                }
+            } catch (Throwable e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
                 syncState.getEngineRunning().set(0);
-                if (running && !reader.isStopped()) {
+                if (running && !activeReader.isStopped()) {
                     log.error("RawPgReader 致命退出，进程自杀交给容器重启: {}", e.getMessage(), e);
                     // 短暂等待：给 Spring stop() 有机会先到（测试场景容器先停导致的误触）
                     Thread.ofPlatform().name("raw-pg-fatal-exit").start(() -> {
                         try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-                        if (!reader.isStopped()) System.exit(1);
+                        if (!activeReader.isStopped()) System.exit(1);
                     });
+                } else if (e instanceof InterruptedException) {
+                    log.info("RawPgReader 已停止（interrupted）");
                 }
             }
         });
@@ -91,16 +104,26 @@ public class RawPgRunner implements SmartLifecycle {
         if (executor != null) {
             executor.shutdownNow();
             try {
-                executor.awaitTermination(15, TimeUnit.SECONDS);
+                if (!executor.awaitTermination(15, TimeUnit.SECONDS)) {
+                    log.warn("RawPgReader 停止超时，线程仍未退出");
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
+        closeOffset();
         syncState.getEngineRunning().set(0);
     }
 
     @Override
     public boolean isRunning() {
         return running;
+    }
+
+    private void closeOffset() {
+        if (offset != null) {
+            offset.close();
+            offset = null;
+        }
     }
 }

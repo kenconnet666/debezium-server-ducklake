@@ -13,9 +13,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
-import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -49,7 +49,7 @@ import static org.awaitility.Awaitility.await;
 class RawPgIntegrationTest {
 
     @Container
-    static final PostgreSQLContainer<?> PG = new PostgreSQLContainer<>("postgres:18-alpine")
+    static final PostgreSQLContainer PG = new PostgreSQLContainer("postgres:18-alpine")
             .withDatabaseName("postgres").withUsername("postgres").withPassword("test")
             .withCommand("postgres", "-c", "wal_level=logical");
 
@@ -324,6 +324,22 @@ class RawPgIntegrationTest {
             assertThat(lakeCount("SELECT count(*) FROM public.toast_probe WHERE id=9001")).isZero();
             assertThat(lakeCount("SELECT length(payload) FROM public.toast_probe WHERE id=9002 AND marker=4"))
                     .isEqualTo(320000L);
+        });
+
+        exec("INSERT INTO toast_probe SELECT g, repeat(md5(g::text), 10000), 0 "
+                + "FROM generate_series(9100, 9107) g");
+        await30s(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM public.toast_probe WHERE id BETWEEN 9100 AND 9107"))
+                    .isEqualTo(8L);
+            assertThat(lakeCount("SELECT count(*) FROM public.toast_probe "
+                    + "WHERE id BETWEEN 9100 AND 9107 AND length(payload)=320000")).isEqualTo(8L);
+        });
+        exec("UPDATE toast_probe SET marker=5 WHERE id BETWEEN 9100 AND 9107");
+        await30s(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM public.toast_probe "
+                    + "WHERE id BETWEEN 9100 AND 9107 AND marker=5")).isEqualTo(8L);
+            assertThat(lakeCount("SELECT count(*) FROM public.toast_probe "
+                    + "WHERE id BETWEEN 9100 AND 9107 AND length(payload)=320000")).isEqualTo(8L);
         });
     }
 

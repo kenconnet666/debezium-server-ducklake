@@ -44,10 +44,10 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          mvn -B versions:set -DnewVersion="$VERSION" -DgenerateBackupPoms=false
+          bash ./mvnw -B versions:set -DnewVersion="$VERSION" -DgenerateBackupPoms=false
 
       - name: Build (with tests)
-        run: mvn -B verify
+        run: bash ./mvnw -B verify
 
       - name: Create GitHub Release with jar
         uses: softprops/action-gh-release@v2

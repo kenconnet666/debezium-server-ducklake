@@ -4,7 +4,7 @@
 #      docker compose -f .docker/postgres/docker-compose.yml up -d        # 只起 源库/catalog/S3
 #      然后 IDEA 以 dev profile Run(端口/口令见 src/main/resources/dev/ducklake.yml)
 #   ── B. 全栈 e2e / 类生产:app 也进容器 ──
-#      mvn package -DskipTests
+#      .\mvnw.cmd package -DskipTests
 #      docker compose -f .docker/postgres/docker-compose.yml --profile app up -d --build
 #      查 watermark: curl http://127.0.0.1:19992/api/ducklake/watermark
 # CDC 基建（复制角色/publication/DDL 审计表）由 initdb 自动完成，up 即可用。
@@ -151,8 +151,8 @@ services:
         limits:
           memory: 3072M
     volumes:
-      # DuckDB 扩展缓存(首启 INSTALL ducklake/postgres/httpfs 需外网,持久化后重启秒加载)
-      - ./ducklake/data/duckdb-ext:/root/.duckdb
+      # named volume 会继承镜像内 uid=10001，首启 INSTALL 后可由非 root 应用持续复用。
+      - ducklake-ext:/home/ducklake/.duckdb
 
   # ── 方案B 分片实例模板（取消注释并按需调整）──
   # 场景：多 schema 横向分片，聚合吞吐随实例数近线性（harness 实测 2slot 聚合 ~170k，完美 2×）。
@@ -201,4 +201,8 @@ services:
   #       limits:
   #         memory: 3072M
   #   volumes:
-  #     - ./ducklake-b/data/duckdb-ext:/root/.duckdb
+  #     - ducklake-b-ext:/home/ducklake/.duckdb
+
+volumes:
+  ducklake-ext:
+  ducklake-b-ext:

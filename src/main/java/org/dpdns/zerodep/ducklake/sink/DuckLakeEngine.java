@@ -303,6 +303,18 @@ public class DuckLakeEngine {
         }
     }
 
+    /** 与 {@link #withLock(LakeAction)} 相同，但把公平锁等待时间返回给 CDC 分层指标。 */
+    public <T> LockedResult<T> withLockTimed(LakeAction<T> action) throws SQLException {
+        long started = System.nanoTime();
+        lock.lock();
+        long waitNanos = System.nanoTime() - started;
+        try {
+            return new LockedResult<>(action.run(worker), waitNanos);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** 便捷执行（维护类单条 SQL） */
     public void execute(String sql) throws SQLException {
         withLock(conn -> {
@@ -345,5 +357,8 @@ public class DuckLakeEngine {
     @FunctionalInterface
     public interface LakeAction<T> {
         T run(Connection conn) throws SQLException;
+    }
+
+    public record LockedResult<T>(T value, long waitNanos) {
     }
 }

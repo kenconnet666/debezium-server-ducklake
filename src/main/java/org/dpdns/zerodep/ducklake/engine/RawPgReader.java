@@ -12,6 +12,7 @@ import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.replication.PGReplicationStream;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -42,6 +43,8 @@ import java.util.Set;
 @Slf4j
 class RawPgReader {
 
+    private static final long PG_EPOCH_MILLIS = 946_684_800_000L;
+
     private final DucklakeProperties props;
     private final DuckLakeEngine engine;
     private final DdlApplier ddlApplier;
@@ -67,8 +70,13 @@ class RawPgReader {
     private enum RowOp { INSERT, UPDATE, DELETE }
     private record TupleData(String[] values, boolean[] unchanged) {
         boolean hasUnchanged() {
+            if (unchanged == null) return false;
             for (boolean value : unchanged) if (value) return true;
             return false;
+        }
+
+        boolean isUnchanged(int index) {
+            return unchanged != null && unchanged[index];
         }
     }
     /** 事件携带解码时的 Relation、旧/新 tuple 与 unchanged-TOAST 快照。 */
@@ -89,17 +97,25 @@ class RawPgReader {
     }
     private record PendingTruncate(RelInfo rel) implements PendingEvent {}
     private enum SegmentKind { DATA, PATCH, DDL, TRUNCATE }
-    private record Segment(SegmentKind kind, RelInfo rel, List<PendingRow> rows) {}
+    private record Segment(SegmentKind kind, RelInfo rel, List<PendingRow> rows,
+                           Set<List<String>> patchKeys) {}
+    private record StagingTiming(long ddlNanos, long appenderNanos) {}
+    private record WriteTiming(long stageMs, long lakeTxMs, long planNanos, long ensureNanos,
+                               long stagingDdlNanos, long appenderNanos, long mirrorDmlNanos,
+                               long lakeCommitNanos, long cleanupNanos) {}
     private final List<PendingEvent> pending = new ArrayList<>();
     /** 最近一个 Commit 消息的 end LSN（向 PG 确认后 slot 才推进） */
     private long batchEndLsn = 0;
     /** 已同步写入 catalog offset 且反馈给 slot 的 LSN，避免空闲期重复写 offset。 */
     private long persistedLsn = 0;
+    /** 当前待刷批中最大的源事务提交时刻（epoch ms）。 */
+    private long batchMaxSourceTsMs;
     /** pgoutput Begin/Commit 边界；未见 Commit 时绝不把半个源事务暴露到湖。 */
     private boolean inTransaction = false;
     /** DDL/TRUNCATE 事务在 Commit 立即刷出，阻断后续 Relation 自愈越过 schema 边界。 */
     private boolean flushAtCommit = false;
     private long lastFlushMs = System.currentTimeMillis();
+    private long decodeNanos;
 
     /** 湖表已知列缓存（避免每批 DESCRIBE） */
     private final Map<String, Map<String, String>> knownColumns = new HashMap<>();
@@ -172,20 +188,40 @@ class RawPgReader {
     private void handleMessage(ByteBuffer msg, PGReplicationStream stream) throws Exception {
         byte type = msg.get();
         switch (type) {
-            case 'R' -> parseRelation(msg);
+            case 'R' -> {
+                long started = System.nanoTime();
+                parseRelation(msg);
+                decodeNanos += System.nanoTime() - started;
+            }
             case 'B' -> {
                 inTransaction = true; // payload 无需解析，边界必须记录
                 flushAtCommit = false;
             }
-            case 'I' -> parseInsert(msg);
-            case 'U' -> parseUpdate(msg);
-            case 'D' -> parseDelete(msg);
-            case 'T' -> parseTruncate(msg);
+            case 'I' -> {
+                long started = System.nanoTime();
+                parseInsert(msg);
+                decodeNanos += System.nanoTime() - started;
+            }
+            case 'U' -> {
+                long started = System.nanoTime();
+                parseUpdate(msg);
+                decodeNanos += System.nanoTime() - started;
+            }
+            case 'D' -> {
+                long started = System.nanoTime();
+                parseDelete(msg);
+                decodeNanos += System.nanoTime() - started;
+            }
+            case 'T' -> {
+                long started = System.nanoTime();
+                parseTruncate(msg);
+                decodeNanos += System.nanoTime() - started;
+            }
             case 'C' -> {
                 msg.get();        // flags (unused)
                 msg.getLong();    // commit lsn
                 batchEndLsn = msg.getLong(); // end lsn = slot 确认位点
-                msg.getLong();    // commit timestamp
+                batchMaxSourceTsMs = Math.max(batchMaxSourceTsMs, pgTimestampMs(msg.getLong()));
                 inTransaction = false;
                 maybeFlush(stream, flushAtCommit || pending.size() >= eng.getMaxBatchSize());
                 flushAtCommit = false;
@@ -195,7 +231,7 @@ class RawPgReader {
     }
     // ──────────── pgoutput 消息解析 ────────────
 
-    private void parseRelation(ByteBuffer msg) throws SQLException {
+    private void parseRelation(ByteBuffer msg) {
         int oid = msg.getInt();
         String schema = readCStr(msg);
         String table  = readCStr(msg);
@@ -287,7 +323,18 @@ class RawPgReader {
         if (pending.isEmpty()) {
             // 即使事务全部被过滤，也要先持久化 offset 再反馈 PG，防 slot WAL 扣留。
             if (!inTransaction && Long.compareUnsigned(batchEndLsn, persistedLsn) > 0 && timeout) {
-                persistAndAck(stream, batchEndLsn);
+                long offsetStarted = System.nanoTime();
+                try {
+                    persistAndAck(stream, batchEndLsn);
+                } catch (Exception e) {
+                    syncState.batchFailed();
+                    throw e;
+                }
+                recordStage(SyncState.Stage.OFFSET_ACK, System.nanoTime() - offsetStarted);
+                recordStage(SyncState.Stage.DECODE, decodeNanos);
+                decodeNanos = 0;
+                syncState.sourceReflectedThrough(batchMaxSourceTsMs);
+                batchMaxSourceTsMs = 0;
                 lastFlushMs = now;
             }
             return;
@@ -297,20 +344,34 @@ class RawPgReader {
         if (!force && !timeout) return;
 
         long flushLsn = batchEndLsn;
-        List<PendingEvent> batch = new ArrayList<>(pending);
+        long maxSourceTsMs = batchMaxSourceTsMs;
+        List<PendingEvent> batch = pending;
+        int eventCount = batch.size();
         long t0 = System.currentTimeMillis();
 
-        engine.withLock(conn -> {
-            writeBatch(conn, batch);
-            return null;
-        });
-
-        if (flushLsn > 0) persistAndAck(stream, flushLsn);
+        DuckLakeEngine.LockedResult<WriteTiming> locked;
+        long offsetNanos = 0;
+        try {
+            locked = engine.withLockTimed(conn -> writeBatch(conn, batch));
+            if (flushLsn > 0) {
+                long offsetStarted = System.nanoTime();
+                persistAndAck(stream, flushLsn);
+                offsetNanos = System.nanoTime() - offsetStarted;
+            }
+        } catch (Exception e) {
+            syncState.batchFailed();
+            throw e;
+        }
+        WriteTiming timing = locked.value();
         pending.clear();
+        batchMaxSourceTsMs = 0;
         long elapsed = System.currentTimeMillis() - t0;
         lastFlushMs = System.currentTimeMillis();
-        syncState.batchCommitted(batch.size(), System.currentTimeMillis(), 0, elapsed, 0);
-        log.debug("RawPg 落湖 {} 行 {}ms lsn=0x{}", batch.size(), elapsed, Long.toHexString(flushLsn));
+        syncState.batchCommitted(eventCount, maxSourceTsMs, deliverLag(t0, maxSourceTsMs),
+                timing.stageMs(), timing.lakeTxMs());
+        recordBatchTiming(timing, locked.waitNanos(), offsetNanos);
+        decodeNanos = 0;
+        log.debug("RawPg 落湖 {} 行 {}ms lsn=0x{}", eventCount, elapsed, Long.toHexString(flushLsn));
     }
 
     private void ackLsn(PGReplicationStream stream, long lsn) throws SQLException {
@@ -328,32 +389,50 @@ class RawPgReader {
     }
 
     /** 两阶段写：staging（湖事务外）→ DELETE+INSERT（单湖事务）。 */
-    private void writeBatch(Connection conn, List<PendingEvent> batch) throws SQLException {
+    private WriteTiming writeBatch(Connection conn, List<PendingEvent> batch) throws SQLException {
+        long stageStarted = System.nanoTime();
+        long planStarted = System.nanoTime();
         List<Segment> segments = segmentsOf(batch);
+        long planNanos = System.nanoTime() - planStarted;
         int[] stagingIndexes = new int[segments.size()];
         Arrays.fill(stagingIndexes, -1);
 
         // 阶段一：staging（湖事务外）
         int stagingCount = 0;
+        long ensureNanos = 0;
+        long stagingDdlNanos = 0;
+        long appenderNanos = 0;
         for (int i = 0; i < segments.size(); i++) {
             Segment segment = segments.get(i);
             if (segment.kind() == SegmentKind.DATA || segment.kind() == SegmentKind.PATCH) {
                 RelInfo rel = segment.rel();
                 // Relation 已携带当前目标类型。先在湖事务外完成建表/加列/类型迁移，避免失败的
                 // ALTER 使后续 DELETE+INSERT 事务进入 aborted 状态。
+                long ensureStarted = System.nanoTime();
                 ensureTable(conn, lakeTableName(rel), rel);
+                ensureNanos += System.nanoTime() - ensureStarted;
                 stagingIndexes[i] = stagingCount;
+                StagingTiming timing;
                 if (segment.kind() == SegmentKind.PATCH) {
-                    stagePatch(conn, rel, segment.rows().getFirst(), stagingCount++);
+                    timing = stagePatch(conn, rel, segment.rows(), stagingCount++);
                 } else {
-                    stageRows(conn, rel, segment.rows(), stagingCount++);
+                    timing = stageRows(conn, rel, segment.rows(), stagingCount++);
                 }
+                stagingDdlNanos += timing.ddlNanos();
+                appenderNanos += timing.appenderNanos();
             }
         }
+        long stageMs = (System.nanoTime() - stageStarted) / 1_000_000L;
 
         // 阶段二：单湖事务，按源事件段顺序执行 DDL / DML / TRUNCATE。
+        long lakeStarted = System.nanoTime();
+        long lakeTxMs;
+        long mirrorDmlNanos;
+        long lakeCommitNanos;
+        long cleanupNanos;
         conn.setAutoCommit(false);
         try {
+            long mirrorStarted = System.nanoTime();
             List<Map<String, String>> ddlRows = new ArrayList<>();
             for (int i = 0; i < segments.size(); i++) {
                 Segment segment = segments.get(i);
@@ -368,47 +447,94 @@ class RawPgReader {
                 applyDdlRows(conn, ddlRows);
                 switch (segment.kind()) {
                     case DATA -> applyStaging(conn, rel, stagingIndexes[i]);
-                    case PATCH -> applyPatch(conn, rel, segment.rows().getFirst(), stagingIndexes[i]);
+                    case PATCH -> applyPatch(conn, rel, segment.rows(), stagingIndexes[i]);
                     case TRUNCATE -> ddlApplier.applyRawPgTruncate(conn, lakeTableName(rel));
                     case DDL -> throw new IllegalStateException("DDL 段不应进入执行分支");
                 }
             }
             applyDdlRows(conn, ddlRows);
+            mirrorDmlNanos = System.nanoTime() - mirrorStarted;
+            long commitStarted = System.nanoTime();
             conn.commit();
+            lakeCommitNanos = System.nanoTime() - commitStarted;
+            lakeTxMs = (System.nanoTime() - lakeStarted) / 1_000_000L;
         } catch (SQLException | RuntimeException ex) {
             conn.rollback();
             knownColumns.clear();
             sqlCache.clear();   // schema 可能已变，整批 SQL 缓存全部失效
             throw ex;
         } finally {
+            long cleanupStarted = System.nanoTime();
             conn.setAutoCommit(true);
             dropStagings(conn, stagingCount);
+            cleanupNanos = System.nanoTime() - cleanupStarted;
         }
+        return new WriteTiming(stageMs, lakeTxMs, planNanos, ensureNanos, stagingDdlNanos,
+                appenderNanos, mirrorDmlNanos, lakeCommitNanos, cleanupNanos);
     }
 
-    /** 连续同表同行事件合并成一段；跨表、DDL、TRUNCATE 边界保持原始顺序。 */
+    /** 保持源顺序分段；可证明互不依赖的 unchanged-TOAST 更新才合并。 */
     private List<Segment> segmentsOf(List<PendingEvent> batch) {
         List<Segment> segments = new ArrayList<>();
         for (PendingEvent event : batch) {
             RelInfo rel = event.rel();
             if (event instanceof PendingTruncate) {
-                segments.add(new Segment(SegmentKind.TRUNCATE, rel, List.of()));
+                segments.add(new Segment(SegmentKind.TRUNCATE, rel, List.of(), null));
                 continue;
             }
             PendingRow row = (PendingRow) event;
             SegmentKind kind = ddlAuditTables.contains(rel.table().toLowerCase(Locale.ROOT))
                     ? SegmentKind.DDL : row.requiresPatch() ? SegmentKind.PATCH : SegmentKind.DATA;
             Segment last = segments.isEmpty() ? null : segments.getLast();
-            // PATCH 必须逐事件执行：后一条的 unchanged TOAST 要读取前一条已更新后的湖值。
+            if (kind == SegmentKind.PATCH && last != null && last.kind() == kind
+                    && last.rel().equals(rel) && appendPatch(last, row)) {
+                continue;
+            }
             if (kind != SegmentKind.PATCH && last != null && last.kind() == kind && last.rel().equals(rel)) {
                 last.rows().add(row);
             } else {
                 List<PendingRow> rows = new ArrayList<>();
                 rows.add(row);
-                segments.add(new Segment(kind, rel, rows));
+                Set<List<String>> patchKeys = null;
+                if (kind == SegmentKind.PATCH && batchablePatch(row)) {
+                    patchKeys = new HashSet<>();
+                    patchKeys.add(patchKey(row));
+                }
+                segments.add(new Segment(kind, rel, rows, patchKeys));
             }
         }
         return segments;
+    }
+
+    private static boolean appendPatch(Segment segment, PendingRow row) {
+        if (segment.patchKeys() == null || !batchablePatch(row)) return false;
+        PendingRow first = segment.rows().getFirst();
+        if (!Arrays.equals(first.newTuple().unchanged(), row.newTuple().unchanged())) return false;
+        if (!segment.patchKeys().add(patchKey(row))) return false;
+        segment.rows().add(row);
+        return true;
+    }
+
+    /** 主键不变、mask 相同且 key 唯一时，各目标行之间没有读后写依赖。 */
+    private static boolean batchablePatch(PendingRow row) {
+        if (!row.newTuple().hasUnchanged()) return false;
+        TupleData oldTuple = row.oldTuple() == null ? row.newTuple() : row.oldTuple();
+        boolean hasKey = false;
+        for (int i = 0; i < row.rel().cols().size(); i++) {
+            if (!row.rel().cols().get(i).isKey()) continue;
+            hasKey = true;
+            if (!Objects.equals(oldTuple.values()[i], row.newTuple().values()[i])) return false;
+        }
+        return hasKey;
+    }
+
+    private static List<String> patchKey(PendingRow row) {
+        TupleData oldTuple = row.oldTuple() == null ? row.newTuple() : row.oldTuple();
+        List<String> values = new ArrayList<>();
+        for (int i = 0; i < row.rel().cols().size(); i++) {
+            if (row.rel().cols().get(i).isKey()) values.add(oldTuple.values()[i]);
+        }
+        return values;
     }
 
     private void applyDdlRows(Connection conn, List<Map<String, String>> ddlRows) throws SQLException {
@@ -426,12 +552,16 @@ class RawPgReader {
     }
     // ──────────── Staging + Lake 写入原语 ────────────
 
-    private void stageRows(Connection conn, RelInfo rel, List<PendingRow> rows, int idx) throws SQLException {
+    private StagingTiming stageRows(Connection conn, RelInfo rel, List<PendingRow> rows, int idx)
+            throws SQLException {
         TableSqlParts parts = sqlCache.computeIfAbsent(rel, this::buildSqlParts);
         String stgName = DuckLakeEngine.MEM + ".main.stg_raw_" + idx;
+        long ddlStarted = System.nanoTime();
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE OR REPLACE TABLE " + stgName + " (" + parts.stageCols() + ")");
         }
+        long ddlNanos = System.nanoTime() - ddlStarted;
+        long appenderStarted = System.nanoTime();
         DuckDBConnection dc = conn.unwrap(DuckDBConnection.class);
         try (DuckDBAppender ap = dc.createAppender(DuckLakeEngine.MEM, "main", "stg_raw_" + idx)) {
             long seq = 0;
@@ -441,15 +571,17 @@ class RawPgReader {
                 for (int i = 0; i < cols.size(); i++) {
                     ap.append(i < row.values().length ? row.values()[i] : null);
                 }
-                ap.append(row.deleted() ? "true" : "false");
+                ap.append(Boolean.toString(row.deleted()));
                 ap.append(seq++);
                 ap.endRow();
             }
         }
+        return new StagingTiming(ddlNanos, System.nanoTime() - appenderStarted);
     }
 
-    /** 单条语义更新 staging：新 tuple 全列 + 独立旧主键列。 */
-    private void stagePatch(Connection conn, RelInfo rel, PendingRow row, int idx) throws SQLException {
+    /** 语义更新 staging：新 tuple 全列 + 独立旧主键列。 */
+    private StagingTiming stagePatch(Connection conn, RelInfo rel, List<PendingRow> rows, int idx)
+            throws SQLException {
         String stgName = DuckLakeEngine.MEM + ".main.stg_raw_" + idx;
         StringBuilder ddl = new StringBuilder("CREATE OR REPLACE TABLE ").append(stgName).append(" (");
         for (int i = 0; i < rel.cols().size(); i++) {
@@ -461,18 +593,24 @@ class RawPgReader {
             ddl.append(", \"").append(oldKeyStageColumn(rel, i)).append("\" VARCHAR");
         }
         ddl.append(')');
+        long ddlStarted = System.nanoTime();
         try (Statement s = conn.createStatement()) {
             s.execute(ddl.toString());
         }
+        long ddlNanos = System.nanoTime() - ddlStarted;
 
-        TupleData oldTuple = row.oldTuple() == null ? row.newTuple() : row.oldTuple();
+        long appenderStarted = System.nanoTime();
         DuckDBConnection dc = conn.unwrap(DuckDBConnection.class);
         try (DuckDBAppender ap = dc.createAppender(DuckLakeEngine.MEM, "main", "stg_raw_" + idx)) {
-            ap.beginRow();
-            for (String value : row.newTuple().values()) ap.append(value);
-            for (int keyIndex : keyIndexes) ap.append(oldTuple.values()[keyIndex]);
-            ap.endRow();
+            for (PendingRow row : rows) {
+                TupleData oldTuple = row.oldTuple() == null ? row.newTuple() : row.oldTuple();
+                ap.beginRow();
+                for (String value : row.newTuple().values()) ap.append(value);
+                for (int keyIndex : keyIndexes) ap.append(oldTuple.values()[keyIndex]);
+                ap.endRow();
+            }
         }
+        return new StagingTiming(ddlNanos, System.nanoTime() - appenderStarted);
     }
 
     /** DELETE + QUALIFY INSERT，实现镜像 upsert/delete 语义。 */
@@ -497,15 +635,16 @@ class RawPgReader {
                     + "SELECT * FROM " + stg
                     + " QUALIFY row_number() OVER (PARTITION BY " + parts.partition()
                     + " ORDER BY \"__seq\" DESC) = 1"
-                    + ") WHERE COALESCE(\"__deleted\", 'false') <> 'true'");
+                    + ") latest WHERE COALESCE(\"__deleted\", 'false') <> 'true'");
         }
     }
 
     /**
-     * UPDATE 的语义慢路径：主键变化按旧 key 定位；unchanged TOAST 列不进入 SET，保留湖中旧值。
-     * 单事件执行保证同一事务内连续更新可见前一事件的结果。
+     * UPDATE 的语义路径：主键变化按旧 key 定位；unchanged TOAST 列不进入 SET，保留湖中旧值。
+     * 同 key 连续更新仍被 planner 拆成独立段，只有互不依赖的目标行会共享一次 UPDATE。
      */
-    private void applyPatch(Connection conn, RelInfo rel, PendingRow row, int idx) throws SQLException {
+    private void applyPatch(Connection conn, RelInfo rel, List<PendingRow> rows, int idx) throws SQLException {
+        PendingRow row = rows.getFirst();
         String lakeTable = lakeTableName(rel);
         List<Integer> keyIndexes = keyIndexes(rel);
         if (keyIndexes.isEmpty()) {
@@ -519,7 +658,7 @@ class RawPgReader {
         String stg = DuckLakeEngine.MEM + ".main.stg_raw_" + idx;
         StringBuilder set = new StringBuilder();
         for (int i = 0; i < rel.cols().size(); i++) {
-            if (row.newTuple().unchanged()[i]) continue;
+            if (row.newTuple().isUnchanged(i)) continue;
             ColDef col = rel.cols().get(i);
             set.append(set.isEmpty() ? "" : ", ").append('"').append(col.name()).append("\" = ")
                     .append(castExprRaw("s.\"" + col.name() + '"', col.duckType()));
@@ -539,15 +678,19 @@ class RawPgReader {
             updated = s.executeUpdate("UPDATE " + lake + " AS t SET " + set
                     + " FROM " + stg + " AS s WHERE " + oldKeyMatch);
         }
-        if (updated != 0) return;
+        if (updated < 0 || updated >= rows.size()) return;
 
         if (row.newTuple().hasUnchanged()) {
             // 首次异步 bootstrap 可能尚未插入基线行；不写 NULL 占位，让后续 anti-join 补全真值。
-            log.warn("unchanged-TOAST UPDATE 未命中湖基线，跳过并等待 bootstrap: {}", lakeTable);
+            log.warn("unchanged-TOAST UPDATE 有 {} 行未命中湖基线，跳过并等待 bootstrap: {}",
+                    rows.size() - updated, lakeTable);
             return;
         }
 
         // 无 TOAST 缺口时可安全补插完整新 tuple（典型为 bootstrap 竞态下的主键更新）。
+        if (rows.size() != 1) {
+            throw new IllegalStateException("主键变化 PATCH 不应被合并: " + lakeTable);
+        }
         StringBuilder cols = new StringBuilder();
         StringBuilder proj = new StringBuilder();
         for (ColDef col : rel.cols()) {
@@ -869,18 +1012,20 @@ class RawPgReader {
         if (rel == null) { skipTuple(msg); return null; }
         int colCount = msg.getShort() & 0xFFFF;
         String[] vals = new String[rel.cols().size()];
-        boolean[] unchanged = new boolean[rel.cols().size()];
+        boolean[] unchanged = null;
         for (int i = 0; i < colCount; i++) {
             byte kind = msg.get();
             if (kind == 'n') { /* null */ }
             else if (kind == 'u') {
-                if (i < unchanged.length) unchanged[i] = true;
+                if (i < vals.length) {
+                    if (unchanged == null) unchanged = new boolean[vals.length];
+                    unchanged[i] = true;
+                }
             }
             else if (kind == 't') {
                 int len = msg.getInt();
-                byte[] bytes = new byte[len];
-                msg.get(bytes);
-                if (i < vals.length) vals[i] = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                if (i < vals.length) vals[i] = readUtf8(msg, len);
+                else msg.position(msg.position() + len);
             }
         }
         return new TupleData(vals, unchanged);
@@ -902,11 +1047,25 @@ class RawPgReader {
         int start = msg.position();
         while (msg.get() != 0) { /* skip */ }
         int end = msg.position() - 1;
-        byte[] bytes = new byte[end - start];
         msg.position(start);
-        msg.get(bytes);
+        String value = readUtf8(msg, end - start);
         msg.get(); // consume null terminator
-        return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+        return value;
+    }
+
+    /** Heap ByteBuffer 直接解码，避免为每个 pgoutput 文本列再分配一份临时 byte[]。 */
+    private static String readUtf8(ByteBuffer msg, int length) {
+        int start = msg.position();
+        String value;
+        if (msg.hasArray()) {
+            value = new String(msg.array(), msg.arrayOffset() + start, length, StandardCharsets.UTF_8);
+            msg.position(start + length);
+        } else {
+            byte[] bytes = new byte[length];
+            msg.get(bytes);
+            value = new String(bytes, StandardCharsets.UTF_8);
+        }
+        return value;
     }
     // ──────────── 工具方法 ────────────
 
@@ -949,5 +1108,30 @@ class RawPgReader {
         } catch (SQLException e) {
             log.debug("stg_raw 清理失败（下批 CREATE OR REPLACE 覆盖）: {}", e.getMessage());
         }
+    }
+
+    private void recordBatchTiming(WriteTiming timing, long lockWaitNanos, long offsetNanos) {
+        recordStage(SyncState.Stage.DECODE, decodeNanos);
+        recordStage(SyncState.Stage.PLAN, timing.planNanos());
+        recordStage(SyncState.Stage.LOCK_WAIT, lockWaitNanos);
+        recordStage(SyncState.Stage.ENSURE, timing.ensureNanos());
+        recordStage(SyncState.Stage.STAGING_DDL, timing.stagingDdlNanos());
+        recordStage(SyncState.Stage.APPENDER, timing.appenderNanos());
+        recordStage(SyncState.Stage.MIRROR_DML, timing.mirrorDmlNanos());
+        recordStage(SyncState.Stage.LAKE_COMMIT, timing.lakeCommitNanos());
+        recordStage(SyncState.Stage.CLEANUP, timing.cleanupNanos());
+        recordStage(SyncState.Stage.OFFSET_ACK, offsetNanos);
+    }
+
+    private void recordStage(SyncState.Stage stage, long nanos) {
+        syncState.recordStage(SyncState.Reader.POSTGRES, stage, nanos);
+    }
+
+    static long pgTimestampMs(long pgMicros) {
+        return PG_EPOCH_MILLIS + Math.floorDiv(pgMicros, 1_000L);
+    }
+
+    private static long deliverLag(long deliveredAtMs, long sourceTsMs) {
+        return sourceTsMs <= 0 ? 0 : Math.max(0, deliveredAtMs - sourceTsMs);
     }
 }

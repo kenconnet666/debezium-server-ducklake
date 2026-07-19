@@ -102,7 +102,7 @@ public class LakeMaintenanceJobs {
      * ⚠️ 写放大的防线是 <b>max_file_size 的分层过滤</b>而非 target：各级只吃自己区间的输入
      * (碎片<1MB / 1-10MB / 10-64MB / 全量)，上一级产物越过区间线后不再被同级重复重写——
      * 每个字节一生只被重写 O(层数) 次。若各级都放开 max，将退化回"每 5 分钟重写全湖"
-     * (旧策略实测放大数千倍,见 README 第十六轮)。
+     * (旧策略实测会把写放大推高数千倍)。
      */
     private void mergeTier(String label, Long minBytes, Long maxBytes, Integer maxCompacted) {
         String targetSize = "100GB";

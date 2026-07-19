@@ -4,7 +4,7 @@
 #      docker compose -f .docker/mysql/docker-compose.yml up -d          # 只起 MySQL/catalog/S3
 #      注:dev profile 默认连 PG 栈;要以 MySQL 为源在 IDE 跑,给主程序传 prod profile + MySQL 环境变量
 #   ── B. 全栈 e2e / 类生产:app 也进容器 ──
-#      mvn package -DskipTests
+#      .\mvnw.cmd package -DskipTests
 #      docker compose -f .docker/mysql/docker-compose.yml --profile app up -d --build
 #   写数据看落湖: docker compose -f .docker/mysql/docker-compose.yml exec mysql \
 #        mysql -uroot -pchangeme shop -e "CREATE TABLE demo(id bigint AUTO_INCREMENT PRIMARY KEY, name varchar(64)); INSERT INTO demo(name) VALUES ('hello'),('mysql');"
@@ -146,5 +146,8 @@ services:
         limits:
           memory: 3072M
     volumes:
-      # DuckDB 扩展缓存(首启 INSTALL ducklake/postgres/httpfs 需外网,持久化后重启秒加载)
-      - ./ducklake/data/duckdb-ext:/root/.duckdb
+      # named volume 会继承镜像内 uid=10001，首启 INSTALL 后可由非 root 应用持续复用。
+      - ducklake-ext:/home/ducklake/.duckdb
+
+volumes:
+  ducklake-ext:

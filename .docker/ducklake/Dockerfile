@@ -1,7 +1,7 @@
 # debezium-server-ducklake 生产镜像:Debian 13 slim + JetBrains Runtime(JBR) 25
 # ── 单一源无关镜像:mysql/postgres 由运行时 DUCKLAKE_SOURCE_TYPE 切换,故两栈与 CI 共用本文件 ──
 # 构建(context 必须是仓库根——要 COPY target/*.jar):
-#   mvn package -DskipTests
+#   .\mvnw.cmd package -DskipTests
 #   docker build -f .docker/ducklake/Dockerfile -t debezium-server-ducklake .
 # 多架构(buildx): TARGETARCH=amd64/arm64 自动映射 JBR 的 x64/aarch64 变体
 FROM debian:trixie-slim
@@ -39,9 +39,16 @@ RUN ARCH="${TARGETARCH:-$(dpkg --print-architecture)}" \
 
 ENV JAVA_HOME=/opt/jbr \
     PATH=/opt/jbr/bin:$PATH \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    HOME=/home/ducklake
 
-COPY target/debezium-server-ducklake-*.jar /app/app.jar
+# 固定 uid/gid 便于生产 volume/fsGroup 对齐；扩展缓存与应用目录都不需要 root。
+RUN groupadd --gid 10001 ducklake \
+    && useradd --uid 10001 --gid ducklake --home-dir /home/ducklake \
+        --create-home --shell /usr/sbin/nologin ducklake \
+    && install -d -o ducklake -g ducklake /app /home/ducklake/.duckdb
+
+COPY --chown=ducklake:ducklake target/debezium-server-ducklake-*.jar /app/app.jar
 
 # 分代 ZGC + 紧凑对象头(JEP 519) + DuckDB JNI native access 授权。
 # 内存预算公式: 容器限额 ≈ JVM 堆(512m) + JVM 本体(~300m) + DuckDB memory-limit(默认 1536m) + 余量
@@ -49,6 +56,7 @@ COPY target/debezium-server-ducklake-*.jar /app/app.jar
 ENV JAVA_OPTS="-Xmx512m -XX:+UseZGC -XX:+UseCompactObjectHeaders --enable-native-access=ALL-UNNAMED"
 
 WORKDIR /app
+USER 10001:10001
 EXPOSE 19992
 HEALTHCHECK --interval=15s --timeout=5s --retries=3 --start-period=90s \
     CMD curl -f http://127.0.0.1:19992/api/ducklake/actuator/health || exit 1

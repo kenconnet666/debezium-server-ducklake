@@ -30,4 +30,4 @@ jobs:
           cache: maven
 
       - name: Test
-        run: mvn -B verify
+        run: bash ./mvnw -B verify
