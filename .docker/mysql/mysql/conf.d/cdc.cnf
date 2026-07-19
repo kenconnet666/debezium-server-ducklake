@@ -1,12 +1,14 @@
-# MySQL 8.0+ CDC 源库配置（挂载到 /etc/mysql/conf.d/）。
-# 8.0 起 log_bin=ON / binlog_format=ROW / binlog_row_image=FULL 均为默认值，无需重复声明——
-# 本文件只补默认没开的两类：GTID（故障转移位点可续 + 为 read-only 增量快照留门）与显式 server-id。
+# MySQL 原生 binlog reader 契约（挂载到 /etc/mysql/conf.d/）。
 [mysqld]
 server-id = 1
+binlog_format = ROW
+binlog_row_image = FULL
+binlog_row_metadata = FULL
+binlog_transaction_compression = OFF
 gtid_mode = ON
 enforce_gtid_consistency = ON
 # 容器场景对外可达(deb 包默认可能绑 127.0.0.1)
 bind-address = 0.0.0.0
 # binlog 保留 30 天（8.0 默认即 2592000，显式声明便于按需收窄；
-# 消费者停机超过保留期会丢位点，见 README 运维节）
+# reader 停机超过保留期会丢位点，见 README 运维节）
 binlog_expire_logs_seconds = 2592000

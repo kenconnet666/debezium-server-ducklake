@@ -10,11 +10,9 @@ import java.sql.SQLException;
 import java.sql.Statement;
 
 /**
- * raw-pg 引擎的 LSN offset 持久化（catalog PG）。
+ * PostgreSQL 原生 reader 的 LSN offset 持久化（catalog PG）。
  * <p>
- * 独立建表 {@code raw_pg_offset}，不复用 Debezium 的 {@code debezium_offset_storage}
- * JSON 格式——免解析复杂度，schema 清晰。
- * 同一 slotName 的 Debezium offset 与 raw-pg offset 天然隔离（不同表）。
+ * 表 {@code raw_pg_offset} 以 slotName 为键，只在对应湖事务提交成功后推进。
  */
 @Slf4j
 class RawPgOffset {
@@ -60,12 +58,12 @@ class RawPgOffset {
                 }
             }
         } catch (SQLException e) {
-            log.warn("RawPg 读取 offset 失败，从头消费: {}", e.getMessage());
+            throw new IllegalStateException("RawPg 读取 offset 失败，拒绝猜测起点: slot=" + slotName, e);
         }
         return 0L;
     }
 
-    /** 落湖提交后异步回写 LSN（失败仅告警，下次重启从上个已记录位点续传）。 */
+    /** 落湖提交后同步回写 LSN；失败必须终止 reader，绝不能继续向 replication slot 确认。 */
     void save(String slotName, long lsn) {
         try (Connection c = connect();
              PreparedStatement ps = c.prepareStatement("""
@@ -79,8 +77,8 @@ class RawPgOffset {
             ps.setLong(2, lsn);
             ps.executeUpdate();
         } catch (SQLException e) {
-            log.warn("RawPg 写入 offset 失败（下次重启从旧位点续传）: slot={} lsn={} err={}",
-                    slotName, Long.toHexString(lsn), e.getMessage());
+            throw new IllegalStateException("RawPg 写入 offset 失败: slot=" + slotName
+                    + " lsn=" + Long.toHexString(lsn), e);
         }
     }
 

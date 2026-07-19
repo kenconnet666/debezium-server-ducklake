@@ -101,7 +101,6 @@ class RawPgThroughputTest {
         r.add("ducklake.lake.s3-access-key", () -> "dummy");
         r.add("ducklake.lake.s3-secret-key", () -> "dummy");
 
-        r.add("ducklake.source.engine", () -> "RAW_PG");
         r.add("ducklake.maintenance.scanner-bootstrap", () -> "false");
         r.add("ducklake.maintenance.scanner-refill", () -> "false");
         r.add("ducklake.maintenance.enabled", () -> "false");

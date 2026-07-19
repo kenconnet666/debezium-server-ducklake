@@ -26,7 +26,7 @@ public class SyncState {
     private final AtomicLong engineRunning = new AtomicLong(0);
 
     // ---- 分段延迟（最近一批,ms）:端到端滞后 = deliver(源→交付) + stage + lakeTx + 残差(锁等待/重试) ----
-    /** 源提交 → 事件交付进 handleBatch（Debezium 解码/unwrap/队列/poll 全链） */
+    /** 源提交 → 原生 reader 交付批处理（协议读取/解码/攒批）。 */
     private final AtomicLong lastDeliverLagMs = new AtomicLong(-1);
     /** 阶段一:切段 + Appender 物化 staging */
     private final AtomicLong lastStageMs = new AtomicLong(-1);
@@ -47,7 +47,7 @@ public class SyncState {
         Gauge.builder("ducklake_last_batch_at_ms", lastBatchAtMs, AtomicLong::get)
                 .description("最近一批成功落湖的墙钟(epoch ms)").register(registry);
         Gauge.builder("ducklake_engine_running", engineRunning, AtomicLong::get)
-                .description("Debezium 引擎运行状态(1/0)").register(registry);
+                .description("原生 CDC reader 运行状态(1/0)").register(registry);
         Gauge.builder("ducklake_last_deliver_lag_ms", lastDeliverLagMs, AtomicLong::get)
                 .description("最近批:源提交→交付进 handleBatch 的滞后(ms)").register(registry);
         Gauge.builder("ducklake_last_stage_ms", lastStageMs, AtomicLong::get)

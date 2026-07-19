@@ -19,22 +19,22 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
 
 /**
- * pgoutput 原始串直通读取器：pgjdbc replication API 直读 pgoutput，
- * 绕开 Debezium engine 的 Struct 物化 + unpark 瓶颈（harness 实测 153-163k rows/s，
- * 约 Debezium 13-14×）。
+ * PostgreSQL 原生读取器：通过 pgjdbc replication API 直读 pgoutput。
  * <p>
- * 写湖路径与 Debezium 路径共用相同 sink：DuckLakeEngine.withLock + DuckDBAppender
- * 全 VARCHAR staging + DELETE/QUALIFY INSERT 投影——staging 格式完全一致，类型名来自
- * information_schema 而非 Debezium Schema，通过 {@link DdlApplier#pgColumnTypes} 获取。
+ * 写湖使用 DuckLakeEngine.withLock + DuckDBAppender 的全 VARCHAR staging，再以
+ * DELETE/QUALIFY INSERT 投影提交；类型名通过 {@link DdlApplier#pgColumnTypes} 获取。
  * <p>
  * DDL 跟随两路并行：① Relation 消息自愈（加列即刻感知）；
  * ② DDL 审计表 Insert 行经 {@link DdlApplier#applyRaw} 复用 PG 前端处理 rename/删列/删表。
@@ -50,7 +50,7 @@ class RawPgReader {
     private final DucklakeProperties.Source src;
     private final DucklakeProperties.Engine eng;
 
-    /** pgoutput Relation 缓存（OID → 列元信息，首次见到时查 information_schema） */
+    /** pgoutput Relation 缓存（OID → 列元信息，首次见到时查 pg_catalog） */
     private record ColDef(String name, String duckType, boolean isKey) {}
     private record RelInfo(String schema, String table, List<ColDef> cols) {
         List<String> keyColumns() { return cols.stream().filter(ColDef::isKey).map(ColDef::name).toList(); }
@@ -60,21 +60,57 @@ class RawPgReader {
     /** DDL 审计表名集合（小写）——这些表的 Insert 事件走 DdlApplier 而非落湖 */
     private final Set<String> ddlAuditTables;
 
-    /** 批次内待落湖行 */
-    private record PendingRow(int relOid, boolean deleted, String[] values) {}
-    private final List<PendingRow> pending = new ArrayList<>();
+    /** 批次内事件保持源顺序；TRUNCATE 必须与前后 DML 在同一湖事务中按序执行。 */
+    private sealed interface PendingEvent permits PendingRow, PendingTruncate {
+        RelInfo rel();
+    }
+    private enum RowOp { INSERT, UPDATE, DELETE }
+    private record TupleData(String[] values, boolean[] unchanged) {
+        boolean hasUnchanged() {
+            for (boolean value : unchanged) if (value) return true;
+            return false;
+        }
+    }
+    /** 事件携带解码时的 Relation、旧/新 tuple 与 unchanged-TOAST 快照。 */
+    private record PendingRow(RelInfo rel, RowOp op, TupleData oldTuple, TupleData newTuple)
+            implements PendingEvent {
+        boolean deleted() { return op == RowOp.DELETE; }
+        String[] values() { return deleted() ? oldTuple.values() : newTuple.values(); }
+        boolean requiresPatch() {
+            if (op != RowOp.UPDATE) return false;
+            if (newTuple.hasUnchanged()) return true;
+            if (oldTuple == null) return false;
+            for (int i = 0; i < rel.cols().size(); i++) {
+                if (rel.cols().get(i).isKey()
+                        && !Objects.equals(oldTuple.values()[i], newTuple.values()[i])) return true;
+            }
+            return false;
+        }
+    }
+    private record PendingTruncate(RelInfo rel) implements PendingEvent {}
+    private enum SegmentKind { DATA, PATCH, DDL, TRUNCATE }
+    private record Segment(SegmentKind kind, RelInfo rel, List<PendingRow> rows) {}
+    private final List<PendingEvent> pending = new ArrayList<>();
     /** 最近一个 Commit 消息的 end LSN（向 PG 确认后 slot 才推进） */
     private long batchEndLsn = 0;
+    /** 已同步写入 catalog offset 且反馈给 slot 的 LSN，避免空闲期重复写 offset。 */
+    private long persistedLsn = 0;
+    /** pgoutput Begin/Commit 边界；未见 Commit 时绝不把半个源事务暴露到湖。 */
+    private boolean inTransaction = false;
+    /** DDL/TRUNCATE 事务在 Commit 立即刷出，阻断后续 Relation 自愈越过 schema 边界。 */
+    private boolean flushAtCommit = false;
     private long lastFlushMs = System.currentTimeMillis();
 
     /** 湖表已知列缓存（避免每批 DESCRIBE） */
     private final Map<String, Map<String, String>> knownColumns = new HashMap<>();
     /** 无主键已告警的湖表 */
     private final Set<String> noKeyWarned = new HashSet<>();
+    /** followTypeChange=false 时避免同一列重复告警 */
+    private final Set<String> typeDriftWarned = new HashSet<>();
 
     /**
-     * per-relOid SQL 片段缓存：stageRows/applyStaging 所需字符串在首次构造后复用。
-     * schema 变更（parseRelation 写入新RelInfo / ensureTable 加列）时失效对应条目。
+     * per-Relation 快照 SQL 片段缓存：stageRows/applyStaging 所需字符串在首次构造后复用。
+     * schema 变更（parseRelation 写入新 RelInfo / ensureTable 加列）时失效对应条目。
      * <p>
      * 收益：对单表连续高吞吐流，每批省去 stream().map().toList() + StringBuilder 的重复构造；
      * 压测场景（100k 行，maxBatchSize=8192，约12批）减少约 11 次完整 SQL 重建。
@@ -86,9 +122,7 @@ class RawPgReader {
             String keyMatch,    // "t.\"id\" = CAST(s.\"id\" AS BIGINT) AND ..."
             String partition    // "\"id\""（无主键时空串）
     ) {}
-    private final Map<Integer, TableSqlParts> sqlCache = new HashMap<>();
-    /** lakeTable → relOid 反向映射：ensureTable 加列时需要通过表名使缓存失效 */
-    private final Map<String, Integer> lakeTableOid = new HashMap<>();
+    private final Map<RelInfo, TableSqlParts> sqlCache = new HashMap<>();
 
     private volatile boolean stopped = false;
     RawPgReader(DucklakeProperties props, DuckLakeEngine engine, DdlApplier ddlApplier,
@@ -100,7 +134,10 @@ class RawPgReader {
         this.offset = offset;
         this.src = props.getSource();
         this.eng = props.getEngine();
-        this.ddlAuditTables = new HashSet<>(props.getMaintenance().getDdlAuditTables());
+        this.ddlAuditTables = new HashSet<>();
+        for (String table : props.getMaintenance().getDdlAuditTables()) {
+            ddlAuditTables.add(table.toLowerCase(Locale.ROOT));
+        }
     }
 
     void stop() {
@@ -112,12 +149,13 @@ class RawPgReader {
     }
 
     /** 主循环，由 RawPgRunner 的专用线程调用，阻塞直到 stopped 或 interrupted。 */
-    void run() throws Exception {
-        long startLsn = offset.load(src.getSlotName());
+    void run(long startLsn, Runnable onStreamReady) throws Exception {
+        persistedLsn = startLsn;
         try (Connection repl = openReplicationConn()) {
             PGReplicationStream stream = openStream(repl, startLsn);
             log.info("pgoutput 流已就绪: slot={} startLsn={}", src.getSlotName(),
                     startLsn == 0 ? "HEAD" : "0x" + Long.toHexString(startLsn));
+            onStreamReady.run();
             while (!stopped && !Thread.currentThread().isInterrupted()) {
                 ByteBuffer msg = stream.readPending();
                 if (msg == null) {
@@ -135,18 +173,24 @@ class RawPgReader {
         byte type = msg.get();
         switch (type) {
             case 'R' -> parseRelation(msg);
-            case 'B' -> { /* Begin: skip finalLsn(8)/commitTime(8)/xid(4) */ }
+            case 'B' -> {
+                inTransaction = true; // payload 无需解析，边界必须记录
+                flushAtCommit = false;
+            }
             case 'I' -> parseInsert(msg);
             case 'U' -> parseUpdate(msg);
             case 'D' -> parseDelete(msg);
+            case 'T' -> parseTruncate(msg);
             case 'C' -> {
                 msg.get();        // flags (unused)
                 msg.getLong();    // commit lsn
                 batchEndLsn = msg.getLong(); // end lsn = slot 确认位点
                 msg.getLong();    // commit timestamp
-                maybeFlush(stream, pending.size() >= eng.getMaxBatchSize());
+                inTransaction = false;
+                maybeFlush(stream, flushAtCommit || pending.size() >= eng.getMaxBatchSize());
+                flushAtCommit = false;
             }
-            // Truncate/Origin/Type/Message → 忽略
+            // Origin/Type/Message → 忽略
         }
     }
     // ──────────── pgoutput 消息解析 ────────────
@@ -164,10 +208,10 @@ class RawPgReader {
         for (int i = 0; i < colCount; i++) {
             isKey[i] = (msg.get() & 1) != 0;
             names[i] = readCStr(msg);
-            msg.getInt(); // type OID（用 information_schema 查更准，见下）
+            msg.getInt(); // type OID（用 pg_catalog 连同 typmod/维度解析，见下）
             msg.getInt(); // atttypmod
         }
-        // 从 information_schema 取精确的 DuckDB 列类型
+        // 从 pg_catalog 取精确的 DuckDB 列类型
         Map<String, String> typeMap = ddlApplier.pgColumnTypes(schema, table);
         List<ColDef> cols = new ArrayList<>(colCount);
         for (int i = 0; i < colCount; i++) {
@@ -179,43 +223,61 @@ class RawPgReader {
             log.info("RawPg 感知表: {}.{} ({}列, key={})",
                     schema, table, colCount, cols.stream().filter(ColDef::isKey).map(ColDef::name).toList());
         } else {
-            // schema 有变化（DDL 期间 Relation 消息更新），失效 SQL 缓存
-            sqlCache.remove(oid);
+            // 新旧事件各自携带 Relation；旧 SQL 片段可丢弃，需要时按快照重建。
+            sqlCache.remove(old);
         }
     }
 
     private void parseInsert(ByteBuffer msg) {
         int oid = msg.getInt();
         msg.get(); // 'N'
-        String[] vals = readTuple(msg, relations.get(oid));
-        if (vals != null) pending.add(new PendingRow(oid, false, vals));
+        RelInfo rel = relations.get(oid);
+        TupleData tuple = readTuple(msg, rel);
+        if (rel != null && tuple != null) {
+            pending.add(new PendingRow(rel, RowOp.INSERT, null, tuple));
+            if (ddlAuditTables.contains(rel.table().toLowerCase(Locale.ROOT))) flushAtCommit = true;
+        }
     }
 
     private void parseUpdate(ByteBuffer msg) {
         int oid = msg.getInt();
         // pgoutput Update: [K|O 旧 tuple]? N 新 tuple
+        RelInfo rel = relations.get(oid);
         byte indicator = msg.get(); // 先无条件消费，可能是 K/O/N
+        TupleData oldTuple = null;
         if (indicator == 'K' || indicator == 'O') {
-            skipTuple(msg); // 跳过旧 tuple
+            oldTuple = readTuple(msg, rel);
             msg.get();      // 消费后续的 'N'
         }
         // indicator == 'N' 时已在新 tuple 列数前，直接读取
-        String[] vals = readTuple(msg, relations.get(oid));
-        if (vals != null) pending.add(new PendingRow(oid, false, vals));
+        TupleData newTuple = readTuple(msg, rel);
+        if (rel != null && newTuple != null) {
+            pending.add(new PendingRow(rel, RowOp.UPDATE, oldTuple, newTuple));
+        }
     }
 
     private void parseDelete(ByteBuffer msg) {
         int oid = msg.getInt();
         msg.get(); // 'K' or 'O'
         RelInfo rel = relations.get(oid);
-        String[] keyVals = readTuple(msg, rel); // null rel 时 readTuple 内部 skipTuple 安全处理
-        if (rel == null || keyVals == null) return; // rel 判断提前（逻辑主因）
-        // Delete：只保留主键列值，其余置 null；__deleted 标记将驱动 insertFromStaging 跳过插入
-        String[] vals = new String[rel.cols().size()];
-        for (int i = 0; i < rel.cols().size(); i++) {
-            if (rel.cols().get(i).isKey()) vals[i] = keyVals[i];
+        TupleData oldTuple = readTuple(msg, rel); // null rel 时 readTuple 内部 skipTuple 安全处理
+        if (rel == null || oldTuple == null) return;
+        pending.add(new PendingRow(rel, RowOp.DELETE, oldTuple, null));
+    }
+
+    /** pgoutput Truncate：Int32 relation count + Int8 options + relation OID[]。 */
+    private void parseTruncate(ByteBuffer msg) {
+        int relationCount = msg.getInt();
+        msg.get(); // options: CASCADE / RESTART IDENTITY；湖侧只需镜像清空
+        boolean follow = props.getMaintenance().isFollowTruncate();
+        if (follow && relationCount > 0) flushAtCommit = true;
+        for (int i = 0; i < relationCount; i++) {
+            int oid = msg.getInt();
+            RelInfo rel = relations.get(oid);
+            // pgoutput 保证在 T 之前发送最新 R；缺失说明流不完整，不能猜测目标表。
+            if (follow && rel != null) pending.add(new PendingTruncate(rel));
+            else if (follow) log.warn("RawPg TRUNCATE 缺少 Relation，跳过未知 OID={}", oid);
         }
-        pending.add(new PendingRow(oid, true, vals));
     }
     // ──────────── 批次刷湖 ────────────
 
@@ -223,18 +285,19 @@ class RawPgReader {
         long now = System.currentTimeMillis();
         boolean timeout = (now - lastFlushMs) >= Math.max(eng.getPollIntervalMs() * 50L, 500L);
         if (pending.isEmpty()) {
-            // 无数据时仍要周期向 PG 心跳，防 slot WAL 扣留
-            if (batchEndLsn > 0 && timeout) {
-                ackLsn(stream, batchEndLsn);
+            // 即使事务全部被过滤，也要先持久化 offset 再反馈 PG，防 slot WAL 扣留。
+            if (!inTransaction && Long.compareUnsigned(batchEndLsn, persistedLsn) > 0 && timeout) {
+                persistAndAck(stream, batchEndLsn);
                 lastFlushMs = now;
             }
             return;
         }
+        // readPending 可能在 Begin 与 Commit 之间短暂无消息；不能因批超时提交半个源事务。
+        if (inTransaction) return;
         if (!force && !timeout) return;
 
         long flushLsn = batchEndLsn;
-        List<PendingRow> batch = new ArrayList<>(pending);
-        pending.clear();
+        List<PendingEvent> batch = new ArrayList<>(pending);
         long t0 = System.currentTimeMillis();
 
         engine.withLock(conn -> {
@@ -242,10 +305,8 @@ class RawPgReader {
             return null;
         });
 
-        if (flushLsn > 0) {
-            ackLsn(stream, flushLsn);
-            offset.save(src.getSlotName(), flushLsn);
-        }
+        if (flushLsn > 0) persistAndAck(stream, flushLsn);
+        pending.clear();
         long elapsed = System.currentTimeMillis() - t0;
         lastFlushMs = System.currentTimeMillis();
         syncState.batchCommitted(batch.size(), System.currentTimeMillis(), 0, elapsed, 0);
@@ -259,75 +320,114 @@ class RawPgReader {
         stream.forceUpdateStatus();
     }
 
-    /** 两阶段写：staging（湖事务外）→ DELETE+INSERT（单湖事务）。与 DuckLakeChangeConsumer 同构。 */
-    private void writeBatch(Connection conn, List<PendingRow> batch) throws SQLException {
-        // 按表顺序分组（保序——同一批内后来的行覆盖前面的，依赖 __seq 排序）
-        Map<Integer, List<PendingRow>> byRel = new LinkedHashMap<>();
-        for (PendingRow r : batch) byRel.computeIfAbsent(r.relOid(), k -> new ArrayList<>()).add(r);
+    /** Debezium 同序语义：消费者 offset 先持久化，成功后 replication slot 才能确认。 */
+    private void persistAndAck(PGReplicationStream stream, long lsn) throws SQLException {
+        offset.save(src.getSlotName(), lsn);
+        ackLsn(stream, lsn);
+        persistedLsn = lsn;
+    }
 
-        // 拆分：DDL 审计行单独处理，数据行走 staging
-        List<Map.Entry<Integer, List<PendingRow>>> dataSegs = new ArrayList<>();
-        List<Map.Entry<Integer, List<PendingRow>>> ddlSegs  = new ArrayList<>();
-        for (Map.Entry<Integer, List<PendingRow>> e : byRel.entrySet()) {
-            RelInfo rel = relations.get(e.getKey());
-            if (rel != null && ddlAuditTables.contains(rel.table().toLowerCase())) {
-                ddlSegs.add(e);
-            } else {
-                dataSegs.add(e);
-            }
-        }
+    /** 两阶段写：staging（湖事务外）→ DELETE+INSERT（单湖事务）。 */
+    private void writeBatch(Connection conn, List<PendingEvent> batch) throws SQLException {
+        List<Segment> segments = segmentsOf(batch);
+        int[] stagingIndexes = new int[segments.size()];
+        Arrays.fill(stagingIndexes, -1);
 
         // 阶段一：staging（湖事务外）
-        for (int i = 0; i < dataSegs.size(); i++) {
-            int oid = dataSegs.get(i).getKey();
-            RelInfo rel = relations.get(oid);
-            if (rel != null) stageRows(conn, oid, rel, dataSegs.get(i).getValue(), i);
+        int stagingCount = 0;
+        for (int i = 0; i < segments.size(); i++) {
+            Segment segment = segments.get(i);
+            if (segment.kind() == SegmentKind.DATA || segment.kind() == SegmentKind.PATCH) {
+                RelInfo rel = segment.rel();
+                // Relation 已携带当前目标类型。先在湖事务外完成建表/加列/类型迁移，避免失败的
+                // ALTER 使后续 DELETE+INSERT 事务进入 aborted 状态。
+                ensureTable(conn, lakeTableName(rel), rel);
+                stagingIndexes[i] = stagingCount;
+                if (segment.kind() == SegmentKind.PATCH) {
+                    stagePatch(conn, rel, segment.rows().getFirst(), stagingCount++);
+                } else {
+                    stageRows(conn, rel, segment.rows(), stagingCount++);
+                }
+            }
         }
 
-        // 阶段二：单湖事务
+        // 阶段二：单湖事务，按源事件段顺序执行 DDL / DML / TRUNCATE。
         conn.setAutoCommit(false);
         try {
-            for (int i = 0; i < dataSegs.size(); i++) {
-                int oid = dataSegs.get(i).getKey();
-                RelInfo rel = relations.get(oid);
-                if (rel != null) applyStaging(conn, oid, rel, i);
-            }
-            // DDL 审计行在同一事务内按序应用
-            if (!ddlSegs.isEmpty()) {
-                List<Map<String, String>> ddlRows = new ArrayList<>();
-                for (Map.Entry<Integer, List<PendingRow>> e : ddlSegs) {
-                    RelInfo rel = relations.get(e.getKey());
-                    if (rel == null) continue;
-                    for (PendingRow r : e.getValue()) {
-                        ddlRows.add(toRowMap(rel, r));
+            List<Map<String, String>> ddlRows = new ArrayList<>();
+            for (int i = 0; i < segments.size(); i++) {
+                Segment segment = segments.get(i);
+                RelInfo rel = segment.rel();
+                if (segment.kind() == SegmentKind.DDL) {
+                    for (PendingRow r : segment.rows()) {
+                        // 审计表只消费 INSERT；运维误用 DELETE 清理时不能把旧值当 DDL 再执行。
+                        if (r.op() == RowOp.INSERT) ddlRows.add(toRowMap(rel, r));
                     }
+                    continue;
                 }
-                ddlApplier.applyRaw(conn, ddlRows, lakeTable -> {
-                    knownColumns.remove(lakeTable);
-                    // DDL rename/drop 后 SQL 片段也过期，防下一批使用旧 cols/proj
-                    Integer oid = lakeTableOid.get(lakeTable);
-                    if (oid != null) sqlCache.remove(oid);
-                }, lakeTable -> {
-                    knownColumns.remove(lakeTable);
-                    Integer oid = lakeTableOid.get(lakeTable);
-                    if (oid != null) sqlCache.remove(oid);
-                });
+                applyDdlRows(conn, ddlRows);
+                switch (segment.kind()) {
+                    case DATA -> applyStaging(conn, rel, stagingIndexes[i]);
+                    case PATCH -> applyPatch(conn, rel, segment.rows().getFirst(), stagingIndexes[i]);
+                    case TRUNCATE -> ddlApplier.applyRawPgTruncate(conn, lakeTableName(rel));
+                    case DDL -> throw new IllegalStateException("DDL 段不应进入执行分支");
+                }
             }
+            applyDdlRows(conn, ddlRows);
             conn.commit();
-        } catch (SQLException ex) {
+        } catch (SQLException | RuntimeException ex) {
             conn.rollback();
             knownColumns.clear();
             sqlCache.clear();   // schema 可能已变，整批 SQL 缓存全部失效
             throw ex;
         } finally {
             conn.setAutoCommit(true);
-            dropStagings(conn, dataSegs.size());
+            dropStagings(conn, stagingCount);
         }
+    }
+
+    /** 连续同表同行事件合并成一段；跨表、DDL、TRUNCATE 边界保持原始顺序。 */
+    private List<Segment> segmentsOf(List<PendingEvent> batch) {
+        List<Segment> segments = new ArrayList<>();
+        for (PendingEvent event : batch) {
+            RelInfo rel = event.rel();
+            if (event instanceof PendingTruncate) {
+                segments.add(new Segment(SegmentKind.TRUNCATE, rel, List.of()));
+                continue;
+            }
+            PendingRow row = (PendingRow) event;
+            SegmentKind kind = ddlAuditTables.contains(rel.table().toLowerCase(Locale.ROOT))
+                    ? SegmentKind.DDL : row.requiresPatch() ? SegmentKind.PATCH : SegmentKind.DATA;
+            Segment last = segments.isEmpty() ? null : segments.getLast();
+            // PATCH 必须逐事件执行：后一条的 unchanged TOAST 要读取前一条已更新后的湖值。
+            if (kind != SegmentKind.PATCH && last != null && last.kind() == kind && last.rel().equals(rel)) {
+                last.rows().add(row);
+            } else {
+                List<PendingRow> rows = new ArrayList<>();
+                rows.add(row);
+                segments.add(new Segment(kind, rel, rows));
+            }
+        }
+        return segments;
+    }
+
+    private void applyDdlRows(Connection conn, List<Map<String, String>> ddlRows) throws SQLException {
+        if (ddlRows.isEmpty()) return;
+        ddlApplier.applyRaw(conn, ddlRows, this::invalidate, lakeTable -> {
+            invalidate(lakeTable);
+            throw new IllegalStateException("RawPg 重建需要 scanner 通道，当前不可用: " + lakeTable);
+        });
+        ddlRows.clear();
+    }
+
+    private void invalidate(String lakeTable) {
+        knownColumns.remove(lakeTable);
+        invalidateSql(lakeTable);
     }
     // ──────────── Staging + Lake 写入原语 ────────────
 
-    private void stageRows(Connection conn, int oid, RelInfo rel, List<PendingRow> rows, int idx) throws SQLException {
-        TableSqlParts parts = sqlCache.computeIfAbsent(oid, k -> buildSqlParts(rel));
+    private void stageRows(Connection conn, RelInfo rel, List<PendingRow> rows, int idx) throws SQLException {
+        TableSqlParts parts = sqlCache.computeIfAbsent(rel, this::buildSqlParts);
         String stgName = DuckLakeEngine.MEM + ".main.stg_raw_" + idx;
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE OR REPLACE TABLE " + stgName + " (" + parts.stageCols() + ")");
@@ -348,12 +448,37 @@ class RawPgReader {
         }
     }
 
-    /** ensureTable + DELETE + QUALIFY INSERT（镜像 upsert/delete 语义，与 DuckLakeChangeConsumer 等价）。 */
-    private void applyStaging(Connection conn, int oid, RelInfo rel, int idx) throws SQLException {
-        String lakeTable = lakeTableName(rel);
-        ensureTable(conn, oid, lakeTable, rel);
+    /** 单条语义更新 staging：新 tuple 全列 + 独立旧主键列。 */
+    private void stagePatch(Connection conn, RelInfo rel, PendingRow row, int idx) throws SQLException {
+        String stgName = DuckLakeEngine.MEM + ".main.stg_raw_" + idx;
+        StringBuilder ddl = new StringBuilder("CREATE OR REPLACE TABLE ").append(stgName).append(" (");
+        for (int i = 0; i < rel.cols().size(); i++) {
+            if (i > 0) ddl.append(", ");
+            ddl.append('"').append(rel.cols().get(i).name()).append("\" VARCHAR");
+        }
+        List<Integer> keyIndexes = keyIndexes(rel);
+        for (int i = 0; i < keyIndexes.size(); i++) {
+            ddl.append(", \"").append(oldKeyStageColumn(rel, i)).append("\" VARCHAR");
+        }
+        ddl.append(')');
+        try (Statement s = conn.createStatement()) {
+            s.execute(ddl.toString());
+        }
 
-        TableSqlParts parts = sqlCache.computeIfAbsent(oid, k -> buildSqlParts(rel));
+        TupleData oldTuple = row.oldTuple() == null ? row.newTuple() : row.oldTuple();
+        DuckDBConnection dc = conn.unwrap(DuckDBConnection.class);
+        try (DuckDBAppender ap = dc.createAppender(DuckLakeEngine.MEM, "main", "stg_raw_" + idx)) {
+            ap.beginRow();
+            for (String value : row.newTuple().values()) ap.append(value);
+            for (int keyIndex : keyIndexes) ap.append(oldTuple.values()[keyIndex]);
+            ap.endRow();
+        }
+    }
+
+    /** DELETE + QUALIFY INSERT，实现镜像 upsert/delete 语义。 */
+    private void applyStaging(Connection conn, RelInfo rel, int idx) throws SQLException {
+        String lakeTable = lakeTableName(rel);
+        TableSqlParts parts = sqlCache.computeIfAbsent(rel, this::buildSqlParts);
         String stg  = DuckLakeEngine.MEM + ".main.stg_raw_" + idx;
         String lake = DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable);
 
@@ -374,6 +499,90 @@ class RawPgReader {
                     + " ORDER BY \"__seq\" DESC) = 1"
                     + ") WHERE COALESCE(\"__deleted\", 'false') <> 'true'");
         }
+    }
+
+    /**
+     * UPDATE 的语义慢路径：主键变化按旧 key 定位；unchanged TOAST 列不进入 SET，保留湖中旧值。
+     * 单事件执行保证同一事务内连续更新可见前一事件的结果。
+     */
+    private void applyPatch(Connection conn, RelInfo rel, PendingRow row, int idx) throws SQLException {
+        String lakeTable = lakeTableName(rel);
+        List<Integer> keyIndexes = keyIndexes(rel);
+        if (keyIndexes.isEmpty()) {
+            if (noKeyWarned.add(lakeTable)) {
+                log.warn("源表无可定位 key，unchanged-TOAST/主键更新无法镜像，跳过 UPDATE: {}", lakeTable);
+            }
+            return;
+        }
+
+        String lake = DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable);
+        String stg = DuckLakeEngine.MEM + ".main.stg_raw_" + idx;
+        StringBuilder set = new StringBuilder();
+        for (int i = 0; i < rel.cols().size(); i++) {
+            if (row.newTuple().unchanged()[i]) continue;
+            ColDef col = rel.cols().get(i);
+            set.append(set.isEmpty() ? "" : ", ").append('"').append(col.name()).append("\" = ")
+                    .append(castExprRaw("s.\"" + col.name() + '"', col.duckType()));
+        }
+        if (set.isEmpty()) return;
+
+        StringBuilder oldKeyMatch = new StringBuilder();
+        for (int i = 0; i < keyIndexes.size(); i++) {
+            ColDef key = rel.cols().get(keyIndexes.get(i));
+            oldKeyMatch.append(oldKeyMatch.isEmpty() ? "" : " AND ")
+                    .append("t.\"").append(key.name()).append("\" IS NOT DISTINCT FROM ")
+                    .append(castExprRaw("s.\"" + oldKeyStageColumn(rel, i) + '"', key.duckType()));
+        }
+
+        int updated;
+        try (Statement s = conn.createStatement()) {
+            updated = s.executeUpdate("UPDATE " + lake + " AS t SET " + set
+                    + " FROM " + stg + " AS s WHERE " + oldKeyMatch);
+        }
+        if (updated != 0) return;
+
+        if (row.newTuple().hasUnchanged()) {
+            // 首次异步 bootstrap 可能尚未插入基线行；不写 NULL 占位，让后续 anti-join 补全真值。
+            log.warn("unchanged-TOAST UPDATE 未命中湖基线，跳过并等待 bootstrap: {}", lakeTable);
+            return;
+        }
+
+        // 无 TOAST 缺口时可安全补插完整新 tuple（典型为 bootstrap 竞态下的主键更新）。
+        StringBuilder cols = new StringBuilder();
+        StringBuilder proj = new StringBuilder();
+        for (ColDef col : rel.cols()) {
+            cols.append(cols.isEmpty() ? "" : ", ").append('"').append(col.name()).append('"');
+            proj.append(proj.isEmpty() ? "" : ", ")
+                    .append(castExprRaw("s.\"" + col.name() + '"', col.duckType()));
+        }
+        StringBuilder newKeyMatch = new StringBuilder();
+        for (int keyIndex : keyIndexes) {
+            ColDef key = rel.cols().get(keyIndex);
+            newKeyMatch.append(newKeyMatch.isEmpty() ? "" : " AND ")
+                    .append("t.\"").append(key.name()).append("\" IS NOT DISTINCT FROM ")
+                    .append(castExprRaw("s.\"" + key.name() + '"', key.duckType()));
+        }
+        try (Statement s = conn.createStatement()) {
+            s.execute("INSERT INTO " + lake + " (" + cols + ") SELECT " + proj + " FROM " + stg
+                    + " s WHERE NOT EXISTS (SELECT 1 FROM " + lake + " t WHERE " + newKeyMatch + ")");
+        }
+    }
+
+    private static List<Integer> keyIndexes(RelInfo rel) {
+        List<Integer> indexes = new ArrayList<>();
+        for (int i = 0; i < rel.cols().size(); i++) {
+            if (rel.cols().get(i).isKey()) indexes.add(i);
+        }
+        return indexes;
+    }
+
+    /** 避开用户源列名，生成稳定的 staging 内部旧 key 列名。 */
+    private static String oldKeyStageColumn(RelInfo rel, int ordinal) {
+        Set<String> names = new HashSet<>();
+        for (ColDef col : rel.cols()) names.add(col.name());
+        String name = "__ducklake_old_key_" + ordinal;
+        while (names.contains(name)) name = '_' + name;
+        return name;
     }
 
     private TableSqlParts buildSqlParts(RelInfo rel) {
@@ -415,8 +624,7 @@ class RawPgReader {
     }
     // ──────────── ensureTable（Relation 消息自驱 DDL 演化） ────────────
 
-    private void ensureTable(Connection conn, int oid, String lakeTable, RelInfo rel) throws SQLException {
-        lakeTableOid.put(lakeTable, oid); // 始终更新（表 drop+recreate OID 变化时保持准确）
+    private void ensureTable(Connection conn, String lakeTable, RelInfo rel) throws SQLException {
         Map<String, String> cols = knownColumns.get(lakeTable);
         if (cols == null) {
             // 先查湖表是否已存在（cache 被清后重入时表已在，不重建也不重设 SORTED BY；
@@ -445,20 +653,129 @@ class RawPgReader {
             knownColumns.put(lakeTable, cols);
             log.info("RawPg 湖表就绪: {} ({} 列)", lakeTable, cols.size());
         }
-        // Relation 消息感知到新列：即刻 ALTER ADD COLUMN（DDL 演化自愈）
+        // Relation 消息感知到新列/新类型：在当批新值写入前完成湖表演化。
         for (ColDef col : rel.cols()) {
-            if (!cols.containsKey(col.name())) {
+            String have = cols.get(col.name());
+            if (have == null) {
                 try (Statement s = conn.createStatement()) {
                     s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
                             + " ADD COLUMN IF NOT EXISTS \"" + col.name() + "\" " + col.duckType());
                 }
                 cols.put(col.name(), col.duckType());
-                // 列增加后 SQL 片段（cols/proj/stageCols）已过期，失效对应 OID 缓存
-                Integer oidForTable = lakeTableOid.get(lakeTable);
-                if (oidForTable != null) sqlCache.remove(oidForTable);
                 log.warn("RawPg 加列（Relation 自愈）: {}.{} ({})", lakeTable, col.name(), col.duckType());
+            } else if (!have.equals(col.duckType())) {
+                followTypeChange(conn, lakeTable, rel, col, have, cols);
             }
         }
+    }
+
+    /**
+     * Relation 类型与湖表类型不一致时，优先使用 DuckLake 原生 ALTER；不支持的转换再用
+     * CAST 临时表原子换表。该方法只从 writeBatch 的事务外阶段调用。
+     */
+    private void followTypeChange(Connection conn, String lakeTable, RelInfo rel, ColDef col,
+                                  String have, Map<String, String> cols) throws SQLException {
+        String driftKey = lakeTable + "." + col.name();
+        if (!props.getMaintenance().isFollowTypeChange()) {
+            if (typeDriftWarned.add(driftKey)) {
+                log.warn("RawPg 类型漂移未跟随(followTypeChange=false): {} {} -> {}",
+                        driftKey, have, col.duckType());
+            }
+            return;
+        }
+
+        SQLException alterFailure;
+        try (Statement s = conn.createStatement()) {
+            s.execute("ALTER TABLE " + DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable)
+                    + " ALTER COLUMN \"" + col.name() + "\" SET DATA TYPE " + col.duckType());
+            cols.put(col.name(), col.duckType());
+            invalidateSql(lakeTable);
+            typeDriftWarned.remove(driftKey);
+            syncState.getDdlApplied().increment();
+            log.warn("RawPg 类型跟随(ALTER): {} {} -> {}", driftKey, have, col.duckType());
+            return;
+        } catch (SQLException e) {
+            alterFailure = e;
+            log.info("RawPg 原生 ALTER 类型失败，尝试 CAST 换表: {} {} -> {} ({})",
+                    driftKey, have, col.duckType(), e.getMessage());
+        }
+
+        try {
+            rewriteTableWithCasts(conn, lakeTable, rel, cols);
+            invalidateSql(lakeTable);
+            typeDriftWarned.remove(driftKey);
+        } catch (SQLException rewriteFailure) {
+            rewriteFailure.addSuppressed(alterFailure);
+            throw new SQLException("RawPg 类型迁移失败: " + driftKey + " " + have + " -> "
+                    + col.duckType(), rewriteFailure);
+        }
+    }
+
+    /** 使用 Relation 的当前目标类型重写湖表；显式事务保证 DROP/RENAME 对读者原子可见。 */
+    private void rewriteTableWithCasts(Connection conn, String lakeTable, RelInfo rel,
+                                       Map<String, String> cols) throws SQLException {
+        if (!conn.getAutoCommit()) {
+            throw new SQLException("RawPg CAST 换表必须在湖数据事务外执行: " + lakeTable);
+        }
+        Map<String, String> wanted = new LinkedHashMap<>();
+        for (ColDef col : rel.cols()) wanted.put(col.name(), col.duckType());
+
+        StringBuilder projection = new StringBuilder();
+        for (Map.Entry<String, String> current : cols.entrySet()) {
+            String target = wanted.get(current.getKey());
+            projection.append(projection.isEmpty() ? "" : ", ");
+            if (target != null && !target.equals(current.getValue())) {
+                projection.append(typeMigrationCastExpr("\"" + current.getKey() + '"',
+                                current.getValue(), target))
+                        .append(" AS \"").append(current.getKey()).append('"');
+            } else {
+                projection.append('"').append(current.getKey()).append('"');
+            }
+        }
+
+        String schemaName = lakeTable.substring(0, lakeTable.indexOf('.'));
+        String tableName = lakeTable.substring(lakeTable.indexOf('.') + 1);
+        String tmpName = tableName + "__typemig";
+        String qTmp = DuckLakeEngine.LAKE + ".\"" + schemaName + "\".\"" + tmpName + "\"";
+        String qTable = DuckLakeEngine.LAKE + "." + DuckLakeEngine.quoted(lakeTable);
+
+        conn.setAutoCommit(false);
+        try {
+            try (Statement s = conn.createStatement()) {
+                s.execute("DROP TABLE IF EXISTS " + qTmp);
+                s.execute("CREATE TABLE " + qTmp + " AS SELECT " + projection + " FROM " + qTable + " LIMIT 0");
+            }
+            ddlApplier.applySortedByPk(conn, schemaName + "." + tmpName, rel.keyColumns());
+            try (Statement s = conn.createStatement()) {
+                s.execute("INSERT INTO " + qTmp + " SELECT " + projection + " FROM " + qTable);
+                s.execute("DROP TABLE " + qTable);
+                s.execute("ALTER TABLE " + qTmp + " RENAME TO \"" + tableName + '"');
+            }
+            conn.commit();
+        } catch (SQLException e) {
+            conn.rollback();
+            throw e;
+        } finally {
+            conn.setAutoCommit(true);
+        }
+
+        Map<String, String> fresh = loadLakeCols(conn, lakeTable);
+        cols.clear();
+        cols.putAll(fresh);
+        syncState.getDdlApplied().increment();
+        log.warn("RawPg 类型跟随(CAST 换表): {} -> {}", lakeTable, fresh);
+    }
+
+    /** 旧版本 PG 数组曾以 VARCHAR 保存花括号文本，迁移到 LIST 前先归一化为 DuckDB 列表文本。 */
+    private static String typeMigrationCastExpr(String column, String currentType, String targetType) {
+        if ("VARCHAR".equals(currentType) && targetType.endsWith("[]")) {
+            return "CAST(replace(replace(" + column + ", '{', '['), '}', ']') AS " + targetType + ')';
+        }
+        return "CAST(" + column + " AS " + targetType + ')';
+    }
+
+    private void invalidateSql(String lakeTable) {
+        sqlCache.keySet().removeIf(rel -> lakeTableName(rel).equals(lakeTable));
     }
 
     private Map<String, String> loadLakeCols(Connection conn, String lakeTable) throws SQLException {
@@ -473,7 +790,7 @@ class RawPgReader {
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     cols.put(rs.getString(1),
-                            org.dpdns.zerodep.ducklake.sink.TypeMapper.normalizeDuckType(rs.getString(2)));
+                            org.dpdns.zerodep.ducklake.sink.DuckType.normalize(rs.getString(2)));
                 }
             }
         }
@@ -495,7 +812,7 @@ class RawPgReader {
 
     private PGReplicationStream openStream(Connection conn, long startLsn) throws SQLException {
         PGConnection pg = conn.unwrap(PGConnection.class);
-        ensureSlotExists(pg);
+        ensureSlotExists(pg, startLsn);
         var builder = pg.getReplicationAPI()
                 .replicationStream()
                 .logical()
@@ -519,7 +836,7 @@ class RawPgReader {
      * 协议下也能跑 SELECT，但 PG 对 replication 连接的普通 SQL 支持未在文档中明确保证，
      * 且无法使用扩展查询协议（PreparedStatement）—— 独立连接更安全。
      */
-    private void ensureSlotExists(PGConnection pg) throws SQLException {
+    private void ensureSlotExists(PGConnection pg, long startLsn) throws SQLException {
         boolean exists;
         String url = "jdbc:postgresql://%s:%d/%s".formatted(src.getHostname(), src.getPort(), src.getDbname());
         try (java.sql.Connection plain = DriverManager.getConnection(url, src.getUser(), src.getPassword());
@@ -531,6 +848,11 @@ class RawPgReader {
             }
         }
         if (exists) return;
+        if (startLsn != 0) {
+            throw new SQLException("replication slot '" + src.getSlotName()
+                    + "' 已丢失，但 catalog 仍有非零 offset 0x" + Long.toHexString(startLsn)
+                    + "；自动新建会静默跳过 WAL，拒绝继续。请执行受控全量重建并清理对应 offset 后重启");
+        }
         log.info("RawPg replication slot '{}' 不存在，自动创建（pgoutput）", src.getSlotName());
         pg.getReplicationAPI()
                 .createReplicationSlot()
@@ -542,15 +864,18 @@ class RawPgReader {
 
     // ──────────── pgoutput Tuple 解析 ────────────
 
-    /** 读取 TupleData（Int16 列数 + 各列 kind/data），返回与 RelInfo.cols() 等长的字符串数组。*/
-    private String[] readTuple(ByteBuffer msg, RelInfo rel) {
+    /** 读取 TupleData，显式保留 {@code u}（unchanged TOAST），不能与 SQL NULL 混为一谈。 */
+    private TupleData readTuple(ByteBuffer msg, RelInfo rel) {
         if (rel == null) { skipTuple(msg); return null; }
         int colCount = msg.getShort() & 0xFFFF;
         String[] vals = new String[rel.cols().size()];
+        boolean[] unchanged = new boolean[rel.cols().size()];
         for (int i = 0; i < colCount; i++) {
             byte kind = msg.get();
             if (kind == 'n') { /* null */ }
-            else if (kind == 'u') { /* unchanged toast */ }
+            else if (kind == 'u') {
+                if (i < unchanged.length) unchanged[i] = true;
+            }
             else if (kind == 't') {
                 int len = msg.getInt();
                 byte[] bytes = new byte[len];
@@ -558,7 +883,7 @@ class RawPgReader {
                 if (i < vals.length) vals[i] = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
             }
         }
-        return vals;
+        return new TupleData(vals, unchanged);
     }
 
     private void skipTuple(ByteBuffer msg) {
@@ -586,7 +911,7 @@ class RawPgReader {
     // ──────────── 工具方法 ────────────
 
     /**
-     * raw-pg 专用 CAST 表达式：与 TypeMapper.castExpr 等价，但处理 pgoutput bytea 的 \x 前缀。
+     * pgoutput 文本值的 CAST 表达式，特别处理 bytea 的 \x 前缀。
      * 参数 col 已含引号（如 "\"col\"" 或 "s.\"col\""）。
      */
     private static String castExprRaw(String col, String duckType) {
@@ -626,4 +951,3 @@ class RawPgReader {
         }
     }
 }
-

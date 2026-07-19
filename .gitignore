@@ -43,3 +43,7 @@ build/
 
 ### 本地日志(dev 文件日志 logging.file.name) ###
 /logs/
+
+### JVM 原生崩溃诊断（可能包含进程参数/环境信息，只保留本机） ###
+hs_err_pid*.log
+replay_pid*.log

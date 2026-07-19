@@ -14,34 +14,13 @@
     <artifactId>debezium-server-ducklake</artifactId>
     <version>0.1.0-SNAPSHOT</version>
     <name>debezium-server-ducklake</name>
-    <description>PostgreSQL 流式 CDC 入湖 DuckLake（Debezium Embedded Engine + 内嵌 DuckDB）——单进程、零 Kafka、独立启动的湖写入者</description>
+    <description>PostgreSQL/MySQL 原生复制流入湖 DuckLake（pgoutput/ROW binlog + 内嵌 DuckDB）</description>
     <packaging>jar</packaging>
 
     <properties>
         <java.version>25</java.version>
-        <debezium.version>3.6.0.Final</debezium.version>
         <duckdb.version>1.5.4.0</duckdb.version>
     </properties>
-
-    <dependencyManagement>
-        <dependencies>
-            <dependency>
-                <groupId>io.debezium</groupId>
-                <artifactId>debezium-bom</artifactId>
-                <version>${debezium.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
-            </dependency>
-            <!-- kafka connect-runtime 传递的 plexus-utils 强制升 4.0.3:
-                 CVE-2025-67030(Expand.extractFile 目录穿越)修复版为 3.6.1/4.0.3,
-                 4.0.x 保留 plexus.util 基础包,connect-runtime 运行时兼容(实测) -->
-            <dependency>
-                <groupId>org.codehaus.plexus</groupId>
-                <artifactId>plexus-utils</artifactId>
-                <version>4.0.3</version>
-            </dependency>
-        </dependencies>
-    </dependencyManagement>
 
     <dependencies>
 
@@ -53,61 +32,27 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
-        <!-- Debezium PG 连接与 offset storage 的 JDBC 驱动（connector 亦有传递，显式声明防版本漂移）。
-             compile scope：RawPgReader 直接使用 pgjdbc replication API（PGConnection/PGReplicationStream），
-             需要编译期可见；运行期由 Spring Boot fat jar 覆盖，无副作用。 -->
+        <!-- PostgreSQL 原生 pgoutput reader 与 catalog offset 共用 pgjdbc。 -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
         </dependency>
-        <!-- MySQL 源（source.type=mysql）的 JDBC 驱动：snapshot/元数据读取用；binlog 流式
-             走 connector 传递的 io.debezium:mysql-binlog-connector-java。版本由 Boot BOM 托管 -->
+        <!-- MySQL scanner 与 information_schema 元数据读取。 -->
         <dependency>
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
             <scope>runtime</scope>
         </dependency>
+        <!-- MySQL 原生 ROW binlog reader；只保留底层协议客户端，不引入 Engine/Kafka Connect。 -->
+        <dependency>
+            <groupId>io.debezium</groupId>
+            <artifactId>mysql-binlog-connector-java</artifactId>
+            <version>0.41.0</version>
+        </dependency>
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
             <scope>compile</scope>
-        </dependency>
-
-        <!-- Debezium Embedded Engine（纯库，非 Quarkus Server）；版本由 root 的 debezium-bom 统一管理 -->
-        <dependency>
-            <groupId>io.debezium</groupId>
-            <artifactId>debezium-embedded</artifactId>
-            <exclusions>
-                <!-- kafka connect-runtime 传递的 log4j 系 SLF4J 绑定与 Boot 的 logback 冲突，排除 -->
-                <exclusion>
-                    <groupId>org.apache.logging.log4j</groupId>
-                    <artifactId>log4j-slf4j-impl</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>org.apache.logging.log4j</groupId>
-                    <artifactId>log4j-slf4j2-impl</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>org.slf4j</groupId>
-                    <artifactId>slf4j-reload4j</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-        <dependency>
-            <groupId>io.debezium</groupId>
-            <artifactId>debezium-connector-postgres</artifactId>
-        </dependency>
-        <!-- MySQL 8.0+ 源连接器（binlog 解码 + ANTLR DDL 解析；MySQL/MariaDB 共享
-             debezium-connector-binlog 基座，均由 connector 传递） -->
-        <dependency>
-            <groupId>io.debezium</groupId>
-            <artifactId>debezium-connector-mysql</artifactId>
-        </dependency>
-        <!-- offset 存 PG（JdbcOffsetBackingStore）；PG 连接器无需 schema history，
-             MySQL 源的 schema history 亦经本模块的 JdbcSchemaHistory 存同一 catalog PG -->
-        <dependency>
-            <groupId>io.debezium</groupId>
-            <artifactId>debezium-storage-jdbc</artifactId>
         </dependency>
 
         <!-- 内嵌 DuckDB（ducklake/httpfs 扩展运行时 INSTALL/LOAD，非 Maven 依赖） -->
@@ -121,25 +66,6 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
-        </dependency>
-
-        <!-- ⚠️ Boot 4 默认 Jackson 3(tools.jackson)，spring-boot-jackson 对 Jackson 2 的依赖
-             全部 optional 声明；Maven nearest-wins 让 Kafka Connect/Debezium 传递来的 Jackson 2
-             (JsonConverter/offset 序列化要用)也被判 optional，repackage 不进 fat jar →
-             启动 NoClassDefFoundError: com.fasterxml.jackson.annotation.JsonInclude$Value(实测)。
-             显式非 optional 声明拉回 runtime classpath；版本由 Boot BOM 的 jackson-bom 托管。 -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-        </dependency>
-        <dependency>
-            <!-- databind 的传递声明同样被 nearest-optional 覆盖，必须单列 -->
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-annotations</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.fasterxml.jackson.datatype</groupId>
-            <artifactId>jackson-datatype-jsr310</artifactId>
         </dependency>
 
         <!-- 测试：单元测试对真 DuckDB 内存库跑（零外部依赖）；
@@ -195,10 +121,9 @@
                 </configuration>
             </plugin>
             <plugin>
-                <!-- 每个测试类独立 JVM:两个 @SpringBootTest(PG/MySQL 集成测试)同 JVM 顺序跑时,
-                     先跑完的类容器已停、其 Spring 缓存上下文里的 Debezium 引擎/DuckDB ATTACH
-                     仍存活并向已死容器狂报错,交叉污染后一个类的上下文加载(CI 实测:PG 类
-                     Failed to load ApplicationContext);独立 fork 彻底隔离缓存上下文、
+                <!-- 每个测试类独立 JVM：PG/MySQL 集成测试同 JVM 顺序跑时，先结束的源容器
+                     已停止但缓存上下文中的后台 reader/DuckDB ATTACH 仍存活，会污染后一类；
+                     独立 fork 彻底隔离缓存上下文、
                      Testcontainers 静态容器与 DuckDB 命名内存实例,代价约每类 +3s JVM 启动 -->
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>

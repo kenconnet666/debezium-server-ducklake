@@ -14,7 +14,7 @@ ducklake:
     slot-name: dbz_ducklake
     publication-name: dbz_publication
   lake:
-    # 独立元空间实例(与源库分离,拓扑与 prod 一致;承载湖 catalog + Debezium offset + schema history)
+    # 独立元空间实例（与源库分离；承载湖 catalog + 原生 reader offset）
     catalog-host: 127.0.0.1
     catalog-port: 15434
     catalog-db: ducklake_catalog

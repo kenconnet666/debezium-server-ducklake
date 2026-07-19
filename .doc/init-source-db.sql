@@ -16,7 +16,7 @@ END $$;
 GRANT pg_read_all_data TO dbuser_cdc;
 
 -- ② publication：FOR ALL TABLES 整库发布——所有 schema 的表、含新建表自动纳入捕获
---    （服务端默认整库同步:存量 initial 快照 + WAL 增量,湖表 <schema>_<表> 自动一一对应;
+--    （服务端默认整库同步：scanner 存量首灌 + WAL 增量，湖表按 schema/table 一一对应；
 --     需收窄范围时改用 FOR TABLES IN SCHEMA ... 并配 DUCKLAKE_SCHEMA_INCLUDE）
 DO $$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_publication WHERE pubname = 'dbz_publication') THEN
@@ -26,8 +26,8 @@ END $$;
 
 -- ② 方案B 按 schema 分片 publication（多实例横向扩展，聚合吞吐近线性，harness 实测 2× 线性）。
 -- 按需取消注释，每实例对应一个独立 slot + publication：
---   实例A：slot=dbz_ducklake_a  publication=pub_schema_a  schema-include-list=schema_a  topic-prefix=ducklake_a
---   实例B：slot=dbz_ducklake_b  publication=pub_schema_b  schema-include-list=schema_b  topic-prefix=ducklake_b
+--   实例A：slot=dbz_ducklake_a  publication=pub_schema_a  schema-include-list=schema_a
+--   实例B：slot=dbz_ducklake_b  publication=pub_schema_b  schema-include-list=schema_b
 -- 注意：每路 walsender 全量解码 WAL 再按 publication 过滤，N 个分片 = N× WAL 读放大；
 --       按表拆 publication（每路只解码自己 schema 的 WAL 再过滤）优于按行 hash 分片同一热表。
 -- DO $$ BEGIN
@@ -39,7 +39,7 @@ END $$;
 --   END IF;
 -- END $$;
 
--- ③ DuckLake catalog（湖元数据 + Debezium offset 存储）——**推荐独立 PG 实例承载**
+-- ③ DuckLake catalog（湖元数据 + 原生 reader offset）——**推荐独立 PG 实例承载**
 --    （.docker/postgres/docker-compose.yml 即此形态：catalog-pg 容器由 POSTGRES_USER=lake_admin /
 --     POSTGRES_DB=ducklake_catalog 环境变量直接建好，无需任何脚本）。
 --    仅当与源库共用同一实例时才取消下面两行注释：
@@ -93,20 +93,7 @@ CREATE EVENT TRIGGER trg_capture_drop ON sql_drop
 
 GRANT TRUNCATE ON public.dbz_ddl_log TO dbuser_cdc;  -- 维护任务定期清空防堆积
 
--- ⑤ Debezium 增量快照 signal 表（source channel）：
---    类型严格跟随的"重建+重拉"兜底经它触发；连接器的快照水位标记也写在此表
-CREATE TABLE IF NOT EXISTS public.dbz_signal (
-    id varchar(42) PRIMARY KEY, type varchar(32) NOT NULL, data varchar(2048));
-GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON public.dbz_signal TO dbuser_cdc;
-
--- ⑥ 心跳表：heartbeat.action.query 周期 UPSERT，防"零流量时 slot 无限扣留实例级 WAL"
---    （LSN flush mode 'connector' 只在事件处理时确认；纯空闲必须造真实事件闭环）
-CREATE TABLE IF NOT EXISTS public.dbz_heartbeat (
-    id int PRIMARY KEY, ts timestamptz NOT NULL DEFAULT now());
-ALTER TABLE public.dbz_heartbeat REPLICA IDENTITY FULL;
-GRANT SELECT, INSERT, UPDATE ON public.dbz_heartbeat TO dbuser_cdc;
-
--- ⑦ 业务表要求：**必须有主键**（无主键的表在 FOR ALL TABLES publication 下
+-- ⑤ 业务表要求：**必须有主键**（无主键的表在 FOR ALL TABLES publication 下
 --    连源库自己的 DELETE/UPDATE 都会被 PG 拒绝(55000)，湖侧也只能降级 insert-only）。
 --    无需 REPLICA IDENTITY FULL——镜像 upsert 只按主键定位行，DEFAULT（主键旧值）
 --    足够且更省 WAL（FULL 会把整行旧值写入 WAL，宽表高频更新时膨胀明显）。

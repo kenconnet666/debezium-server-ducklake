@@ -1,452 +1,464 @@
 # debezium-server-ducklake
 
-PostgreSQL / MySQL → [DuckLake](https://ducklake.select/) 的流式 CDC 入湖器。**单进程、零 Kafka**：Debezium Embedded Engine 解码复制流（PG 逻辑复制 / MySQL binlog），内嵌 DuckDB 直写湖仓——catalog 存 PostgreSQL、数据落 S3 Parquet。
+PostgreSQL / MySQL → DuckLake 的单进程 CDC 入湖器。仓库名为历史遗留；当前运行时已经不再使用
+Debezium Engine、Kafka Connect、SMT、schema history 或 signal 表：
 
-```
-┌─────────────┐  pgoutput / binlog  ┌──────────────────────────────────┐      ┌─────────────────┐
-│ PostgreSQL  │────────────────────▶│  debezium-server-ducklake (JVM)  │─────▶│  DuckLake 湖仓   │
-│  或 MySQL   │  逻辑复制槽/ROW 流   │  Debezium Embedded ──▶ 内嵌DuckDB │      │ catalog: PG 库   │
-│  (业务库)   │                     │  批消费·两阶段写入·DDL 跟随·维护   │      │ data: S3 Parquet │
-└─────────────┘                     └──────────────────────────────────┘      └─────────────────┘
-                                            ▲ /watermark · /actuator/prometheus
+```text
+PostgreSQL pgoutput ── pgjdbc replication ─┐
+                                           ├─ 全 VARCHAR staging ─ DuckLake 事务 ─ PG catalog + S3/本地文件
+MySQL ROW binlog ─── BinaryLogClient ──────┘
 ```
 
-## 特性
+Java 25 + Spring Boot 4.1 + DuckDB 1.5.4，单进程、零 Kafka。PG/MySQL 源由
+`ducklake.source.type` 选择，对应的原生 reader 自动启动，不再有 engine 模式开关。
 
-- **零中间件**：不需要 Kafka / Kafka Connect / Quarkus Debezium Server，一个 Spring Boot 进程搞定采集与写入
-- **双源支持**：`source.type=postgres|mysql` 一键切换——PG 走逻辑复制（slot+publication），MySQL 8.0+ 走 binlog（ROW/FULL 为 8.0 出厂默认，源库近乎零配置；schema history 与 offset 同存 catalog PG，容器无状态）
-- **当前态镜像**：湖表 = 主库当前态，列一一对应、无任何元数据列——UPDATE 就地更新、DELETE 物理跟随（批量 upsert/delete，merge-on-read），查询直接 `SELECT` 即所见即主库，无需窗口函数去重
-- **默认整库同步**：`FOR ALL TABLES` publication + 不限 schema，存量 initial 快照 + WAL 增量都拉，湖 schema 直接镜像 PG schema（`lake.<schema>.<表>`，可配前缀），新建表自动纳入
-- **高吞吐写入路径**：DuckDB Appender 两阶段写（内存 staging 全 VARCHAR 物化 → 单湖事务按主键批量 DELETE + `INSERT SELECT` 向量化 CAST），实测行成本比 prepared-batch 低两个数量级
-- **自适应双模式**：小批（默认 ≤512 行）走 DuckLake Data Inlining 直写 catalog 元空间（最低延迟、零小文件）；大批自动走 Parquet 向量化直写——按批粒度自动切换，无需干预
-- **DDL 跟随**：源库 `RENAME COLUMN` / `DROP COLUMN` / `DROP TABLE` / **表与列的 `COMMENT` 注释**同步到湖表——PG 经 event trigger 审计流，MySQL 直接消费 binlog 原生 schema change 事件（**源库零审计基建**，另支持 `RENAME TABLE` 与 `TRUNCATE` 跟随）；新表建表/加列由事件 schema 驱动，两者幂等互补
-- **类型严格跟随**：源库 `ALTER COLUMN TYPE` 后湖列逐级对齐（就地 ALTER → 整表 CAST 重写 → 删表重建 + 重灌兜底）
-- **scanner 直拉重灌**：重建类重灌（主键变更/类型不可转）默认走 DuckDB postgres/mysql scanner 只读直连源库 `INSERT INTO ... SELECT`（实测 100 万行 PG 1.2s / MySQL 4.0s，比 Debezium 快照重灌快 36×/11× 且不停流）；源不可达自动降级 signal 快照
-- **首次接入 scanner 化**：首启零配置整库接入（自动发现全部库表→建湖表→灌存量→无缝接增量）默认由 scanner 承担存量段——快照降 `no_data` 秒级拿位点、流式即刻开始，存量后台直灌与增量 anti-join 收敛；无主键/跨库表自动 signal blocking 兜底，进度存 catalog 崩溃续跑
-- **时间旅行**：DuckLake snapshot 独立提供（默认保留 30 天）——湖是当前态镜像，但保留期内任意时刻可 `AT (TIMESTAMP ...)` 回看，误删有后悔窗口
-- **可靠性**：at-least-once 语义——湖事务提交成功后才推进 offset，崩溃/断电重启自动从上个 offset 重放；镜像 upsert 天然幂等（重放同批=同样结果）
-- **空闲 WAL 防护**：心跳 action query 闭环，防止 publication 空闲时复制槽无限扣留实例级 WAL
-- **湖内维护**：分层压实（防写放大的关键设计）、快照过期清理、inlined 数据定时落盘，全部进程内调度
-- **可观测**：`/watermark` 水位线接口（湖侧权威提交时刻 + 源事件时刻 + 分段延迟）、Prometheus 指标（`ducklake_*` 系列）
+## 当前结论
 
-## 快速开始
+2026-07-19 的本机 Docker Desktop 实测显示：
 
-### 0. 环境要求
+| 数据库 | 当前原生完整链 | 协议/写入上限 | 历史 Embedded 完整链 | 结论 |
+|---|---:|---:|---:|---|
+| PostgreSQL 18 | 追赶 68,870–87,873 行/秒；4 表 27,708–28,003 行/秒 | pgjdbc 直读 pgoutput 153,000–163,000 行/秒 | Debezium Embedded（无 Kafka）约 22,400–26,491 行/秒 | 原生路径有明显余量；冷表流式场景仍受首次建表阻塞 |
+| MySQL 8.4 | 单表 59,934 行/秒；4 表 67,636 行/秒 | 解码 514,138 行/秒；解码 + staging 384,615 行/秒 | Debezium Embedded（无 Kafka）单表 25,803 行/秒；4 表 41,288 行/秒 | 原生完整链约为旧路径的 2.3× / 1.6× |
 
-- JDK 25+ / Maven 3.9+
-- 源库二选一：PostgreSQL 14+（`wal_level=logical`，推荐 PG 16+）或 **MySQL 8.0+**（含 8.4 LTS / 9.x，不支持 5.7；binlog ROW/FULL 为出厂默认）
-- S3 兼容对象存储（MinIO / rustfs / AWS S3...）；本地体验也可用文件系统路径
+PostgreSQL 与 MySQL 的语义回归最近分别为 38/38（`DdlApplierTest`、原生 pgoutput 与完整应用链）
+和 16/16；MySQL 两类吞吐测试为 4/4。PG 吞吐基准的追赶与 4 表项通过，但冷表在线流式项连续
+两次约 4,430 行/秒，低于当前 5,000 行/秒断言。详细计时口径、延迟分位数与测试矩阵见下文，
+不会把协议解码、源端造数和端到端落湖数据混为同一种吞吐。
 
-### 1. 一键体验（Docker Compose）
+## 数据与一致性语义
 
-两套源栈独立自包含（`.docker/postgres/` 与 `.docker/mysql/`，project/端口/数据目录全错开，可并存同机），按源库类型选一套：
-
-```bash
-mvn package -DskipTests
-docker compose -f .docker/postgres/docker-compose.yml --profile app up -d --build   # 全栈(app 也进容器)
-```
-
-PG 栈内容：源库 PG（Debian bookworm + [Pigsty pig](https://pigsty.io/docs/pig/) 扩展仓库，
-加插件一行 `pig ext install <name> -v 18 -y`）+ **独立元空间 PG**（catalog-pg，湖元数据
-高频小事务与源库隔离）+ rustfs(S3) + 本服务。CDC 全套基建（角色/publication/DDL 审计/
-signal/心跳表）由 initdb 自动完成——**up 即可用，无需手动初始化**。
-
-镜像统一约定：**全部 Debian 基础镜像**（本服务跑 JetBrains Runtime 25，rustfs 用官方
-gnu 二进制自建，MySQL 用 bookworm-slim + 官方 APT 仓库自建，均非 alpine/Oracle Linux），
-构建期换国内源，内置排障工具（`procps`/`iproute2`/`less`/`jq`）。目录布局——每套栈
-一个 `docker-compose.yml`，每服务一个子目录放各自 `Dockerfile`（本服务生产镜像源无关，
-`Dockerfile` 提到顶层 `.docker/ducklake/`，两栈与 CI 共用），持久化数据落各自
-`<服务>/data/`（bind mount，备份/清理一个目录搞定）：
-
-```
-.docker/
-├── ducklake/                 # 本服务生产镜像 Dockerfile(源无关,两栈+CI 共用;PG/MySQL 由环境变量切换)
-├── postgres/                 # PG 源完整栈(project: ducklake-pg)
-│   ├── docker-compose.yml
-│   ├── e2e-verify.sh         # 端到端冒烟(建表→落湖→DDL 跟随→心跳,PASS/FAIL 汇总)
-│   ├── bench.sh 等           # 性能基线四阶段 + 参数矩阵(README 性能节口径)
-│   ├── postgres/             # 源库:postgres:18-bookworm + pig(Dockerfile + initdb/ + data/)
-│   ├── catalog-pg/           # 元空间:复用源库镜像(仅 data/)
-│   ├── rustfs/               # S3:Debian 13 + rustfs gnu 二进制 + mc(Dockerfile + data/)
-│   └── ducklake/             # 本服务运行数据(仅 data/duckdb-ext;镜像 Dockerfile 见顶层 .docker/ducklake/)
-└── mysql/                    # MySQL 源完整栈(project: ducklake-mysql)
-    ├── docker-compose.yml
-    ├── e2e-verify.sh         # 冒烟(另含 RENAME COLUMN/TRUNCATE 跟随断言)
-    ├── mysql/                # 源库:自建 Debian 镜像(bookworm-slim + MySQL 8.4 APT 清华源,
-    │                         #   Dockerfile + entrypoint.sh + conf.d/ + initdb/ + data/)
-    ├── catalog-pg/           # 元空间:官方 postgres:18-bookworm(仅 data/)
-    ├── rustfs/               # 同 PG 栈(独立实例与数据)
-    └── ducklake/             # 同 PG 栈(仅 data/)
-```
-
-写点数据看它流进湖：
-
-```sql
-CREATE TABLE demo (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text);  -- 主键必须有
-INSERT INTO demo (name) VALUES ('hello'), ('ducklake');
-```
-
-```bash
-curl http://127.0.0.1:19992/api/ducklake/watermark
-```
-
-**MySQL 源栈**（MySQL 8.4 + 元空间 PG + rustfs + 本服务）：
-
-```bash
-mvn package -DskipTests
-docker compose -f .docker/mysql/docker-compose.yml --profile app up -d --build
-# 写数据(业务库 shop 由 initdb 建好;CDC 账号/signal/心跳表同样自动就绪):
-docker compose -f .docker/mysql/docker-compose.yml exec mysql \
-  mysql -uroot -pchangeme shop -e "CREATE TABLE demo(id bigint AUTO_INCREMENT PRIMARY KEY, name varchar(64)); INSERT INTO demo(name) VALUES ('hello'),('mysql');"
-curl http://127.0.0.1:19993/api/ducklake/watermark    # 湖表 lake.shop.demo
-(cd .docker/mysql && bash e2e-verify.sh)              # 端到端冒烟
-```
-
-### 2. 本机开发（主程序在 IntelliJ 里 Run）
-
-**推荐：infra 用一键栈、app 在 IDE 里跑**——改一行代码即时重启，不必每次 `mvn package` + 重建镜像。
-用 PG 栈的 infra-only 模式（不带 `--profile app`，容器版 app 不会起）：
-
-```bash
-docker compose -f .docker/postgres/docker-compose.yml up -d   # 只起 源库/catalog-pg/rustfs
-```
-
-然后 IntelliJ 里以 **active profile = `dev`** Run 主程序即可——`src/main/resources/dev/ducklake.yml`
-已把端口/口令对齐到该栈（源库 15432 / catalog 15434 / S3 19000）。收工 `docker compose ... down`。
-
-**或：接入你已有的源库。** PG 源用 `docs/init-source-db.sql`、MySQL 源用
-`docs/init-source-mysql.sql` 初始化（catalog 推荐独立 PG 实例，见脚本注释），改
-`src/main/resources/dev/ducklake.yml` 指向你的源库与 S3（MySQL 另设 `source.type: mysql`
-+ `port: 3306`），然后：
-
-```bash
-mvn spring-boot:run
-```
-
-## 数据语义（重要）
-
-湖表是**主库当前态镜像**：列与源表一一对应（无 `__*` 元数据列），UPDATE 就地更新、DELETE 物理跟随、`DROP TABLE` 跟随删湖表。查询当前态就是普通 `SELECT`：
-
-```sql
-SELECT * FROM lake.public.demo;   -- 所见即主库当前态(滞后=复制延迟,毫秒-秒级)
-```
-
-历史版本由 DuckLake snapshot 承担（默认保留 30 天，`maintenance.snapshot-retain-days` 可调）：
-
-```sql
-SELECT * FROM lake.public.demo AT (TIMESTAMP '2026-07-12 08:00:00');  -- 时间旅行回看
-```
-
-表/列的 `COMMENT ON` 注释也自动跟随到湖（增量跟随：改造部署后新执行的 COMMENT 会同步；存量注释可重新执行一遍 COMMENT 语句补齐）。
-
-### 变更跟随矩阵（库/表/列各类变更在两源下的行为）
-
-| 源库变更 | PostgreSQL 源 | MySQL 源 | 说明 |
-|---|---|---|---|
-| INSERT / UPDATE / DELETE | ✅ 镜像 upsert / 物理跟随 | ✅ 同 | 无主键表降级 insert-only（UPDATE/DELETE 不跟随，每表告警一次） |
-| 主键值本身被 UPDATE | ✅ | ✅ | Debezium 发 DELETE(旧键)+INSERT(新键) 事件对，镜像 upsert 天然正确 |
-| CREATE TABLE（含空表） | ✅ DDL 即刻建 | ✅ DDL 即刻建 | PG 连源库读列定义（**部署后新建的表**；存量空表无事件覆盖不到）；MySQL 用 schema change 全列结构，**存量空表借初始快照一并补齐**；类型偏差由数据驱动自愈 |
-| ADD COLUMN | ✅ DDL 即刻建列 | ✅ DDL 即刻建列 | 不等数据事件：PG 连源库读目标态、MySQL 用 tableChanges 全列（含注释）；数据驱动 ensureTable 仍为幂等兜底 |
-| 列顺序变更 | ✅ 目标态对齐重排 | ✅ 整表重写换表重排（`AFTER`/`FIRST`） | DuckDB 无列重排语法，按源目标序换表（空表阶段挂排序聚簇+重刷注释，湖独有历史列追尾保留）；失败兜底重建+快照重灌。注：PG 本身无列重排语法（所有版本），差异多来自表重建，机制同样对齐 |
-| DROP COLUMN | ✅ 目标态 diff（审计 sql_drop 双保险） | ✅ 目标态 diff | DDL 到达即按"源目标列集合"对齐删除，免正则/审计配对依赖；`follow-drop-column=false` 时湖保留历史列（重排时追尾） |
-| RENAME COLUMN | ✅ 目录语义判定 | ✅ RENAME/CHANGE 正则 | 湖侧真 rename，数据无损（列存在性检查幂等） |
-| ALTER COLUMN TYPE | ✅ 数据驱动三级 | ✅ 同 | 就地 ALTER → 整表 CAST 重写 → 重建+重灌兜底（scanner 直拉，anti-join 免重；降级 signal 增量快照） |
-| 列 DEFAULT/NOT NULL/CHECK 变更 | ➖ 不跟随 | ➖ 不跟随 | 湖表设计上不带约束（分析场景无需），数据值不受影响 |
-| ADD PRIMARY KEY（存量表补主键） | ✅ 重建+重灌当前态 | ✅ 同 | 旧行主键回填无 CDC 事件，必须重灌。主路径 DDL 段事务内 scanner 就地重建直灌（秒级原子可见）；降级 blocking 快照（详见运维节） |
-| DROP 主键 | ⚠️ 降级告警 | ⚠️ 降级告警 | 掉主键后事件无 key → 湖侧自该时刻起 insert-only（告警提示）；湖历史行保留 |
-| RENAME TABLE | ✅ 湖表同步改名 | ✅ 湖表同步改名 | 数据无损（表存在性检查幂等） |
-| TRUNCATE | ✅ 湖表清空 | ✅ 湖表清空 | 两源同通路（op=t 事件），`follow-truncate` 可关 |
-| DROP TABLE | ✅ 湖表真删 | ✅ 同 | `follow-drop-table=false` 时保留；时间旅行窗口内旧 snapshot 仍可回看 |
-| DROP SCHEMA / DATABASE | ✅ 级联逐表删 | ✅ 湖 schema 级联删 | |
-| 表/列 COMMENT | ✅ COMMENT ON 语句跟随 | ✅ DDL 内嵌注释跟随 | 幂等覆盖；MySQL 存量表注释随初始快照落湖 |
-
-（✅ 自动跟随 ⏳ 数据驱动延迟跟随 ⚠️ 降级+告警 ➖ 设计上不适用 ❌ 暂不支持）
-
-### 类型映射要点
-
-湖列类型由 Debezium 事件 schema 推导（`decimal.handling.mode=precise` + `time.precision.mode=isostring`，两源同一套 [`TypeMapper`](src/main/java/org/dpdns/zerodep/ducklake/sink/TypeMapper.java)）：
-
-| 源类型 | 湖列型 | 说明 |
+| 能力 | PostgreSQL | MySQL |
 |---|---|---|
-| 整数族 / FLOAT / DOUBLE / BOOLEAN | 同位原生类型 | MySQL `TINYINT(1)` 经官方 converter 统一为 BOOLEAN（快照/流式两阶段一致） |
-| DECIMAL / NUMERIC(p,s) | `DECIMAL(p,s)` 忠实对应 | 元数据保真，p≤18 走 int64 存储更省更快；PG 裸 `numeric`（无精度）→ `DECIMAL(38,18)`（20 位整数+18 位小数，可直接聚合）；p>38 或 s>p → VARCHAR 保精度（见局限） |
-| DATE / TIME / DATETIME / TIMESTAMP | DATE / TIME / TIMESTAMP / **TIMESTAMPTZ** | MySQL `TIMESTAMP` 有时区语义（UTC 规范化）→ TIMESTAMPTZ，`DATETIME` 无时区 → TIMESTAMP；时间族投影用 TRY_CAST，毒丸值（zero-date、±838h TIME）置 NULL 不断链 |
-| CHAR/VARCHAR/TEXT、ENUM、SET、UUID* | VARCHAR / UUID | *UUID 为 PG 特有；ENUM/SET 落文本 |
-| JSON / jsonb | **VARIANT**（`json-as-variant` 默认开，可关回 JSON） | 子字段 shredding 统计参与文件剪枝、`payload->>'k'` 免运行时解析；⚠️ DuckLake 1.0 下 VARIANT 表暂不参与 Data Inlining（小批直落 Parquet 由压实吸收，v1.1 拟解除） |
-| PG `interval` | `INTERVAL` 原生 | ISO8601 出流并转 DuckDB 认的形态，时长语义可直接运算 |
-| MySQL `BIGINT UNSIGNED` | `UBIGINT` 原生 | 自研 CustomConverter 无符号文本出流——8 字节整数替代 DECIMAL(20,0)，快照/流式两阶段一致 |
-| BINARY/BLOB/BYTEA、BIT(n>1) | BLOB | staging 走 hex 编码往返无损 |
-| GEOMETRY 族（MySQL / PostGIS） | BLOB（WKB） | DuckDB spatial 扩展可 `ST_GeomFromWKB` 直接解析 |
-| PG 一维数组 | 元素类型`[]`（DuckDB LIST） | `text[]`→`VARCHAR[]`、`int8[]`→`BIGINT[]` 等；嵌套数组/`bytea[]` 退 VARCHAR |
-| PG hstore、自定义类型等 | VARCHAR 兜底 | toString 原文保全，不丢数据 |
+| 增量协议 | pgoutput | ROW binlog |
+| 持久化位点 | `raw_pg_offset`：slot + LSN | `raw_mysql_offset`：source + file/position/GTID |
+| 位点推进 | 对应 DuckLake 事务提交成功后 | 完整源事务落湖后 |
+| INSERT / UPDATE / DELETE | 主键镜像 | 主键镜像 |
+| 主键值 UPDATE | 旧键 delete + 新键 upsert | 旧键 delete + 新键 upsert |
+| DDL | event trigger → `dbz_ddl_log` | binlog QueryEvent + `information_schema` |
+| 首次存量/重灌 | 独立 `postgres_scan(...)` | 只读 MySQL scanner ATTACH |
 
-未识别类型一律 VARCHAR 兜底并告警——**保证不丢数据是第一优先级**。
+写湖采用当前态镜像语义：同一批先按主键删除目标行，再对 staging 以主键取最后一条并 INSERT。
+进程在“湖已提交、offset 尚未提交”的窗口崩溃时会重放，但主键 upsert/delete 保持幂等。
 
-语义边界：**无主键表降级 insert-only**——Debezium 事件无 key 时湖侧无法定位行，UPDATE/DELETE 不跟随（两源一致；PG 逻辑复制本就要求有主键才有完整语义）。
+无主键表只能 insert-only：后续 INSERT 会进入湖，UPDATE/DELETE 无法可靠定位旧行；首次存量也不能
+用主键 anti-join 安全收敛，因此 bootstrap 会记录为 `no-pk-skip`。生产业务表应配置主键。
 
-### 只读查询湖
+### PostgreSQL 类型与精度
 
-任意 DuckDB 客户端（CLI / DataGrip / Python）直连只读 ATTACH，不经过本服务、不影响写入：
+PG reader 从 `pg_catalog.pg_attribute`/`pg_type` 读取 `format_type`、`atttypmod` 和 `attndims`，
+不再只依赖 `information_schema` 的顶层 `data_type`。因此下列声明会保留元素精度和维度：
 
-```sql
-INSTALL ducklake; LOAD ducklake; INSTALL httpfs; LOAD httpfs;
-CREATE SECRET rfs (TYPE s3, KEY_ID 'admin', SECRET '...', ENDPOINT 'host:9000', URL_STYLE 'path', USE_SSL false);
-ATTACH 'ducklake:postgres:dbname=ducklake_catalog host=... user=... password=...' AS lake (READ_ONLY);
-SELECT count(*) FROM lake.public.demo;
-```
-
-建议为分析建独立的只读 PG 角色与 S3 只读凭据。
-
-### 查询优化（DuckLake 没有索引，加速靠数据布局）
-
-DuckLake **不支持二级索引/CREATE INDEX**，官方列为 "unlikely to be supported"（OLAP 湖格式的定位——大数据量下索引维护成本不可接受；强制主键/唯一约束同理不支持）。查询加速的正道是**数据布局 + 统计剪枝**三板斧，按需对热点表启用（DuckDB 客户端连湖执行，一次生效）：
-
-**本服务默认已对有主键的新建湖表自动挂 `SORTED BY (主键)`**（`maintenance.sorted-by-pk`，
-默认 true）——CDC 小批的写出排序毫秒级，每个文件即刻有序、min/max 即刻收紧，压实时再全局
-重排。存量表或想换排序键（如按时间列）时手动执行：
-
-```sql
--- ① 排序聚簇(最推荐):写入不排序(不拖累 CDC 热路径),定期压实时自动按此键重排——
---    文件/row-group 的 min-max 统计变"紧",时间/主键过滤的文件剪枝立竿见影
-ALTER TABLE lake.public.orders SET SORTED BY (created_at ASC);
-CALL lake.set_option('sort_on_insert', false, table_name => 'orders');
-
--- ② 分区(追加型大表可选):只影响新写入,粗粒度为宜——每批写入按分区拆文件,
---    分区过细 × CDC 小批 = 小文件放大,且压实不跨分区合并
-ALTER TABLE lake.public.events SET PARTITIONED BY (day(created_at));
--- 高基数键点查:ALTER TABLE ... SET PARTITIONED BY (bucket(8, user_id));
-
--- ③ 读端缓存:远端 Parquet footer 进程内缓存,重复扫描明显提速
-SET enable_object_cache = true;
-```
-
-机制说明：DuckLake catalog 里的 `ducklake_file_column_stats`（每文件×每列 min/max/null_count）承担 zone map 角色，过滤谓词先在 catalog 层做 file skipping，选中的文件再由 DuckDB 用 Parquet row-group 统计与 bloom filter 二次跳过；`COUNT(*)` 直接由元数据回答不扫文件（DuckLake 1.0）。本服务已内置的分层压实会自动应用表上的 SORTED BY（压实即重排）。另注意：**查询延迟的大头常在 catalog PG 的元数据往返**——分析端与 catalog PG 同机房部署收益最大。乱序高基数列（UUID 等）min/max 剪枝失效，需 `bucket()` 分区或改用趋势递增键。
-
-**一层免费的隐形加速——Parquet Bloom filter（DuckDB ≥1.2 零配置自动生效）**：压实写出的
-文件里，**中低基数整数列**（row group 内 distinct 值 ≤ 行数 10%，即触发字典编码的列，如
-`tenant_id`/`status`/外键）会自动携带 Bloom filter，等值查询（`WHERE tenant_id=42`）在
-row-group 级再跳一轮——无需任何建索引动作。自增/雪花主键这类高基数列不触发（本就靠
-SORTED BY 的 min/max 剪枝）。对照业界：这一"排序聚簇+统计剪枝+自动 Bloom"组合正是
-ClickHouse（稀疏主键+skip index）与 Databricks（Liquid Clustering+data skipping，其手动
-Bloom filter 索引已弃用、转向全自动）收敛出的同一条路线；湖格式共同放弃的传统二级索引
-（倒排/btree）是架构定位使然——独立索引文件的维护成本随数据量线性增长，与"开放格式+
-对象存储+无常驻索引服务"根本冲突。
-
-## 配置参考
-
-配置前缀 `ducklake`，按 profile 提供（`dev`/`prod`）。核心参数（完整见 `DucklakeProperties.java` 的注释，每个默认值都有实测依据）：
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `source.type` | `postgres` | 源类型：`postgres` / `mysql`（8.0+）——解码机制与 DDL 跟随路线随之切换 |
-| `source.engine` | `DEBEZIUM` | **[仅 PG]** CDC 读取引擎：`DEBEZIUM`（默认，PG/MySQL 通用）/ `RAW_PG`（PG 专用，pgjdbc 直读 pgoutput，harness 实测约 Debezium 13×，单张热表建议用此选项；mysql 时本参数忽略） |
-| `source.hostname/port/user/password/dbname` | — | 源库连接（集群形态可填代理读写口，故障转移自动跟随）。⚠️ port 默认 5432，MySQL 须显式 3306；MySQL 的 dbname=signal/心跳表所在业务库，不限定捕获范围 |
-| `source.slot-name` | `dbz_ducklake` | [仅 PG] 复制槽名 |
-| `source.publication-name` | `dbz_publication` | [仅 PG] 发布名（init 脚本建 `FOR ALL TABLES`：整库所有 schema、新建表自动纳入） |
-| `source.server-id` | `6400` | [仅 MySQL] binlog 客户端 ID，须在 MySQL 集群 server_id/replica 空间内唯一；多实例各配不同值 |
-| `source.connection-time-zone` | 空 | [仅 MySQL] 会话时区透传；空=自动查询服务端（默认即可） |
-| `source.schema-include-list` | 空 | **默认整库同步**：空=全部用户 schema/库（存量 initial 快照 + 流式增量都拉，湖 schema 一一镜像 PG schema / MySQL database，`lake.<schema|db>.<表>`，可配前缀）；需收窄填逗号分隔列表 |
-| `source.table-exclude-list` | 空 | 排除表（正则，`schema.table` / `db.table` 形式） |
-| `source.signal-table` | 空 | 增量快照 signal 表（类型重建兜底经它触发）。空=按类型推导：PG `public.dbz_signal` / MySQL `<dbname>.dbz_signal` |
-| `maintenance.follow-truncate` | `true` | 源 `TRUNCATE TABLE` 跟随清空湖表（两源通用，见变更跟随矩阵） |
-| `maintenance.sorted-by-pk` | `true` | 新建湖表自动 `SET SORTED BY (主键)`（写出与压实按键排序，剪枝受益；见查询优化节） |
-| `maintenance.scanner-refill` | `true` | 重建重灌走 scanner 直拉：启动时按 `source.type` 自动 `INSTALL` postgres/mysql 扩展并只读 ATTACH 源库（实测快 36×/11× 且不停流）。扩展装不上（离线）/源不可达自动降级 signal 快照；MySQL 只覆盖 `source.dbname` 库（跨库表走降级路） |
-| `maintenance.scanner-bootstrap` | `true` | **首次接入的存量也走 scanner 直拉**（需 scanner-refill 同开）：首启（offset 空）把快照降为 `no_data`——秒级拿一致位点、**流式从第一秒就在追**，存量由后台逐表"建表（含注释/聚簇）+直灌"（1 亿行 ≈ 2~7 分钟 vs Debezium 快照 ≈ 75 分钟）。按主键 anti-join 与并行增量收敛（DBLog 思路）；无主键/跨库表自动转 signal blocking 快照；进度存 catalog 的 `ducklake_bootstrap` 表，崩溃重启续跑 |
-| `lake.catalog-*` | — | DuckLake catalog 的 PG 连接（同时承载 Debezium offset 表） |
-| `lake.data-path` | `s3://lake/ducklake/` | 数据文件根路径（S3 或本地目录） |
-| `lake.memory-limit` | `1536MB` | 内嵌 DuckDB 内存上限。⚠️ 须给足"常驻+批工作集"，过小会 OOM crash loop |
-| `lake.threads` | `2` | DuckDB 并行线程数。CDC 小批（<1 个 row group）本就吃不满多核；每线程写出缓冲是内存乘法器，调大前先给容器内存预算 |
-| `lake.data-inlining-row-limit` | `512` | Data Inlining 阈值。只对小批有利（大批 inlined 是 PG 行式写、比 Parquet 慢 60×）；0=禁用 |
-| `engine.max-batch-size / max-queue-size` | `8192 / 32768` | 连续消费模型：批大小=单批写入耗时内的自然流量，负反馈自稳。加大批实测反而更慢 |
-| `engine.poll-interval-ms` | `10` | 空闲唤醒间隔（唯一延迟参数，仅空闲时燃烧） |
-| `engine.snapshot-mode` | `initial` | 首启全量快照后转流式 |
-| `engine.heartbeat-interval-ms` | `60000` | 心跳间隔（防空闲 WAL 扣留，见运维节） |
-| `engine.heartbeat-action-query` | 空 | **强烈建议配置**：零流量时唯一能触发 LSN 确认的机制（prod profile 已带默认 UPSERT 语句） |
-| `engine.dry-run` | `false` | 诊断：空转不写湖测纯解码吞吐。⚠️ 生产必须 false（offset 照推进=丢数据） |
-| `maintenance.enabled` | `true` | 湖维护调度总开关 |
-| `maintenance.schema-prefix` | 空 | 湖 schema 前缀：空=纯镜像（源 `public.demo` → 湖 `lake.public.demo`）；多个源库实例共享同一湖时各配前缀隔离（如 `erp_` → `lake.erp_public.demo`；仅小写字母/数字/下划线） |
-| `maintenance.follow-drop-table` | `true` | 源 DROP TABLE/DROP SCHEMA 跟随真删湖表（false=湖表保留） |
-| `maintenance.follow-drop-column` | `true` | DDL 删列跟随真删（false=湖保留历史列） |
-| `maintenance.follow-type-change` | `true` | 类型严格跟随三级策略 |
-| `maintenance.snapshot-retain-days` | `30` | 快照保留窗口（time travel），过期物理清理 |
-
-## 部署
-
-### 预构建产物
-
-每次推送 `v*` tag 自动发布（`.github/workflows/release.yml`）：
-- **jar**：GitHub Releases 附件 `debezium-server-ducklake-<版本>.jar`
-- **镜像**（多架构 amd64/arm64）：
-
-```bash
-docker pull kenconnet/debezium-server-ducklake:latest            # Docker Hub(主, 默认 public)
-docker pull ghcr.io/kenconnet666/debezium-server-ducklake:latest # GHCR(备份)
-```
-
-维护者发布：`git tag v0.1.0 && git push origin v0.1.0` 即可（需先在仓库 secrets 配好
-`DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`）；GHCR 首次发布后需在 GitHub Packages 设置里把包
-改为 public 才能匿名拉取（Docker Hub 仓库默认 public）。
-
-### 内存预算（实测公式）
-
-```
-容器限额 ≈ JVM 堆(512m) + JVM 本体(~300m) + lake.memory-limit(1536m) + 余量 ≈ 3G
-```
-
-DuckDB 的 Parquet writer 按 row group 容量**预分配**列缓冲（与实际批行数无关）——本项目已内置 `parquet_row_group_size=16384` 与 `per_thread_output=false` 两个防 OOM 关键参数（宽行表实测三档内存全炸的修复项），无需手工设置。
-
-### 生产建议
-
-- 用 `prod` profile（全环境变量注入，变量清单见 `src/main/resources/prod/ducklake.yml` 与 compose 示例）
-- **单实例部署**：本服务是湖的唯一写入者（单写者设计规避 DuckLake 并发提交缺陷）；容器 `restart: always`——任何致命错误进程自杀交给容器重启，从上个 offset 重放，零丢失
-- JVM 参数照 `.docker/ducklake/Dockerfile`：ZGC + 紧凑对象头 + `--enable-native-access=ALL-UNNAMED`（DuckDB JNI）
-- DuckDB 扩展缓存目录 `/root/.duckdb` 挂持久卷（否则每次重启重新下载扩展）
-
-## 运维
-
-### 维护任务（进程内调度，全部持写锁与 CDC 串行）
-
-| 任务 | 频率 | 内容 |
-|---|---|---|
-| quick | 5 分钟 | `flush_inlined_data`（元空间小批落盘 Parquet）+ Tier0 压实（碎片合并） |
-| hourly | 每小时 | Tier1 压实（小文件合并） |
-| daily | 每日（默认 04:40，`maintenance.daily-cron` 可调） | **全量归并**（所有文件收敛到大文件）+ 快照过期清理 + 孤儿文件检测（dry-run 只报不删）+ 信号表 TRUNCATE |
-
-分层压实的 `max_file_size` 过滤是**防写放大的关键**：各级只吃自己区间的输入，每个字节一生只被重写 O(层数) 次。
-
-### 监控与告警
-
-- Prometheus：`/api/ducklake/actuator/prometheus`，指标 `ducklake_last_{source_event_ts,batch_at,deliver_lag,stage,lake_tx,batch_lag}_ms`、`ducklake_{events,batches,batch_failures,ddl_applied}_total`、`ducklake_engine_running`
-- 水位线：`GET /api/ducklake/watermark` —— `lastSyncedAt`（DuckLake 最新 snapshot 提交时刻，湖侧权威）/ `lastSourceEventTs`（已反映源库到此刻）/ 分段延迟四元组
-- **告警建议**：按 `lastSourceEventTs 距今` 判滞后（计数器是进程内存值、重启归零，别用绝对值）；PG 侧加复制槽保留字节告警（`pg_replication_slots`），防消费者宕机数天磁盘涨
-- **不要设 `max_slot_wal_keep_size`**：超限 slot 被 invalidate = 丢数据；对 CDC 宁可磁盘告警人工介入
-
-### 常见坑速查（全部实测）
-
-| 现象 | 原因与处置 |
+| 源列 | 湖列 |
 |---|---|
-| 空闲期 `pg_wal` 稳步增长 | [PG] 零流量时连接器无事件可确认、slot 冻结扣留实例级 WAL。配 `heartbeat-action-query`（心跳表 UPSERT）闭环；只配 interval 不够 |
-| [MySQL] 重启报 binlog 位点不存在、引擎 crash loop | 消费者停机超过 `binlog_expire_logs_seconds`（默认 30 天）位点被清。临时改 `engine.snapshot-mode=when_needed` 自动重新全量快照后改回；心跳表 action query 可防"长期全闲"触发此边界 |
-| [MySQL] 连接报 `Public Key Retrieval is not allowed` | caching_sha2 认证 + 非 TLS 连接的组合。Debezium `database.ssl.mode` 默认 preferred 通常自动走 TLS 规避；顽固场景给源库配 TLS 或加 `driver.allowPublicKeyRetrieval=true` |
-| OOM crash loop | `lake.memory-limit` 与容器限额不匹配，或 threads 调大没给内存。按内存预算公式配 |
-| 湖里查不到刚写的数据 | 小批走了 Data Inlining 在 catalog 元空间，属正常——查询照常可见；物理落盘由 quick 任务定时 flush |
-| 崩溃重启后短暂"回退" | offset flush 间隔（默认 10s)内的批被按序重放（at-least-once），重放期间中间态短暂回退、追平后与主库一致；镜像 upsert 幂等，不会产生重复行 |
-| 无主键表 UPDATE/DELETE 没跟随 | 设计降级：事件无 key 无法定位湖行，insert-only（日志有每表一次的 WARN）。给源表加主键即恢复完整镜像 |
-| 源库 DELETE 报 `55000: cannot delete from table ... no replica identity` | `FOR ALL TABLES` publication 的 PG 约束：无主键（无 replica identity）的表**连源库自己的 DELETE/UPDATE 都被拒**。修法：`ALTER TABLE <表> ADD COLUMN id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY;`（有主键即可，无需 `REPLICA IDENTITY FULL`——镜像 upsert 只按主键定位，DEFAULT 足够且更省 WAL）|
-| 源 TRUNCATE 后湖没清空 | TRUNCATE 事件暂不跟随（见数据语义节）；用 `DELETE FROM` 替代或湖侧手动清 |
+| `numeric(12,2)` | `DECIMAL(12,2)` |
+| `numeric(12,2)[]` | `DECIMAL(12,2)[]` |
+| `numeric(10,3)[][]` | `DECIMAL(10,3)[][]` |
+| `numeric[]` | `DECIMAL(38,18)[]`（DuckDB 精度上限形态） |
+| `amount_7_3[]`（域基于 `numeric(7,3)`） | `DECIMAL(7,3)[]` |
 
-## 性能参考
+精度超过 DuckDB 38 位、复合类型/enum、以及当前没有可靠 PG 文本到 DuckDB 结构转换的数组，
+整列保留为 `VARCHAR`，不静默截断。数组值通过 `TRY_CAST` 转为 DuckDB LIST；运行时维度超出
+列声明的异常值可能转为 `NULL`，需要业务侧约束源数据形状。MySQL `DECIMAL/NUMERIC` 同样在
+`p<=38` 时保留 `(p,s)`。
 
-8C16G 单机 Docker Compose 全家桶实测（源 PG、元空间 PG、rustfs、本服务**同机**——即本仓一键体验栈原样；`.docker/postgres/bench.sh` 四阶段与 `bench-matrix.sh` 参数矩阵可在你的环境一键复现）：
+从旧版本升级时，历史上以 `VARCHAR` 保存的 PG 数组会在类型跟随换表时先把 `{...}` 文本
+转换为 DuckDB 列表，再严格 `CAST` 到目标精度；无法转换的旧值会使迁移事务失败，避免静默丢值。
 
-### 测试环境硬件基准
+## MySQL 必要契约
 
-测试机是一台**性能偏弱的入门级 KVM 云虚机**（Intel Xeon Cascadelake 8 vCPU / 15GiB / QEMU 虚拟盘），磁盘被宿主 QoS 明显限速——下文**延迟**数字是**保守值**（更强硬件更好）；但**吞吐**受单槽逐事件解码架构限制、并不随更强硬件放大（下方环境 B 实测证实：单核快 4.3× 而吞吐几乎持平）：
+原生 MySQL reader 启动时会 fail-fast 校验：
 
-| 项目 | 实测 | 判定 |
+```ini
+[mysqld]
+server-id = 1
+binlog_format = ROW
+binlog_row_image = FULL
+binlog_row_metadata = FULL
+binlog_transaction_compression = OFF
+gtid_mode = ON
+enforce_gtid_consistency = ON
+```
+
+前四个 binlog 条件是硬要求。GTID 强烈建议启用：未启用时仍可按 file/position 续传，但切主不能
+自动续位。`binlog_expire_logs_seconds` 必须覆盖可接受的最长停机窗口。
+
+账号只需要读取元数据/scanner 和复制流：
+
+```sql
+CREATE USER IF NOT EXISTS 'dbuser_cdc'@'%' IDENTIFIED BY 'changeme';
+GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT
+  ON *.* TO 'dbuser_cdc'@'%';
+```
+
+不需要 signal、heartbeat 或 DDL 审计表。完整模板见
+[.doc/init-source-mysql.sql](.doc/init-source-mysql.sql)。
+
+## PostgreSQL 必要契约
+
+- `wal_level=logical`，并为每个实例分配独立 slot 和 publication。
+- 复制账号需 `REPLICATION` 与业务表只读权限。
+- DDL 跟随需要 `dbz_ddl_log` 与两个 event trigger；初始化脚本已包含。
+- publication 建议 `FOR ALL TABLES`；业务表应有主键。
+
+完整模板见 [.doc/init-source-db.sql](.doc/init-source-db.sql)。原生 reader 会周期性向复制连接发送
+standby status，不需要通过业务心跳表制造 WAL。
+
+PG 首次接入严格先建立 replication slot/stream，再启动异步 scanner，封住“快照已读、slot 尚未建立”
+的漏数窗口。每个 `BEGIN` 到 `COMMIT` 保持为不可拆分边界；pgoutput 的 unchanged-TOAST `u` 标记
+不会被误写成 SQL `NULL`，主键值变更按旧键定位后更新。若 catalog 已有非零 LSN 但 slot 丢失，
+reader 会 fail-fast，拒绝自动建新 slot 后静默跳 WAL。
+
+首次存量和类型/主键重建使用独立的参数化 `postgres_scan(?, ?, ?)`，不把源 PG ATTACH 为共享
+catalog；MySQL scanner 只读 ATTACH `source.dbname`。这样可避开 DuckDB 1.5.4 的 PostgreSQL
+catalog 加载竞态，同时保留重灌时的主键 anti-join。reader 与维护任务共用单写者锁；任一湖提交或
+offset 写入失败都会终止进程，由容器从最近已提交位点重放。
+
+当前隔离策略对应的上游修复见 [duckdb-postgres #500](https://github.com/duckdb/duckdb-postgres/issues/500)、
+[#503](https://github.com/duckdb/duckdb-postgres/pull/503)、[#502](https://github.com/duckdb/duckdb-postgres/issues/502)
+和 [#506](https://github.com/duckdb/duckdb-postgres/pull/506)。等包含修复的稳定版本验证后再评估恢复并行查询。
+
+## 快速启动
+
+要求：Java 25、Docker Desktop Linux engine。构建使用仓库 Maven Wrapper：
+
+```powershell
+.\mvnw.cmd -DskipTests package
+```
+
+MySQL 一键栈：
+
+```powershell
+docker compose -f .docker/mysql/docker-compose.yml up -d
+docker compose -f .docker/mysql/docker-compose.yml --profile app up -d --build
+bash .docker/mysql/e2e-verify.sh
+```
+
+PostgreSQL 一键栈：
+
+```powershell
+docker compose -f .docker/postgres/docker-compose.yml up -d
+docker compose -f .docker/postgres/docker-compose.yml --profile app up -d --build
+bash .docker/postgres/e2e-verify.sh
+```
+
+第一条只启动源库、catalog PG 与 S3，适合 IntelliJ 本地运行；第二条连应用一起启动。WSL 可直接执行
+`.sh` 验证脚本。持久数据在各栈的 `data/` 下，日常测试和维护不要删除或重置这些目录。
+
+## 配置
+
+生产配置入口是 [prod/ducklake.yml](src/main/resources/prod/ducklake.yml)。常用项：
+
+| 配置 | 默认 | 作用 |
 |---|---:|---|
-| CPU 单线程（sysbench cpu） | 907 events/s | 解码走 **pgoutput 单线程**（追赶期仅 ~1 核满载）；但吞吐受内存延迟/流水线主导、**不随此算力口径线性放大**（见环境 B 实测） |
-| CPU 8 线程 | 6,600 events/s（扩展比 7.3×/8） | 无超卖挤兑，8 核是真的 |
-| 内存带宽 | 29.5 GiB/s | 非瓶颈 |
-| 磁盘 4k 随机读 / 写 | ~2,300 IOPS（~9 MB/s） | **受限云盘**（读写都精确撞 9 MB/s 的 QoS 特征；本地 SSD 应为 5 万+ IOPS） |
-| 磁盘 1M 顺序读 / 写 | 89 / 54 MB/s | 同为受限云盘水平 |
-| 容器间网络（iperf3） | 19.7 Gbit/s | bridge 软件转发，无瓶颈 |
+| `source.type` | `POSTGRES` | `POSTGRES` / `MYSQL`，直接决定原生 reader |
+| `source.name` | `ducklake` | MySQL catalog offset 命名空间；共享 catalog 时必须唯一 |
+| `source.hostname/port/user/password/dbname` | — | 源库连接；MySQL `dbname` 也是 scanner 默认绑定库 |
+| `source.slot-name` | `dbz_ducklake` | 仅 PG，复制槽 |
+| `source.publication-name` | `dbz_publication` | 仅 PG，publication |
+| `source.server-id` | `6400` | 仅 MySQL，集群内唯一的 replica client id |
+| `source.schema-include-list` | 空 | PG schema / MySQL database 的逗号分隔正则 |
+| `source.table-exclude-list` | 空 | `schema.table` / `db.table` 的逗号分隔正则 |
+| `engine.max-batch-size` | `8192` | 已提交源事务的攒批上限 |
+| `engine.poll-interval-ms` | `10` | 空闲轮询；flush 超时为 `max(poll×50, 500ms)` |
+| `lake.memory-limit` | `1536MB` | DuckDB 内存上限 |
+| `lake.threads` | `2` | DuckDB 并行度 |
+| `lake.data-inlining-row-limit` | `512` | 小批内联阈值；`0` 明确禁用，避免沿用 DuckLake 非零默认值 |
+| `lake.max-retry-count` | `20` | DuckLake catalog 乐观提交冲突重试次数 |
+| `maintenance.scanner-refill` | `true` | DDL 重建后用 scanner 直灌当前态 |
+| `maintenance.scanner-bootstrap` | `true` | 首次接入异步 scanner 存量首灌 |
+| `maintenance.follow-*` | `true` | 类型、删列、删表、TRUNCATE 镜像开关 |
+| `maintenance.schema-prefix` | 空 | 多源共享一个湖时隔离目标 schema |
 
-硬件对结果的影响解读：
-- 吞吐卡在 **pgoutput 单槽单线程解码**，且是内存延迟/流水线受限、**非纯算力**——环境 B 单核快 4.3× 而吞吐几乎不变；**提吞吐要并行解码侧（多 publication / 多槽分片），堆单核或加核数收益都有限**
-- 压测时灌入器与消费者**同机争抢同一块受限盘**，生产形态（源库独立部署）下消费吞吐预期更好
-- 消费侧写湖流量仅 ~2-5 MB/s，受限盘也有 10 倍富余；磁盘只在"这台机器同时承载高并发 OLTP 业务库"时才会先于 CPU 成为瓶颈（2,300 随机 IOPS 撑不起高并发事务）
-- 内存与网络在此负载形态下大幅过剩（栈满载 ~2.5GiB / 15GiB）
+容器环境变量示例：
 
-**双环境对照**（同款 sysbench/fio、同容器口径，在一台桌面级机器上复测——量化"更强硬件能好多少"）：
+```text
+DUCKLAKE_SOURCE_TYPE=mysql
+DUCKLAKE_SOURCE_NAME=mysql-shop
+DUCKLAKE_SOURCE_HOST=mysql
+DUCKLAKE_SOURCE_PORT=3306
+DUCKLAKE_SOURCE_DBNAME=shop
+DUCKLAKE_SOURCE_SERVER_ID=6400
+DUCKLAKE_CATALOG_HOST=catalog-pg
+DUCKLAKE_CATALOG_DB=ducklake_catalog
+```
 
-| 项目 | 参考环境 A：入门云虚机（上表，压测基线） | 参考环境 B：桌面级（Ryzen 5 6600H + NVMe） | 差距 |
-|---|---:|---:|---|
-| CPU 单线程 | 907 events/s | 3,868 events/s | **4.3×** |
-| CPU 多线程 | 6,600（8 线程） | 21,612（12 线程） | 3.3× |
-| 内存带宽 | 29.5 GiB/s | 47.9 GiB/s | 1.6× |
-| 4k 随机读 / 写 | 2,316 / 2,307 IOPS | 53,100 / 28,900 IOPS | **23× / 12×** |
-| 1M 顺序读 / 写 | 89 / 54 MB/s | 1,746 / 1,619 MB/s | 20× / 30× |
+不存在 `DUCKLAKE_ENGINE=DEBEZIUM/RAW_*` 之类的模式开关；旧环境变量应从部署配置中删除。
 
-**环境 B 整栈实测**（2026-07，同 `bench.sh` 四阶段口径，WSL2 同机全家桶）——**实测证伪了先前的外推**：吞吐并未随单核算力放大，延迟才是更强硬件真正买到的东西。
+## 性能、延迟与测试
 
-| 端到端指标 | 环境 A（云虚机） | 环境 B（6600H / WSL2） | 差距 |
-|---|---:|---:|---|
-| 追赶吞吐（端到端写湖） | ~22,400 行/秒 | **26,491 行/秒** | 1.2× |
-| 纯解码地板（dry-run 空转） | ~29,000 行/秒 | 28,701 行/秒 | **~1.0×** |
-| batchLag p50 / p95 | 617 / 813ms | **352 / 488ms** | ~1.7× |
-| 空闲单行端到端 | ~280ms | 172ms | 1.6× |
-| 追赶期 CPU 峰值 | 614%（≈6 核） | **98%（≈1 核）** | — |
+### 测量环境与口径
 
-反直觉的关键读数：环境 B 单核 sysbench 快 **4.3×**，纯解码吞吐却与环境 A **几乎持平（~29k）**，追赶期只吃满 **约 1 个核**。说明吞吐天花板卡在 **pgoutput 单槽逐事件解码流水线**，且该路径更像**内存延迟 / 流水线受限**而非纯算力受限（否则 4.3× 的单核应线性反映到吞吐上）；写湖侧在 NVMe 上快到不再是瓶颈，于是只剩单个解码线程满载。**要点：吞吐是单槽解码架构的固有量级、堆单核算力难破——要提吞吐得从解码侧并行（多 publication / 多槽分片）入手；更强硬件主要买到更低延迟**（batchLag ~1.7×，写湖 stage/lakeTx 同步变快）。故原按单核线性外推的「环境 B 45-70k 行/秒」不成立：就吞吐而言环境 A 已是该架构真实量级，环境 B 只在延迟上明显更优。
+| 项目 | 统一口径 |
+|---|---|
+| 日期 | 2026-07-19；数值来自本地 Codex 会话记录和本轮复跑 |
+| 软件 | Java 25.0.3、Spring Boot 4.1、DuckDB 1.5.4 |
+| 源库 | PostgreSQL 18、MySQL 8.4，均由 Docker Desktop 29.6.1 Linux engine 启动 |
+| 湖与 catalog | DuckLake 本地临时数据目录 + PostgreSQL 18 catalog；不把 S3 网络耗时混入结果 |
+| 数据量 | PG 吞吐基准 100,000 行（单表或 4×25,000）；MySQL 基准 200,000 行（单表或 4 表） |
+| 公式 | `rows × 1000 / elapsed_ms`；四舍五入为整数行/秒 |
+| `source INSERT` | 造数 SQL 的墙钟耗时；只在生产链基准中计入总耗时 |
+| `reader drain` | 源端 INSERT 完成后，到预期事件/湖表计数达标的耗时 |
+| `stage` / `lakeTx` | 最近一次已提交批次的分段耗时，不是 p50/p95；不能直接相加为端到端延迟 |
 
-### 吞吐
+PG 的 `catchup` 是引擎启动后消费 slot 中已有 WAL，`streaming` 是在线 INSERT 到湖计数达标，
+`multi-table` 是四张表连续造数到全部湖表达标。MySQL 生产链的 `total` 包含 source INSERT 和
+reader drain；raw 协议基准不把 source INSERT 算进解码吞吐。
 
-| 指标 | 实测值 | 口径 |
+### 当前原生完整链吞吐
+
+| 数据库 | 场景 | 行数 | 计时范围 | 耗时 | 吞吐 | 备注 |
+|---|---|---:|---|---:|---:|---|
+| PostgreSQL 18 | catchup 单表 | 100,000 | 引擎就绪 → 湖计数达标 | 1,138–1,452 ms | 68,870–87,873 行/秒 | 两次独立运行；包含首次 catchup 建表 |
+| PostgreSQL 18 | streaming 单表 | 100,000 | source INSERT → 湖计数达标 | 22,567–22,570 ms | 4,430–4,431 行/秒 | INSERT 448–475 ms；首次湖表 DDL/排序约 21 秒，连续两次低于 5,000 断言 |
+| PostgreSQL 18 | multi-table（4 表） | 100,000（4×25,000） | 四表 INSERT → 全部湖计数达标 | 3,571–3,609 ms | 27,708–28,003 行/秒 | 包含四张湖表的首次动态创建 |
+| MySQL 8.4 | native 单表 | 200,000 | source INSERT → reader drain | 3,337 ms | 59,934 行/秒 | INSERT 2,096 ms；drain 1,241 ms；1 batch；stage 497 ms；lakeTx 268 ms |
+| MySQL 8.4 | native 四表 | 200,000（4×50,000） | 四表 source INSERT → reader drain | 2,957 ms | 67,636 行/秒 | INSERT 2,568 ms；drain 389 ms；4 batches；stage 83 ms；lakeTx 202 ms |
+
+PG streaming 的低值是冷表建湖成本，不应解释为稳态每行解码速度；当前基准保留该失败，便于后续
+把“首次 DDL 延迟”和“已建表后的稳态流式吞吐”拆成两个测试。MySQL 早期一次运行曾得到单表
+64,184、四表 75,872 行/秒，因运行时序不同只作为波动参考，不与上表最终代表值合并。
+
+### 协议上限与历史对照
+
+| 路径 | 数据库 | 行数 | source INSERT | drain/flush | 吞吐 | 口径与状态 |
+|---|---|---:|---:|---:|---:|---|
+| BinaryLogClient 纯 ROW 解码 | MySQL 8.4 | 200,000 | 1,775 ms（仅记录） | 389 ms | 514,138 行/秒 | 不写湖；当前 native reader 的协议上限 |
+| BinaryLogClient + DuckDB staging | MySQL 8.4 | 200,000 | 1,814 ms（仅记录） | 520 ms（含 flush） | 384,615 行/秒 | 全 VARCHAR Appender；不含 DuckLake transaction |
+| pgjdbc 直读 pgoutput | PostgreSQL | — | — | — | 153,000–163,000 行/秒 | 历史原生 harness；协议解码/入队对照，不等同完整落湖 |
+| `pg_recvlogical` 裸流 | PostgreSQL | — | — | — | 90,000–100,000 行/秒 | 历史命令行对照 |
+| 源库批量 INSERT | PostgreSQL | — | — | — | 220,000–344,000 行/秒 | 仅源端造数速度，不是 CDC 吞吐 |
+
+旧 Debezium 完整链也保留为回归基线：MySQL 单表约 25,803 行/秒、四表约 41,288 行/秒；这些
+数字来自历史路径，不能当作当前 native reader 的延迟或上限。raw MySQL 多轮记录范围为纯解码
+401,606–514,138 行/秒、解码加 staging 384,615–434,782 行/秒，上表列出最终代表运行。
+
+### 多槽解码与横向扩展边界
+
+当前版本**没有把多槽解码加入单进程**：每个 `RawPgRunner` 只创建一个 `slotName`、一个
+`publicationName` 和一个 reader 线程。`.docker/postgres/docker-compose.yml` 中的 `ducklake-b`
+只是按 schema 启动第二个独立应用实例的注释模板，不是运行时自动分片。
+
+历史 harness 做过按互不重叠的表/schema 分片的对照：
+
+| 配置 | 历史吞吐 | 口径 | 状态 |
+|---|---:|---|---|
+| 1 slot | 约 90,000–100,000 行/秒 | `pg_recvlogical` 裸流 | 历史协议基线 |
+| 2 slot，独立表/schema | 约 170,000 行/秒 | 两个独立实例聚合 | 约 2×，不是当前单进程测试 |
+
+因此只能说“独立实例在该 harness 和该负载下近似线性”，不能承诺任意 N 槽都线性。每个
+walsender 都会全量解码 WAL 后再按 publication 过滤，N 个实例会带来约 N 倍源库 WAL 解码/读取
+开销；还要分别配置 slot、publication、offset 命名空间和湖 schema 前缀。按同一张热表做行级
+hash 分片目前没有实现，也不能安全地把一个事务拆到多个 reader。
+
+### 传统 Kafka CDC 路线对照
+
+传统 Debezium 部署不是“给一个 slot 设置更多线程”，而是把源端、持久化日志和下游消费拆成
+独立故障域：
+
+```text
+PostgreSQL WAL / MySQL binlog
+  -> Debezium Source Connector
+  -> Kafka data topics / partitions
+  -> Kafka Connect Sink、Flink 或自定义 consumer group
+  -> staging / merge
+  -> DuckLake commit
+```
+
+`tasks.max` 只是 Kafka Connect 允许 connector 创建的任务上限。对单个 PostgreSQL 或 MySQL
+connector，持续流式阶段仍是一条有序 WAL/binlog 流：PG 对应一个 replication slot，MySQL 对应
+一个 binlog client；把 `tasks.max` 从 1 调大不会自动拆成多路源端解码。需要源端并行时仍要启动
+多个 connector：PG 使用不同 slot/publication，MySQL 使用不同 server id，最好按互不重叠的
+database/table 或源库分片。PG 多 slot 的源库开销与上一节相同。官方边界与部署模型见 Debezium
+3.6 的 [架构说明](https://debezium.io/documentation/reference/3.6/architecture.html)、
+[PostgreSQL connector](https://debezium.io/documentation/reference/3.6/connectors/postgresql.html) 和
+[MySQL/Kafka Connect 教程](https://debezium.io/documentation/reference/3.6/kc-tutorial.html)。
+
+Kafka 真正可横向扩展的是 broker 写入和下游 partition consumer。数据 topic 增加 partition 后，
+consumer group / sink tasks 可以并行做转换和写入；但顺序只在单 partition 内成立，跨表、跨
+partition 的数据库事务不会自动保持全局提交顺序。若 sink 需要源事务原子性，必须按事务路由、
+使用事务元数据做屏障，或接受按表/键有序的较弱语义。当前 `DuckLakeEngine` 还有全局单写者锁，
+因此即使 Kafka 前面有很多 partition，最终提交仍会在这里串行，除非先把写入按独立表/分片和连接
+安全地拆开。
+
+传统路线有两个有意分离的 checkpoint：Debezium 把事件可靠写入 Kafka 后保存源 LSN/binlog
+offset，使 PG slot 可以继续确认 LSN，也使已入 Kafka 的 MySQL binlog 不再受 sink 进度约束；sink
+只有在 DuckLake 提交成功后才提交 Kafka consumer offset。MySQL binlog 仍由源库 retention 策略
+清理，并不由 consumer ack 直接删除。这正是 Kafka 的主要价值：长时间下游停机时把 backlog 留在
+Kafka，而不是让 PG slot 持续保留 WAL；还可独立重放、扇出多个消费者并滚动升级 sink。代价是
+序列化、网络、broker 磁盘与副本、两套 offset 和更多运维状态。
+
+稳态端到端吞吐近似受最慢阶段限制：
+
+```text
+R_e2e <= min(R_source->Kafka, R_Kafka, sum(R_sink tasks), R_DuckLake commit)
+```
+
+Kafka broker 吞吐应同时看 MB/s 和 records/s，不能直接套成“行/秒”：Debezium event 包含 key、
+before/after、source metadata，使用带 schema 的 JSON 时还可能远大于源行。例如平均序列化事件为 1 KiB，
+100,000 事件/秒已经约为 100 MiB/s，尚未计副本流量。当前仓库没有在同一环境跑过
+`Debezium -> Kafka -> DuckLake sink`，因此不能声称这条路线达到几十万或百万行/秒：
+
+| 路径 | 已有吞吐 | 能否代表传统 Kafka 完整链 |
 |---|---:|---|
-| 积压追赶吞吐（端到端写湖） | **~22,400 行/秒** | 停消费灌 100 万行再启动，两点法测消费速率，~100B/行；100 万积压 ~45s 追平 |
-| 纯解码地板（dry-run 空转） | ~29,000 行/秒 | 不写湖只解码+交付（bench.sh 全家桶口径） |
-| **Debezium 精确解码上限（harness 口径）** | **~11,500 行/秒** | tmpfs 隔离、单槽 drain backlog，排除系统噪声——是 Debezium engine 路径的真实天花板 |
-| 追赶期资源峰值 | CPU 614% / 内存 845MiB | 8 核的 77% / 3GiB 容器限额内 |
-| 参考：append-only 旧写路径 | ~26,700 行/秒 | 同环境——镜像语义（查询即当前态、免视图免去重）的代价约 **-16% 吞吐**，对分析湖完全值得 |
-| **RAW_PG 引擎（PG 专用，`source.engine: RAW_PG`）** | **~153,000 行/秒** | 绕开 Debezium engine，pgjdbc 直读 pgoutput → DuckDB Appender；类型 100% 保真；约 Debezium 13×（详见 `.doc/raw-passthrough.md`） |
+| 当前 native reader -> DuckLake | PG catchup 68,870–87,873；MySQL 59,934–67,636 行/秒 | 是当前零 Kafka 完整链，不是 Kafka 路线 |
+| native 协议解码 | PG 历史 153,000–163,000；MySQL 401,606–514,138 行/秒 | 只代表 source/read 上限 |
+| 历史 Debezium Embedded dry-run | 28,701–29,000 行/秒 | 无 broker、无 Kafka sink |
+| 历史 Debezium Embedded -> DuckLake | 22,400–26,491 行/秒 | 无 broker；仅作旧对象化路径基线 |
+| Debezium -> Kafka -> DuckLake sink | 未测试 | 必须补同机分层基准，不能用 broker 压测数字代替 |
 
-### 延迟
+公平对照至少要分别测 source-to-Kafka、预灌 Kafka 后的 sink drain、完整端到端和长时间稳态，固定
+事件序列化格式、平均/尾部事件字节数、partition 数、broker 副本数、connector/sink task 数和
+DuckLake 批量。只有 source-to-Kafka 已经触顶时，多 connector/slot 才能提高源端吞吐；只有 sink
+能按 partition 并行提交时，Kafka 的下游并行才会转化为落湖吞吐。
 
-| 指标 | p50 | p95 | 口径 |
-|---|---:|---:|---|
-| **batchLag**（事件产生→落湖提交，端到端） | **617ms** | 813ms | ~2k 行/秒持续流 |
-| ├ deliverLag（Debezium 解码+交付） | 339ms | 510ms | 同上 |
-| ├ stage（staging 物化） | 14ms | 19ms | 同上 |
-| └ lakeTx（湖事务：按键 DELETE + INSERT） | 252ms | 304ms | 镜像 upsert 两步的成本所在 |
-| 空闲单行端到端 | ~280ms | — | 排空后单行 INSERT 到落湖提交（中位，5 次探针） |
+### 延迟数据
 
-崩溃恢复：kill/重启后从上个 offset 按序重放，镜像 upsert 幂等，源湖当前态精确一致。对典型业务 CDC 增量（几百-几千行/秒）有 1-2 个数量级余量。
+当前 native MySQL 基准只输出最近批次的阶段耗时，尚未收集事件级 p50/p95：
 
-### 调参指南（单变量矩阵实测）
+| 数据库/场景 | source INSERT | reader drain | 最近 `stage` | 最近 `lakeTx` | 是否为 p50/p95 |
+|---|---:|---:|---:|---:|---|
+| MySQL native 单表 | 2,096 ms | 1,241 ms | 497 ms | 268 ms | 否，单批观测 |
+| MySQL native 四表 | 2,568 ms | 389 ms | 83 ms | 202 ms | 否，单批观测 |
+| PostgreSQL streaming 冷表 | 448–475 ms | 22,092–22,122 ms | 未单独输出 | 未单独输出 | 否；主要是首次 DDL |
 
-吞吐对参数**不敏感**——各组均在基线 ±8% 内（瓶颈在解码侧），**默认参数即最优区**：
+下表是历史 Debezium/旧整栈 benchmark 的延迟分位数，仅用于量级对照：
 
-| 参数 | 默认 | 矩阵结论 |
+| 历史环境 | 端到端追赶吞吐 | dry-run 解码 | `batchLag` p50/p95 | `deliverLag` p50/p95 | `stage` p50/p95 | `lakeTx` p50/p95 | 空闲单行端到端 | CPU 峰值 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 环境 A（旧 Debezium） | 约 22,400 行/秒 | 约 29,000 行/秒 | 617 / 813 ms | 339 / 510 ms | 14 / 19 ms | 252 / 304 ms | 约 280 ms | 614% |
+| 环境 B（6600H / WSL2，旧 Debezium） | 26,491 行/秒 | 28,701 行/秒 | 352 / 488 ms | 未记录 | 未记录 | 未记录 | 172 ms | 98% |
+
+历史延迟表不能证明当前 native 路径的 p50/p95；要补齐该项，需要在 native reader 为每个源事务
+记录提交时间、首次入队时间和湖事务提交时间，再以固定批量和重复次数统计分位数。
+
+### 测试矩阵
+
+下表只统计当前 `src/test/java` 中仍存在的测试类；`target` 里已删除的旧 Debezium 测试报告不计入。
+
+| 数据库/层次 | 测试类 | 测试数 | Docker 依赖 | 最近结果 | 最近耗时 | 覆盖重点 |
+|---|---|---:|---|---:|---:|---|
+| 共同/DDL | `DdlApplierTest` | 13 | 否 | 13/13 | 4.08 s | CREATE/ALTER/RENAME/DROP、列注释、主键变化、numeric domain 数组精度与多维度 |
+| PostgreSQL 原生 | `RawPgIntegrationTest` | 12 | PostgreSQL 18 | 12/12 | 68.59 s | pgoutput 启动、INSERT/UPDATE/DELETE、unchanged TOAST、主键变化、类型矩阵、DDL、schema、无主键、NULL |
+| PostgreSQL 完整应用 | `DucklakeApplicationIntegrationTest` | 13 | PostgreSQL 18 | 13/13 | 93.25 s | scanner 首灌、流式 CRUD、DDL/重命名、合并、watermark、非 public schema、主键补加、数组/interval、TRUNCATE/DROP |
+| PostgreSQL 吞吐 | `RawPgThroughputTest` | 3 | PostgreSQL 18 | 2/3 | 60.70 s | 100k catchup、100k streaming、4×25k；streaming 冷表项低于 5,000 行/秒断言 |
+| MySQL 原生语义 | `MySqlIntegrationTest` | 16 | MySQL 8.4 + catalog PG 18 | 16/16 | 96.52 s | 快照、类型、CRUD、主键更新、CREATE/ALTER/RENAME/DROP/TRUNCATE、列序/注释、毒丸 TIME、主键重建、offset 回退与过滤事务 |
+| MySQL 完整链吞吐 | `MySqlThroughputTest` | 2 | MySQL 8.4 + catalog PG 18 | 2/2 | 58.78 s | 200k 单表与四表 source/drain/批次/stage/lakeTx |
+| MySQL 协议上限 | `RawMySqlThroughputTest` | 2 | MySQL 8.4 | 2/2 | 23.98 s | 200k 纯 binlog 解码、解码到 DuckDB staging |
+
+已记录的语义回归为 PG 38/38、MySQL 16/16；加上 MySQL 吞吐 4/4，本轮新跑的 PG 吞吐为 2/3。
+因此当前完整报告合计 60/61 通过，唯一失败是已知的 PG 冷表 streaming 性能断言，不是数据一致性
+断言失败。集成测试耗时包含 Testcontainers 和 Spring 上下文启动，不应解释为 CDC 延迟。
+
+### 运行命令
+
+单元测试不需要 Docker：
+
+```powershell
+.\mvnw.cmd -q '-Dtest=DdlApplierTest' test
+```
+
+PG 与 MySQL 语义回归需要 Docker：
+
+```powershell
+.\mvnw.cmd -q '-Dtest=RawPgIntegrationTest,DucklakeApplicationIntegrationTest' test
+.\mvnw.cmd -q '-Dtest=MySqlIntegrationTest' test
+```
+
+吞吐基准：
+
+```powershell
+.\mvnw.cmd -q '-Dtest=RawPgThroughputTest' test
+.\mvnw.cmd -q '-Dtest=MySqlThroughputTest' '-Dmysql.bench.rows=200000' test
+.\mvnw.cmd -q '-Dtest=RawMySqlThroughputTest' '-Dmysql.raw.rows=200000' test
+```
+
+吞吐日志会打印 source INSERT、reader drain、总耗时、湖批次数、stage 和 lake transaction；PowerShell
+中建议将 `-Dtest=...` 和带逗号/数字的属性整体加引号。
+
+### 后续性能工作
+
+#### 先把瓶颈测准
+
+MySQL 生产链测试在 source INSERT 期间 reader 已经并发消费，因此 `drain` 只是造数结束后的尾部，
+不能用 `rows / drain` 推导消费者吞吐，也不能把 INSERT 占总耗时的比例直接当成瓶颈占比：
+
+| 场景 | source INSERT | drain 尾部 | 总耗时/吞吐 | 当前能得出的结论 |
+|---|---:|---:|---:|---|
+| MySQL native 单表 | 2,096 ms | 1,241 ms | 3,337 ms / 59,934 行/秒 | 解码与写湖在 INSERT 期间重叠，无法从该结果单独归因 |
+| MySQL native 四表 | 2,568 ms | 389 ms | 2,957 ms / 67,636 行/秒 | 四个源事务形成流水线，但 389 ms 不是完整消费耗时 |
+| MySQL raw backlog | INSERT 不计入吞吐 | 解码 389 ms；解码 + staging 520 ms | 514,138 / 384,615 行/秒 | 已隔离协议解码与本地 staging，尚未覆盖 DuckLake 镜像事务 |
+
+PG 的历史分层 harness 更能说明方向：纯 pgjdbc/pgoutput 为 153,584 行/秒，加入本地 DuckDB
+Appender + CAST 投影为 162,882 行/秒，说明**本地 staging 与类型 CAST 不是主要损耗**。但该
+`VERIFY=1` 没有覆盖当前生产链的 DuckLake `DELETE + INSERT` 镜像、catalog commit、DDL 屏障和
+offset 持久化，不能据此断言全部写湖成本都可以忽略。当前完整 catchup 只有 68,870–87,873 行/秒，
+新增差距更可能分布在：
+
+- 每行 `String[]`、`boolean[]`、`PendingRow` 和每列 `new String` 的对象化与 GC；
+- 事务内缓存后再次复制、按表/事件切段，再二次遍历写 Appender；
+- staging 表反复 create/drop、主键 `DELETE + QUALIFY INSERT`、DuckLake catalog commit；
+- 首次 `ensureTable`、排序配置、DDL 与 offset/LSN 提交。
+
+所以首先要补：PG 的 decode、buffer/segment、stage、lakeTx、offset ack 分段计时；已建表后的固定
+backlog；以及 append-only、镜像 INSERT、UPDATE/DELETE 三种负载。当前 PG 指标把整个写批耗时
+记进 `stage`、`lakeTx` 记为 0，本身不足以证明哪一段最慢。
+
+#### 解码后是否需要消息队列
+
+要区分“采用 Kafka 架构”和“把 Kafka 当作当前吞吐补丁”。WAL/binlog 是源事实与短期恢复日志，
+Kafka 是独立保留、重放和分发层，两者不能简单等同。若需要承受长时间 sink 停机、避免 PG slot
+拖住 WAL、扇出多个消费者或独立回放，传统 Kafka 路线是合理选择；若目标只是提高当前单 sink、
+单写者 DuckLake 的稳态吞吐，引入 Kafka 不会自动突破最慢阶段，应该先完成分段基准和写入拆分。
+
+在继续保持本项目“单进程、零中间件”定位的前提下，更合适的局部优化仍是**有界的进程内事务
+队列**，用于让网络解码和湖写入重叠，而不是承担持久化日志职责：
+
+| 方案 | 判断 | 原因 |
 |---|---|---|
-| `engine.max-batch-size` | 8192 | 32768 约 +8% 吞吐，但批重放粒度 ×4，不值得改默认；超大积压追赶可临时调大 |
-| `lake.threads` | 2 | 4 约 +6%（单机全家桶 CPU 已饱和，收益边际）；独立部署且内存充足可试 4 |
-| `engine.record-processing-threads` | -1（=核数） | 窄行负载下与单线程持平（SMT 本身轻）；宽行/高流量才是它的设计场景，保持默认 |
-| `lake.data-inlining-row-limit` | 512 | 关闭（0）对追赶 +3%（噪声级）；保留 512 换小批低延迟与零小文件 |
-| `engine.poll-interval-ms` | 10 | 调 1ms 无感知收益（空闲延迟主导项是单批写入耗时），保持默认 |
-| `lake.memory-limit` | 1536MB | 与容器限额联动（预算公式见部署节）；过小 OOM crash loop |
+| Kafka 持久化日志 | 按架构需求选择 | 解决长时缓冲、重放、扇出和下游 partition 扩展；增加序列化、broker、双 checkpoint 与运维成本 |
+| RabbitMQ 等通用 MQ | 当前不做 | 不匹配本项目基于源 offset 的 CDC 重放模型，也不能自动提高单写者湖事务吞吐 |
+| 无界内存队列 | 禁止 | sink 变慢时会无限占内存，掩盖源端到湖端的反压 |
+| 有界事务队列 | 后续可做 | 吸收短时突发、让解码与写湖重叠，并在满时明确反压 |
 
-## 与其他方案对比
+队列元素必须是**完整源事务或完整提交批次**，不能直接按行并发消费。建议的最小 envelope 包含
+`source`、结束 offset/LSN、源提交时间、事件序号、schema 版本和不可变事件列表；sink 按源顺序
+合并多个完整事务，达到行数/字节数/等待时间任一阈值后写湖。只有 staging、湖事务和 offset 全部
+成功，才向 PG slot 回 ack 或保存 MySQL offset；sink 失败时停止 reader 且不推进 offset。进程退出后
+内存队列可以丢失，因为容器会从源日志的最后已提交位置重放。队列容量应同时限制行数和估算字节数，
+并暴露 depth、oldest-age、enqueue-wait 和 backpressure 指标。
 
-PostgreSQL CDC → 分析存储的常见选型对照。⚠️ 本方案列为上文同环境实测；其余列为各官方文档/公开资料的**典型配置口径，非同环境实测**，仅供架构选型参考：
+这类队列主要改善突发吸收和延迟抖动，**不会凭空突破单写者 DuckLake 的稳态上限**。当前
+`RawPgReader`/`RawMySqlReader` 都在解码回调线程内调用 `DuckLakeEngine.withLock`；在 DuckDB/
+DuckLake 单写约束和 catalog 并发缺陷未解除前，不能简单启动多个 lake writer。可先把纯 CPU 的
+类型解析、列分组和 staging 缓冲做成可并行的预处理，再由一个有序 sink 提交。
 
-| 维度 | 本方案（DuckLake） | Iceberg 链路 | Apache Doris | Cloudberry（GP 系 MPP） |
-|---|---|---|---|---|
-| 典型链路 | Debezium Embedded + 内嵌 DuckDB，**单进程** | Kafka + Connect/Flink CDC → Iceberg + catalog 服务（Hive/REST）+ 查询引擎 | Flink CDC → Doris（FE+BE 集群） | Kafka/gpss 等 → MPP 集群 |
-| 最小部署 | 单机 `docker compose up`（本仓一键栈） | 5+ 组件各自高可用 | 3 节点起（可单机试用） | 多节点 MPP 集群 |
-| 数据存储 | S3 Parquet（开放格式，catalog 在 PG） | S3/HDFS Parquet/ORC（开放格式） | 本地盘为主（存算一体；3.x 起有存算分离形态） | 本地盘 MPP 分布式 |
-| CDC 端到端延迟 | **亚秒~秒级**（实测 p50 0.6s @2k 行/秒） | 分钟级为主（Flink checkpoint 驱动；激进配置 ~30s，但小文件压力大） | 秒级（典型 1~10s，攒批导入） | 批 ETL 分钟~小时；流式（gpss）秒~分钟 |
-| 当前态语义 | 镜像 upsert，查询即当前态 | delete file + 后台 compaction，查询引擎 merge-on-read | Unique Key 模型 merge-on-write | 原生 UPDATE/DELETE |
-| 二级索引 | ✗（湖格式共性：开放不可变 Parquet 无人维护索引；靠排序聚簇+统计剪枝，见查询优化节） | ✗（同为开放湖格式，仅统计/布局） | ✓ 全家桶（前缀/ZoneMap 内置，BloomFilter/NGram/倒排手动建——自管 Segment 存储，索引随 compaction 维护） | ✓ PG 索引全家桶（btree/GIN/GiST/BRIN/bitmap——每 segment 是完整 PG 实例；但官方建议分析负载少建索引） |
-| 时间旅行 | ✓ snapshot（默认保留 30 天） | ✓ snapshot | ✗（靠备份恢复） | ✗ |
-| 查询引擎 | DuckDB（任意客户端只读 ATTACH 直查，不经本服务） | Trino/Spark/Flink/DuckDB…**生态最广** | 自带（MySQL 协议，高并发点查/聚合强） | 自带（PostgreSQL 协议） |
-| 吞吐扩展 | 单实例 ~22k 行/秒；按表分片多实例横向扩 | Flink 并行度横向扩，上限最高 | 导入随 BE 横向扩 | 随 MPP 节点横向扩 |
-| 运维面 | **最小**：单进程 + 你已有的 PG 与 S3 | 最大：Kafka/Flink/catalog 三套系统各自运维 | 中：集群自管（FE/BE/Compaction） | 大：MPP 集群管理 |
-| 适合场景 | 中小规模、要开放湖格式 + 极简运维、PG 技术栈 | 组织级湖仓平台、多引擎共享、超大规模 | 高并发低延迟 OLAP 对外服务 | Greenplum 迁移、PG 系重型数仓 |
+多槽多实例不依赖这个队列：每个实例独立读取、处理和提交自己的表分片即可。若以后在单 JVM 中
+运行多个 slot，只能按完整事务/批次做粗粒度交接；不能为每行入队。旧 Debezium profiler 中逐记录
+队列的 `LockSupport.unpark` 曾占约 39% CPU，重新引入同类细粒度队列会抵消并行解码收益。
 
-一句话：**要一个"接上就有、查询即当前态、随时能被任何 DuckDB 客户端打开"的 PG 分析副本**，选本方案；要组织级多引擎湖仓平台选 Iceberg；要高并发对外 OLAP 服务选 Doris；深度 PG 生态的重型 MPP 数仓选 Cloudberry。
+#### 建议实施顺序
 
-## 局限
+1. **基准与 profiler**：增加 warm-table、固定 backlog、批次字节数和 p50/p95；分开统计 decode、对象分配/GC、segment、stage、lakeTx、offset ack。
+2. **PG 多槽多实例**：把现有注释模板变成可执行的 1/2/4 slot 基准，按互不重叠的表/schema publication 分片；记录聚合吞吐、每槽 lag、源库 walsender CPU/WAL 读取和 catalog 重试。历史 2 slot 约 170k 是优先验证目标，不是当前生产承诺。
+3. **单槽后处理**：用事务级紧凑/列式缓冲代替每行多数组和 record；减少 pending 复制与二次分段；复用 staging/SQL/元数据，单独优化镜像 `DELETE + INSERT`。
+4. **粗粒度队列（可选）**：只有 profiler 证明 decode 与 sink 都有可重叠时间后，才实现单 reader → 有界事务批队列 → 单 ordered sink；做 queue on/off 对照，避免逐行信号成本。
+5. **单进程多槽（后置）**：当前全局 `DuckLakeEngine` 锁会让多 reader 最终串行写湖。先用隔离更清晰的多实例获得扩展数据，再决定是否增加多 slot supervisor、分片 worker connection 和更细粒度锁。
 
-- **单表吞吐上限（Debezium 路径）≈ 11,500 行/秒**（pgoutput 单槽单线程解码，Struct 物化 + 单队列交接是主要瓶颈）。提升路径：① `source.engine: RAW_PG`——绕开 Debezium engine 直读 pgoutput，单槽实测 ~153k 行/秒（约 13×，PG 专用，见 `.doc/raw-passthrough.md`）；② 按表分片多实例（PG 独立 slot/publication，harness 实测 2 实例 2× 线性，注意每路 N× WAL 读放大）
-- **镜像是当前态不是备份**：主库误删会忠实同步到湖（时间旅行窗口内可 `AT (TIMESTAMP ...)` 找回，过期即不可）；备份职责在源库侧
-- 无主键表降级 insert-only（UPDATE/DELETE 不跟随；重建类重灌也无 anti-join 依据，走 signal 快照路）
-- UPDATE/DELETE 密集负载会产生较多 delete file（merge-on-read 读放大），由分层压实定期吸收
-- **scanner 直拉重灌的边界**：GEOMETRY/point 列经 scanner 直灌的物理形态是源文本而非流式路径的 WKB（此类表建议 `scanner-refill=false` 走 signal 快照保编码一致）；MySQL 只读 attach 绑定 `source.dbname` 单库，跨库表自动降级；离线环境 `INSTALL` 扩展失败仅告警降级，不影响主链路
-- `numeric` 的 NaN/Infinity 值无法通过 Debezium 的 BigDecimal 转换（上游限制）
-- **DECIMAL 精度上限 38**（DuckDB 硬限制）：源列声明 p>38 且实际存了 >38 位的值时，该批 CAST 溢出会失败重试并阻塞链路（刻意不静默截断/置 NULL——数值完整性优先，需人工处理该值或收窄源列）
-- **MySQL 边界**：`TIME` 合法值域 ±838h 超出湖 TIME(24h)、历史 zero-date（`0000-00-00`）——两者经 TRY_CAST 置 NULL 保数据链不断（引擎侧另有 `event.converting.failure=warn` 一道防线）；空间类型落 BLOB(WKB)（DuckDB spatial 可 `ST_GeomFromWKB` 解析）；`BIGINT UNSIGNED` 走 DECIMAL(38,0) 防溢出；消费者停机超过 `binlog_expire_logs_seconds`（默认 30 天）会丢位点，重启需重新快照（临时 `snapshot.mode=when_needed` 可自动重灌）
+每一步都必须重跑 offset 回退、主键变更、DDL 屏障、numeric 数组精度和 16 项 MySQL 语义回归；
+吞吐提升不能以放宽事务原子性或 offset 恢复正确性为代价。
 
-## License
+## 运维与可观测性
 
-[Apache-2.0](LICENSE)
+- `GET /api/ducklake/watermark` 返回 reader 状态、最近源提交时刻与最近落湖时刻。
+- `/actuator/prometheus` 暴露 `ducklake_engine_running`、`ducklake_events_total`、
+  `ducklake_batches_total`、`ducklake_last_stage_ms`、`ducklake_last_lake_tx_ms` 等指标。
+- reader 致命断链时进程退出，由容器从最近已提交 offset 重启。
+- `LakeMaintenanceJobs` 与写入共用单写者锁，执行内联 flush、分层/每日合并、快照过期与安全清理。
+- 孤儿文件清理始终只做 `dry_run`，不自动删除。
+- `lake.data-inlining-row-limit=0` 会明确禁用 Data Inlining。DuckLake 1.5.4 在 DROP/替换表后可能遗留
+  `ducklake_inlined_%` side table，见 [#1237](https://github.com/duckdb/ducklake/issues/1237) 与
+  [#1316](https://github.com/duckdb/ducklake/pull/1316)；需要规避时设为 0，并等待上游受支持的清理路径。
+
+当前限制：单进程单写者；MySQL 仅支持 8.0+ 的未压缩 ROW binlog；PG DDL 需要 event trigger；
+无主键表仅 insert-only；MySQL scanner 默认只 attach `source.dbname`，跨库表可流式同步但无法自动重灌存量。

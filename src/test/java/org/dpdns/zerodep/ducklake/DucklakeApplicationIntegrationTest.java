@@ -32,7 +32,7 @@ import static org.awaitility.Awaitility.await;
  * 真 PG18(wal_level=logical)+ 真 DuckLake——湖数据走本地 DATA_PATH(DuckLake 原生支持
  * 文件系统路径,免 S3 容器;CREATE SECRET 是惰性的,假 S3 端点无害)。
  * <p>
- * 验证与服务器 E2E 同口径：完整 Spring 上下文启动 → 引擎快照 → 流式增量(INSERT)→
+ * 验证与服务器 E2E 同口径：完整 Spring 上下文启动 → scanner 存量首灌 → 流式增量(INSERT)→
  * DDL 审计流(RENAME COLUMN 湖侧真 rename)→ /watermark 接口。
  */
 @Testcontainers(disabledWithoutDocker = true)
@@ -125,9 +125,6 @@ class DucklakeApplicationIntegrationTest {
                     + "sku text NOT NULL, qty int DEFAULT 1)");
             s.execute("INSERT INTO app.orders (sku, qty) VALUES ('sku-a', 2), ('sku-b', 3)");
 
-            // Debezium 增量快照 signal 表(类型严格跟随的重建+重拉兜底;连接器写快照水位也在此表)
-            s.execute("CREATE TABLE dbz_signal (id varchar(42) PRIMARY KEY, type varchar(32) NOT NULL, data varchar(2048))");
-            s.execute("GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON public.dbz_signal TO dbuser_cdc");
             s.execute("GRANT TRUNCATE ON public.dbz_ddl_log TO dbuser_cdc");
         }
     }
@@ -158,7 +155,8 @@ class DucklakeApplicationIntegrationTest {
     @Test
     @Order(1)
     void snapshotLandsInLake() {
-        await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(1)).untilAsserted(() -> {
+        // scanner bootstrap 异步建 schema/表；首次轮询可能早于建表完成，此时应继续等待。
+        await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofSeconds(1)).ignoreExceptions().untilAsserted(() -> {
             assertThat(lakeCount("SELECT count(*) FROM public.cdc_test")).isEqualTo(3L);
             // 默认整库:非 public schema 的存量随 initial 快照自动落湖,湖表名 <schema>_<表>
             assertThat(lakeCount("SELECT count(*) FROM app.orders")).isEqualTo(2L);
@@ -321,7 +319,7 @@ class DucklakeApplicationIntegrationTest {
 
     @Test
     @Order(7)
-    void addingPrimaryKeyToExistingTableRebuildsAndResnapshotsLake() throws Exception {
+    void addingPrimaryKeyToExistingTableRebuildsAndRefillsLake() throws Exception {
         // 用户实测场景:无主键表先积累了数据(湖 insert-only 镜像),后补主键——
         // 旧行主键回填无 CDC 事件,湖旧行主键恒 NULL;应自动重建+增量快照重灌恢复完整镜像
         try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
@@ -329,8 +327,10 @@ class DucklakeApplicationIntegrationTest {
             s.execute("CREATE TABLE pkfix (name text NOT NULL)");
             s.execute("INSERT INTO pkfix VALUES ('a'), ('b'), ('c')");
         }
-        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500)).untilAsserted(() ->
-                assertThat(lakeCount("SELECT count(*) FROM public.pkfix")).isEqualTo(3L));
+        // reader 使用独立连接，首轮查询可能早于异步建表；该窗口只代表尚未就绪。
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions().untilAsserted(() ->
+                        assertThat(lakeCount("SELECT count(*) FROM public.pkfix")).isEqualTo(3L));
 
         try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
              Statement s = c.createStatement()) {
@@ -413,7 +413,7 @@ class DucklakeApplicationIntegrationTest {
                         + "AND table_name='renamed_probe' AND column_name='note'", Long.class)).isEqualTo(1L));
     }
 
-    /** 源 TRUNCATE 跟随(PG 与 MySQL 同通路:op=t 放行 + trescue 改装穿 unwrap) */
+    /** 源 TRUNCATE 跟随：PG 直读 pgoutput Truncate，MySQL 直读 QueryEvent。 */
     @Test
     @Order(73)
     void truncateFollowsToLake() throws Exception {
@@ -464,7 +464,7 @@ class DucklakeApplicationIntegrationTest {
     @Test
     @Order(1000)
     void teardownDropsEveryCreatedTableSoSourceAndLakeEndEmpty() throws Exception {
-        // ① 源侧:动态枚举所有用户表并 DROP(排除基建表 dbz_ddl_log/dbz_signal/dbz_heartbeat)
+        // ① 源侧：动态枚举所有用户表并 DROP（排除 DDL 审计表）。
         try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
              Statement s = c.createStatement()) {
             var toDrop = new java.util.ArrayList<String>();

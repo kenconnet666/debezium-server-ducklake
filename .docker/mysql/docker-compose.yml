@@ -9,8 +9,7 @@
 #   写数据看落湖: docker compose -f .docker/mysql/docker-compose.yml exec mysql \
 #        mysql -uroot -pchangeme shop -e "CREATE TABLE demo(id bigint AUTO_INCREMENT PRIMARY KEY, name varchar(64)); INSERT INTO demo(name) VALUES ('hello'),('mysql');"
 #      curl http://127.0.0.1:19993/api/ducklake/watermark
-# CDC 基建(CDC 账号/signal/心跳表)由 initdb 自动完成——比 PG 栈更少:无 publication、
-# 无 DDL 审计 event trigger(binlog 自带 DDL)。8.0+ 默认 ROW/FULL,conf.d 仅补 GTID。
+# CDC 基建只有复制账号；无 signal/心跳/publication/DDL 审计表。conf.d 显式钉死 ROW/FULL 契约与 GTID。
 # 与 PG 源栈(.docker/postgres/)完全独立:project 名/端口/数据目录全部错开,可并存同机;
 # 每服务一个子目录,持久化数据落 <服务>/data/(备份/清理一处搞定)。
 # 镜像约定不破例:MySQL 同为自建 Debian 镜像(bookworm-slim + MySQL 官方 APT 仓库清华镜像,
@@ -34,7 +33,7 @@ services:
     logging: *default-logging
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-changeme}
-      # 业务库(demo 用;signal/心跳表建在此库,DUCKLAKE_SOURCE_DBNAME 与之对应)
+      # scanner 默认绑定的业务库（DUCKLAKE_SOURCE_DBNAME 与之对应）
       MYSQL_DATABASE: shop
     ports:
       - "13306:3306"
@@ -48,7 +47,7 @@ services:
       retries: 20
       start_period: 30s
 
-  # ── DuckLake 元空间 PG(湖 catalog + Debezium offset + MySQL schema history 三合一):
+  # ── DuckLake 元空间 PG（湖 catalog + 原生 MySQL offset）:
   #    官方镜像即可——元空间只存元数据,无需 PG 源栈那套 pigsty 观测扩展 ──
   catalog-pg:
     image: postgres:18-bookworm
@@ -118,18 +117,16 @@ services:
       SPRING_PROFILES_ACTIVE: prod
       # ── MySQL 源 ──
       DUCKLAKE_SOURCE_TYPE: mysql
+      DUCKLAKE_SOURCE_NAME: mysql-shop
       DUCKLAKE_SOURCE_HOST: mysql
       DUCKLAKE_SOURCE_PORT: "3306"
       DUCKLAKE_SOURCE_USER: dbuser_cdc
       DUCKLAKE_SOURCE_PASSWORD: ${MYSQL_PASSWORD:-changeme}
-      # signal/心跳表所在业务库(捕获范围默认整实例全部用户库,不受此值限定)
+      # scanner 默认绑定库；binlog 捕获范围默认是实例全部用户库
       DUCKLAKE_SOURCE_DBNAME: shop
       # binlog 客户端 ID:必须在 MySQL 集群 server_id/replica 空间内唯一
       DUCKLAKE_SOURCE_SERVER_ID: "6400"
-      # 心跳 UPSERT 用 MySQL 方言(覆盖 prod 默认的 PG 语法);MySQL 无 PG 的 WAL 扣留问题,
-      # 心跳价值=空闲期持续推进 offset,规避 30 天全闲后 binlog 过期丢位点的边界
-      DUCKLAKE_HEARTBEAT_QUERY: "INSERT INTO shop.dbz_heartbeat (id, ts) VALUES (1, NOW(6)) ON DUPLICATE KEY UPDATE ts = NOW(6)"
-      # ── 元空间(湖 catalog + offset + schema history 同库) ──
+      # ── 元空间（湖 catalog + 原生 offset） ──
       DUCKLAKE_CATALOG_HOST: catalog-pg
       DUCKLAKE_CATALOG_PORT: "5432"
       DUCKLAKE_CATALOG_DB: ducklake_catalog
@@ -140,6 +137,8 @@ services:
       DUCKLAKE_S3_ENDPOINT: rustfs:9000
       DUCKLAKE_S3_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-admin}
       DUCKLAKE_S3_SECRET_KEY: ${RUSTFS_SECRET_KEY:-changeme}
+      DUCKLAKE_DATA_INLINING_ROW_LIMIT: ${DUCKLAKE_DATA_INLINING_ROW_LIMIT:-512}
+      DUCKLAKE_MAX_RETRY_COUNT: ${DUCKLAKE_MAX_RETRY_COUNT:-20}
     ports:
       - "19993:19992"
     deploy:

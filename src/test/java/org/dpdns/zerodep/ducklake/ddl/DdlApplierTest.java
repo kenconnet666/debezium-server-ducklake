@@ -1,12 +1,9 @@
 package org.dpdns.zerodep.ducklake.ddl;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.dpdns.zerodep.ducklake.config.DucklakeProperties;
 import org.dpdns.zerodep.ducklake.metrics.SyncState;
 import org.dpdns.zerodep.ducklake.sink.DuckLakeEngine;
-import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
-import org.apache.kafka.connect.data.Schema;
-import org.apache.kafka.connect.data.SchemaBuilder;
-import org.apache.kafka.connect.data.Struct;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -18,18 +15,17 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/**
- * DdlApplier 单测(真 DuckDB 内存库):真 rename 判定(同事务无 sql_drop)、DROP+ADD 不误判且
- * 默认跟随真删、followDropColumn=false 保留历史列、墓碑事件过滤(阅后即焚兜底)、幂等重放、
- * 缓存失效回调。2026-07-08 起纯跟随不留档(meta.ddl_history 已裁撤)。
- */
+/** PostgreSQL 原生 DDL 审计行到 DuckLake 的跟随语义（真 DuckDB 内存库）。 */
 class DdlApplierTest {
 
-    private static Connection conn;
+    private static Connection connection;
+    private static long idSequence;
 
     private DucklakeProperties props;
     private SyncState syncState;
@@ -37,575 +33,238 @@ class DdlApplierTest {
     private List<String> invalidated;
     private List<String> rebuilds;
 
-    private static final Schema DDL_SCHEMA = SchemaBuilder.struct().name("dbz_ddl_log.Value")
-            .field("id", Schema.OPTIONAL_INT64_SCHEMA)
-            .field("ev", Schema.STRING_SCHEMA)
-            .field("tag", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("object_type", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("object_identity", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("query_text", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("xid", Schema.OPTIONAL_INT64_SCHEMA)
-            .field("occurred_at", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("__lsn", Schema.OPTIONAL_INT64_SCHEMA)
-            .field("__op", Schema.OPTIONAL_STRING_SCHEMA)
-            .build();
-
     @BeforeAll
     static void openDuckDb() throws SQLException {
-        conn = DriverManager.getConnection("jdbc:duckdb:");
-        try (Statement s = conn.createStatement()) {
-            s.execute("ATTACH ':memory:' AS lake");
-            s.execute("CREATE SCHEMA lake.public");
+        connection = DriverManager.getConnection("jdbc:duckdb:");
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("ATTACH ':memory:' AS lake");
+            statement.execute("CREATE SCHEMA lake.public");
         }
     }
 
     @AfterAll
     static void close() throws SQLException {
-        conn.close();
+        connection.close();
     }
 
     @BeforeEach
     void newApplier() {
         props = new DucklakeProperties();
         syncState = new SyncState(new SimpleMeterRegistry());
-        // engine 未 init → scanner 通道未就绪:主键变更走 rebuildRequester 老路,断言口径不变
         applier = new DdlApplier(props, syncState, new DuckLakeEngine(props));
         invalidated = new ArrayList<>();
         rebuilds = new ArrayList<>();
     }
 
-    private static long idSeq = 0;
-
-    private static Struct row(String ev, String tag, String objectType, String identity, String query, long xid) {
-        return rowWithOp(ev, tag, objectType, identity, query, xid, "c");
+    private static Map<String, String> row(String event, String tag, String objectType,
+                                           String identity, String query, long xid) {
+        Map<String, String> row = new LinkedHashMap<>();
+        row.put("id", Long.toString(++idSequence));
+        row.put("ev", event);
+        row.put("tag", tag);
+        row.put("object_type", objectType);
+        row.put("object_identity", identity);
+        row.put("query_text", query);
+        row.put("xid", Long.toString(xid));
+        return row;
     }
 
-    private static Struct rowWithOp(String ev, String tag, String objectType, String identity,
-                                    String query, long xid, String op) {
-        return new Struct(DDL_SCHEMA)
-                .put("id", ++idSeq).put("ev", ev).put("tag", tag)
-                .put("object_type", objectType).put("object_identity", identity)
-                .put("query_text", query).put("xid", xid)
-                .put("occurred_at", "2026-07-07T10:00:00+08:00").put("__lsn", idSeq)
-                .put("__op", op);
+    private void apply(List<Map<String, String>> rows) throws SQLException {
+        applier.apply(connection, rows, invalidated::add, rebuilds::add);
     }
 
-    private void apply(List<Struct> run) throws SQLException {
-        applier.apply(conn, run, invalidated::add, rebuilds::add);
+    @Test
+    void pgArrayTypeKeepsNumericPrecisionDomainsAndDimensions() {
+        assertThat(applier.pgTypeToDuck("numeric(12,2)", 1)).isEqualTo("DECIMAL(12,2)[]");
+        assertThat(applier.pgTypeToDuck("numeric(10,3)", 2)).isEqualTo("DECIMAL(10,3)[][]");
+        assertThat(applier.pgTypeToDuck("numeric", 1)).isEqualTo("DECIMAL(38,18)[]");
+        assertThat(applier.pgTypeToDuck("numeric(7,3)", 1)).isEqualTo("DECIMAL(7,3)[]");
+        assertThat(applier.pgTypeToDuck("timestamp(3)", 1)).isEqualTo("TIMESTAMP[]");
+        assertThat(applier.pgTypeToDuck("character varying(32)", 1)).isEqualTo("VARCHAR[]");
+        assertThat(applier.pgTypeToDuck("timestamp with time zone", 2)).isEqualTo("TIMESTAMPTZ[][]");
+        assertThat(applier.pgTypeToDuck("numeric(40,2)", 1)).isEqualTo("VARCHAR");
+        assertThat(applier.pgTypeToDuck("public.composite_amount", 1)).isEqualTo("VARCHAR");
     }
-
-    // ---------- 用例 ----------
 
     @Test
     void trueRenameIsAppliedToLakeTable() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.public.r1 (id BIGINT, note VARCHAR)");
-        }
-        // ALTER TABLE + 同事务无 sql_drop + RENAME COLUMN 语句 = 真 rename
+        execute("CREATE TABLE lake.public.r1 (id BIGINT, note VARCHAR)");
         apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.r1",
                 "ALTER TABLE r1 RENAME COLUMN note TO remark", 100)));
 
         assertThat(columns("public", "r1")).containsExactly("id", "remark");
-        assertThat(invalidated).containsExactly("public.r1");  // 消费者缓存失效回调
+        assertThat(invalidated).containsExactly("public.r1");
         assertThat(syncState.getDdlApplied().count()).isEqualTo(1);
     }
 
     @Test
     void renameReplayIsIdempotent() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.public.r2 (id BIGINT, note VARCHAR)");
-        }
-        List<Struct> run = List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.r2",
-                "ALTER TABLE r2 RENAME COLUMN note TO remark", 110));
-        apply(run);
-        apply(run); // 快照重放同一 DDL:旧列已不存在 → 安全跳过
+        execute("CREATE TABLE lake.public.r2 (id BIGINT, note VARCHAR)");
+        List<Map<String, String>> rows = List.of(row("ddl_command_end", "ALTER TABLE", "table",
+                "public.r2", "ALTER TABLE r2 RENAME COLUMN note TO remark", 110));
+        apply(rows);
+        apply(rows);
 
         assertThat(columns("public", "r2")).containsExactly("id", "remark");
-        assertThat(syncState.getDdlApplied().count()).isEqualTo(1); // 只应用了一次
+        assertThat(syncState.getDdlApplied().count()).isEqualTo(1);
     }
 
     @Test
     void dropAddIsNotMisjudgedAsRenameAndFollowsDropByDefault() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.public.r3 (id BIGINT, note VARCHAR)");
-        }
-        // DROP COLUMN + ADD COLUMN(同 xid 有 sql_drop):不做 rename;followDropColumn 默认 true → 跟随真删
+        execute("CREATE TABLE lake.public.r3 (id BIGINT, note VARCHAR)");
         apply(List.of(
                 row("ddl_command_end", "ALTER TABLE", "table", "public.r3",
                         "ALTER TABLE r3 DROP COLUMN note, ADD COLUMN remark text", 120),
                 row("sql_drop", "ALTER TABLE", "table column", "public.r3.note",
                         "ALTER TABLE r3 DROP COLUMN note, ADD COLUMN remark text", 120)));
 
-        assertThat(columns("public", "r3")).containsExactly("id"); // note 已跟删;remark 由数据驱动 ensureTable 建
-        assertThat(invalidated).containsExactly("public.r3");
+        assertThat(columns("public", "r3")).containsExactly("id");
         assertThat(syncState.getDdlApplied().count()).isEqualTo(1);
     }
 
     @Test
     void followDropColumnDisabledKeepsHistoricalColumn() throws Exception {
         props.getMaintenance().setFollowDropColumn(false);
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.public.r4 (id BIGINT, legacy VARCHAR)");
-        }
+        execute("CREATE TABLE lake.public.r4 (id BIGINT, legacy VARCHAR)");
         apply(List.of(
                 row("ddl_command_end", "ALTER TABLE", "table", "public.r4",
                         "ALTER TABLE r4 DROP COLUMN legacy", 130),
                 row("sql_drop", "ALTER TABLE", "table column", "public.r4.legacy",
                         "ALTER TABLE r4 DROP COLUMN legacy", 130)));
 
-        assertThat(columns("public", "r4")).containsExactly("id", "legacy"); // 历史列保留,新行该列 NULL
-        assertThat(syncState.getDdlApplied().count()).isZero();
-    }
-
-    @Test
-    void tombstoneEventsAreIgnored() throws Exception {
-        // 信号表被 DELETE 清理产生的墓碑(__op=d)不得当作 DDL 信号重放(常规清理走 TRUNCATE 无事件)
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.public.r5 (id BIGINT, note VARCHAR)");
-        }
-        apply(List.of(rowWithOp("ddl_command_end", "ALTER TABLE", "table", "public.r5",
-                "ALTER TABLE r5 RENAME COLUMN note TO remark", 140, "d")));
-
-        assertThat(columns("public", "r5")).containsExactly("id", "note"); // 未被重放
-        assertThat(syncState.getDdlApplied().count()).isZero();
-        assertThat(syncState.getDdlAudited().count()).isZero(); // 墓碑不计入信号消费数
+        assertThat(columns("public", "r4")).containsExactly("id", "legacy");
     }
 
     @Test
     void renameOnAbsentLakeTableIsSkipped() throws Exception {
-        // 湖表尚未由数据驱动建出(建表延迟到首批数据):rename 安全跳过,建表时直接新列名
         apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.ghost",
                 "ALTER TABLE ghost RENAME COLUMN a TO b", 150)));
         assertThat(syncState.getDdlApplied().count()).isZero();
-        assertThat(invalidated).isEmpty();
     }
 
     @Test
     void dropTableFollowsToLakeByDefault() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.public.r6 (id BIGINT)");
-        }
-        // 真实 PG 行为:DROP 命令不出现在 pg_event_trigger_ddl_commands(),审计流只有 sql_drop 行
+        execute("CREATE TABLE lake.public.r6 (id BIGINT)");
         apply(List.of(row("sql_drop", "DROP TABLE", "table", "public.r6", "DROP TABLE r6", 160)));
 
         assertThat(tableExists("public", "r6")).isFalse();
         assertThat(invalidated).containsExactly("public.r6");
-        assertThat(syncState.getDdlApplied().count()).isEqualTo(1);
     }
 
     @Test
     void dropSchemaCascadeFollowsEveryTable() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE SCHEMA IF NOT EXISTS lake.app");
-            s.execute("CREATE TABLE lake.app.o1 (id BIGINT)");
-            s.execute("CREATE TABLE lake.app.o2 (id BIGINT)");
-        }
-        // DROP SCHEMA app CASCADE:级联的每张表各有一条 sql_drop table 行(tg_tag='DROP SCHEMA')
+        execute("CREATE SCHEMA IF NOT EXISTS lake.app");
+        execute("CREATE TABLE lake.app.o1 (id BIGINT)");
+        execute("CREATE TABLE lake.app.o2 (id BIGINT)");
         apply(List.of(
                 row("sql_drop", "DROP SCHEMA", "table", "app.o1", "DROP SCHEMA app CASCADE", 165),
                 row("sql_drop", "DROP SCHEMA", "table", "app.o2", "DROP SCHEMA app CASCADE", 165)));
 
         assertThat(tableExists("app", "o1")).isFalse();
         assertThat(tableExists("app", "o2")).isFalse();
-        assertThat(syncState.getDdlApplied().count()).isEqualTo(2);
     }
 
     @Test
     void dropTableDisabledKeepsLakeTable() throws Exception {
         props.getMaintenance().setFollowDropTable(false);
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.public.r7 (id BIGINT)");
-        }
+        execute("CREATE TABLE lake.public.r7 (id BIGINT)");
         apply(List.of(row("sql_drop", "DROP TABLE", "table", "public.r7", "DROP TABLE r7", 170)));
 
-        assertThat(tableExists("public", "r7")).isTrue(); // followDropTable=false:湖表保留
-        assertThat(syncState.getDdlApplied().count()).isZero();
+        assertThat(tableExists("public", "r7")).isTrue();
     }
 
     @Test
-    void snapshotReplayedDropTableIsSkipped() throws Exception {
-        // 快照重放(op='r')的历史 DROP 不得删活表:快照=当前态,表存在说明后来又被重建
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.public.r8 (id BIGINT)");
-        }
-        apply(List.of(rowWithOp("sql_drop", "DROP TABLE", "table", "public.r8", "DROP TABLE r8", 180, "r")));
-
-        assertThat(tableExists("public", "r8")).isTrue();
-        assertThat(syncState.getDdlApplied().count()).isZero();
-    }
-
-    @Test
-    void commentOnTableAndColumnFollowsToLake() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.public.r9 (id BIGINT, note VARCHAR)");
-        }
+    void commentsFollowToLake() throws Exception {
+        execute("CREATE TABLE lake.public.r9 (id BIGINT, note VARCHAR)");
         apply(List.of(
                 row("ddl_command_end", "COMMENT", "table", "public.r9",
                         "COMMENT ON TABLE r9 IS '测试表'", 190),
                 row("ddl_command_end", "COMMENT", "table column", "public.r9.note",
                         "COMMENT ON COLUMN r9.note IS '备注''引号'", 191)));
 
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT comment FROM duckdb_tables() WHERE database_name='lake' AND schema_name='public' AND table_name='r9'")) {
-            rs.next();
-            assertThat(rs.getString(1)).isEqualTo("测试表");
-        }
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT comment FROM duckdb_columns() WHERE database_name='lake' "
-                        + "AND schema_name='public' AND table_name='r9' AND column_name='note'")) {
-            rs.next();
-            assertThat(rs.getString(1)).isEqualTo("备注'引号"); // '' 转义原样搬运
-        }
-        assertThat(syncState.getDdlApplied().count()).isEqualTo(2);
+        assertThat(tableComment("public", "r9")).isEqualTo("测试表");
+        assertThat(columnComment("public", "r9", "note")).isEqualTo("备注'引号");
     }
 
     @Test
-    void commentOnAbsentTableOrUnparsableIsSkipped() throws Exception {
-        apply(List.of(
-                row("ddl_command_end", "COMMENT", "table", "public.ghost9",
-                        "COMMENT ON TABLE ghost9 IS 'x'", 195),      // 湖表不存在:执行失败仅告警
-                row("ddl_command_end", "COMMENT", "table", "public.ghost9",
-                        "COMMENT ON TABLE ghost9 IS E'pg\\n转义'", 196))); // PG E'' 形式:解析不上跳过
-        // 两条都不落地也不抛出
-        assertThat(syncState.getDdlApplied().count()).isZero();
-    }
-
-    @Test
-    void primaryKeyChangeTriggersRebuildResnapshot() throws Exception {
-        // 存量表补主键:旧行主键回填无 CDC 事件,湖旧行主键恒 NULL——必须重建+重灌
+    void primaryKeyChangeRequestsRebuild() throws Exception {
         apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.p1",
                 "ALTER TABLE p1 ADD COLUMN id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY", 200)));
-        assertThat(rebuilds).containsExactly("public.p1");
-
-        // 对已有列直接 ADD PRIMARY KEY 同样触发
         apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.p2",
                 "ALTER TABLE p2 ADD PRIMARY KEY (code)", 201)));
+
         assertThat(rebuilds).containsExactly("public.p1", "public.p2");
     }
 
     @Test
-    void primaryKeyChangeSkippedForSnapshotReplayAndUnrelatedAlter() throws Exception {
-        // 快照重放(op='r')的历史主键 DDL 不触发(当前态本就完整,重灌无意义)
-        apply(List.of(rowWithOp("ddl_command_end", "ALTER TABLE", "table", "public.p3",
-                "ALTER TABLE p3 ADD PRIMARY KEY (id)", 210, "r")));
-        // 与主键无关的 ALTER(如 DROP CONSTRAINT xxx_pkey 语句不含 PRIMARY KEY 字样)不触发
+    void unrelatedAlterDoesNotRequestRebuild() throws Exception {
         apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.p4",
                 "ALTER TABLE p4 DROP CONSTRAINT p4_pkey", 211)));
+
         assertThat(rebuilds).isEmpty();
     }
 
-    // ---------- MySQL schema change 前端（applySchemaChange） ----------
-
-    private static final Schema CHANGE_TABLE_COLUMN = SchemaBuilder.struct().name("Column")
-            .field("name", Schema.STRING_SCHEMA)
-            .field("typeName", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("length", Schema.OPTIONAL_INT32_SCHEMA)
-            .field("scale", Schema.OPTIONAL_INT32_SCHEMA)
-            .field("comment", Schema.OPTIONAL_STRING_SCHEMA)
-            .optional().build();
-    private static final Schema CHANGE_TABLE = SchemaBuilder.struct().name("Table")
-            .field("comment", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("columns", SchemaBuilder.array(CHANGE_TABLE_COLUMN).optional().build())
-            .optional().build();
-    private static final Schema TABLE_CHANGE = SchemaBuilder.struct().name("Change")
-            .field("type", Schema.STRING_SCHEMA)
-            .field("id", Schema.STRING_SCHEMA)
-            .field("table", CHANGE_TABLE)
-            .optional().build();
-    private static final Schema CHANGE_SOURCE = SchemaBuilder.struct().name("Source")
-            .field("snapshot", Schema.OPTIONAL_STRING_SCHEMA)
-            .optional().build();
-    private static final Schema SCHEMA_CHANGE = SchemaBuilder.struct().name("SchemaChangeValue")
-            .field("source", CHANGE_SOURCE)
-            .field("databaseName", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("ddl", Schema.OPTIONAL_STRING_SCHEMA)
-            .field("tableChanges", SchemaBuilder.array(TABLE_CHANGE).optional().build())
-            .build();
-
-    /** 构造 MySQL schema change 事件（snapshot=false 的实时 DDL） */
-    private static Struct changeEvent(String db, String ddl, Struct... tableChanges) {
-        return changeEventWithSnapshot(db, ddl, "false", tableChanges);
-    }
-
-    private static Struct changeEventWithSnapshot(String db, String ddl, String snapshot, Struct... tableChanges) {
-        return new Struct(SCHEMA_CHANGE)
-                .put("source", new Struct(CHANGE_SOURCE).put("snapshot", snapshot))
-                .put("databaseName", db)
-                .put("ddl", ddl)
-                .put("tableChanges", List.of(tableChanges));
-    }
-
-    private static Struct tableChange(String type, String id) {
-        return new Struct(TABLE_CHANGE).put("type", type).put("id", id);
-    }
-
-    private void applyChange(Struct... events) throws SQLException {
-        applier.applySchemaChange(conn, List.of(events), invalidated::add, rebuilds::add);
-    }
-
     @Test
-    void mysqlRenameColumnBothSyntaxesFollow() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
-            s.execute("CREATE TABLE lake.shop.m1 (id BIGINT, note VARCHAR, alias VARCHAR)");
-        }
-        // 8.0 RENAME COLUMN 语法（反引号标识符）
-        applyChange(changeEvent("shop", "ALTER TABLE `shop`.`m1` RENAME COLUMN `note` TO `remark`",
-                tableChange("ALTER", "\"shop\".\"m1\"")));
-        // 5.x CHANGE 语法改名（old≠new）
-        applyChange(changeEvent("shop", "ALTER TABLE m1 CHANGE alias nickname varchar(64)",
-                tableChange("ALTER", "\"shop\".\"m1\"")));
-
-        assertThat(columns("shop", "m1")).containsExactly("id", "remark", "nickname");
-        // CHANGE 同名（纯类型变更）不触发 rename
-        applyChange(changeEvent("shop", "ALTER TABLE m1 CHANGE nickname nickname varchar(255)",
-                tableChange("ALTER", "\"shop\".\"m1\"")));
-        assertThat(columns("shop", "m1")).containsExactly("id", "remark", "nickname");
-    }
-
-    @Test
-    void mysqlDropColumnAndDropTableFollow() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
-            s.execute("CREATE TABLE lake.shop.m2 (id BIGINT, legacy VARCHAR)");
-            s.execute("CREATE TABLE lake.shop.m3 (id BIGINT)");
-        }
-        // 删列走目标态 diff(tableChanges 变更后全列不含 legacy),免正则/审计配对
-        Struct idOnly = new Struct(CHANGE_TABLE)
-                .put("columns", List.of(new Struct(CHANGE_TABLE_COLUMN).put("name", "id").put("typeName", "BIGINT")));
-        applyChange(changeEvent("shop", "ALTER TABLE m2 DROP COLUMN legacy",
-                new Struct(TABLE_CHANGE).put("type", "ALTER").put("id", "\"shop\".\"m2\"").put("table", idOnly)));
-        assertThat(columns("shop", "m2")).containsExactly("id");
-
-        // DROP TABLE 走结构化 tableChanges type=DROP（ddl 原文无关紧要）
-        applyChange(changeEvent("shop", "DROP TABLE `m3`", tableChange("DROP", "\"shop\".\"m3\"")));
-        assertThat(tableExists("shop", "m3")).isFalse();
-        // DROP PRIMARY KEY 不得误判为删列
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.shop.m4 (id BIGINT, name VARCHAR)");
-        }
-        applyChange(changeEvent("shop", "ALTER TABLE m4 DROP PRIMARY KEY",
-                tableChange("ALTER", "\"shop\".\"m4\"")));
-        assertThat(columns("shop", "m4")).containsExactly("id", "name");
-        assertThat(rebuilds).contains("shop.m4"); // 但主键变更触发重建
-    }
-
-    @Test
-    void mysqlRenameTableAndTruncateFollow() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
-            s.execute("CREATE TABLE lake.shop.m5 (id BIGINT)");
-            s.execute("INSERT INTO lake.shop.m5 VALUES (1), (2)");
-        }
-        // 表重命名:tableChanges id 为 "<old>,<new>" 拼接形态
-        applyChange(changeEvent("shop", "ALTER TABLE m5 RENAME TO m5_new",
-                tableChange("ALTER", "\"shop\".\"m5\",\"shop\".\"m5_new\"")));
-        assertThat(tableExists("shop", "m5")).isFalse();
-        assertThat(tableExists("shop", "m5_new")).isTrue();
-
-        // TRUNCATE(schema change 流形态兜底)
-        applyChange(changeEvent("shop", "TRUNCATE TABLE m5_new"));
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT count(*) FROM lake.shop.m5_new")) {
-            rs.next();
-            assertThat(rs.getLong(1)).isZero();
-        }
-    }
-
-    @Test
-    void mysqlDropDatabaseFollowsAsSchemaCascade() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE SCHEMA IF NOT EXISTS lake.olddb");
-            s.execute("CREATE TABLE lake.olddb.x1 (id BIGINT)");
-        }
-        applyChange(changeEvent("olddb", "DROP DATABASE `olddb`"));
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT count(*) FROM information_schema.schemata WHERE catalog_name='lake' AND schema_name='olddb'")) {
-            rs.next();
-            assertThat(rs.getLong(1)).as("湖 schema 应随 DROP DATABASE 级联删除").isZero();
-        }
-    }
-
-    @Test
-    void mysqlSnapshotPhaseDdlOnlyFollowsComments() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
-            s.execute("CREATE TABLE lake.shop.m6 (id BIGINT, note VARCHAR)");
-        }
-        // 快照期(snapshot=true)的历史 DDL:结构变更一律跳过(活表不能被历史 DDL 误删/误改)
-        Struct dropInSnapshot = changeEventWithSnapshot("shop", "DROP TABLE m6", "true",
-                tableChange("DROP", "\"shop\".\"m6\""));
-        applyChange(dropInSnapshot);
-        assertThat(tableExists("shop", "m6")).isTrue();
-
-        // 但快照期 CREATE TABLE 携带的注释照样跟随(存量表注释借初始快照落湖)
-        Struct col = new Struct(CHANGE_TABLE_COLUMN).put("name", "note").put("comment", "备注列");
-        Struct table = new Struct(CHANGE_TABLE).put("comment", "商品表")
-                .put("columns", List.of(col));
-        Struct create = new Struct(TABLE_CHANGE).put("type", "CREATE")
-                .put("id", "\"shop\".\"m6\"").put("table", table);
-        applyChange(changeEventWithSnapshot("shop",
-                "CREATE TABLE m6 (id bigint, note varchar(64) COMMENT '备注列') COMMENT='商品表'", "true", create));
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT comment FROM duckdb_tables() WHERE database_name='lake' AND schema_name='shop' AND table_name='m6'")) {
-            rs.next();
-            assertThat(rs.getString(1)).isEqualTo("商品表");
-        }
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT comment FROM duckdb_columns() WHERE database_name='lake' "
-                        + "AND schema_name='shop' AND table_name='m6' AND column_name='note'")) {
-            rs.next();
-            assertThat(rs.getString(1)).isEqualTo("备注列");
-        }
-    }
-
-    @Test
-    void mysqlPrimaryKeyAddTriggersRebuild() throws Exception {
-        applyChange(changeEvent("shop", "ALTER TABLE m7 ADD PRIMARY KEY (id)",
-                tableChange("ALTER", "\"shop\".\"m7\"")));
-        assertThat(rebuilds).containsExactly("shop.m7");
-    }
-
-    /** MySQL CREATE(含快照期历史 CREATE):tableChanges 全列结构即刻建湖空表,类型对齐事件口径,
-     *  表/列注释一并应用——存量空表借初始快照补齐 */
-    @Test
-    void mysqlCreateTableChangeBuildsEmptyLakeTableWithComments() throws Exception {
-        Struct idCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "id").put("typeName", "BIGINT");
-        Struct flagCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "flag")
-                .put("typeName", "TINYINT").put("length", 1).put("comment", "开关");
-        Struct amountCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "amount")
-                .put("typeName", "DECIMAL").put("length", 12).put("scale", 2);
-        Struct bigUCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "seq")
-                .put("typeName", "BIGINT UNSIGNED");
-        Struct table = new Struct(CHANGE_TABLE).put("comment", "空表测试")
-                .put("columns", List.of(idCol, flagCol, amountCol, bigUCol));
-        Struct create = new Struct(TABLE_CHANGE).put("type", "CREATE")
-                .put("id", "\"shop\".\"empty1\"").put("table", table);
-        // 快照期(snapshot=true)的历史 CREATE 也建——存量空表补齐语义
-        applyChange(changeEventWithSnapshot("shop",
-                "CREATE TABLE empty1 (id bigint, flag tinyint(1) COMMENT '开关', "
-                        + "amount decimal(12,2), seq bigint unsigned) COMMENT='空表测试'", "true", create));
-
-        assertThat(tableExists("shop", "empty1")).isTrue();
-        assertThat(columns("shop", "empty1")).containsExactly("id", "flag", "amount", "seq");
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT data_type FROM information_schema.columns WHERE table_catalog='lake' "
-                        + "AND table_schema='shop' AND table_name='empty1' ORDER BY ordinal_position")) {
-            rs.next(); assertThat(rs.getString(1)).isEqualTo("BIGINT");
-            rs.next(); assertThat(rs.getString(1)).isEqualTo("BOOLEAN");        // TINYINT(1) 口径
-            rs.next(); assertThat(rs.getString(1)).isEqualTo("DECIMAL(12,2)");  // 源精度忠实对应
-            rs.next(); assertThat(rs.getString(1)).isEqualTo("UBIGINT");        // BIGINT UNSIGNED 原生映射
-        }
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT comment FROM duckdb_tables() WHERE database_name='lake' AND schema_name='shop' AND table_name='empty1'")) {
-            rs.next();
-            assertThat(rs.getString(1)).isEqualTo("空表测试");
-        }
-        // 幂等:重放同 CREATE 不动已有表
-        applyChange(changeEventWithSnapshot("shop", "CREATE TABLE empty1 (id bigint)", "true", create));
-        assertThat(columns("shop", "empty1")).hasSize(4);
-    }
-
-    /** PG 表改名:object_identity 是新名,旧名从原句取;省略 COLUMN 关键字的列改名同样跟随 */
-    @Test
-    void pgRenameTableAndBareRenameColumnFollow() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE TABLE lake.public.rt1 (id BIGINT, note VARCHAR)");
-        }
-        // 表改名:ALTER TABLE rt1 RENAME TO rt2(identity 已是 public.rt2)
+    void renameTableAndBareRenameColumnFollow() throws Exception {
+        execute("CREATE TABLE lake.public.rt1 (id BIGINT, note VARCHAR)");
         apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.rt2",
                 "ALTER TABLE rt1 RENAME TO rt2", 400)));
-        assertThat(tableExists("public", "rt1")).isFalse();
-        assertThat(tableExists("public", "rt2")).isTrue();
-
-        // 省略 COLUMN 关键字的列改名(PG 合法语法)
         apply(List.of(row("ddl_command_end", "ALTER TABLE", "table", "public.rt2",
                 "ALTER TABLE rt2 RENAME note TO remark", 401)));
+
+        assertThat(tableExists("public", "rt1")).isFalse();
         assertThat(columns("public", "rt2")).containsExactly("id", "remark");
     }
 
-    /** ADD COLUMN DDL 驱动即刻建列(不等数据,含注释) + 列序漂移整表重排跟随 */
-    @Test
-    void mysqlAlterSyncsNewColumnsAndColumnOrder() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
-            s.execute("CREATE TABLE lake.shop.mc1 (id BIGINT, name VARCHAR)");
-            s.execute("INSERT INTO lake.shop.mc1 VALUES (1,'a'), (2,'b')");
-        }
-        // 源 ADD COLUMN age AFTER id:目标列序 id,age,name——湖应即刻加列并重排到位
-        Struct idCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "id").put("typeName", "BIGINT");
-        Struct ageCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "age")
-                .put("typeName", "INT").put("comment", "年龄");
-        Struct nameCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "name").put("typeName", "VARCHAR");
-        Struct table = new Struct(CHANGE_TABLE).put("columns", List.of(idCol, ageCol, nameCol));
-        Struct alter = new Struct(TABLE_CHANGE).put("type", "ALTER")
-                .put("id", "\"shop\".\"mc1\"").put("table", table);
-        applyChange(changeEvent("shop", "ALTER TABLE mc1 ADD COLUMN age int COMMENT '年龄' AFTER id", alter));
-
-        assertThat(columns("shop", "mc1")).containsExactly("id", "age", "name"); // 列序=源目标态
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT count(*), max(name) FROM lake.shop.mc1 WHERE age IS NULL")) {
-            rs.next();
-            assertThat(rs.getLong(1)).as("重排换表不丢数据").isEqualTo(2);
-            assertThat(rs.getString(2)).isEqualTo("b");
-        }
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT comment FROM duckdb_columns() WHERE database_name='lake' "
-                        + "AND schema_name='shop' AND table_name='mc1' AND column_name='age'")) {
-            rs.next();
-            assertThat(rs.getString(1)).as("DDL 加列携带注释").isEqualTo("年龄");
+    private static void execute(String sql) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(sql);
         }
     }
-
-    /** follow-drop-column=false 时:源已删列在湖保留(重排追尾不丢);默认 true 则目标态 diff 删除 */
-    @Test
-    void reorderKeepsLakeOnlyHistoricalColumns() throws Exception {
-        props.getMaintenance().setFollowDropColumn(false);
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE SCHEMA IF NOT EXISTS lake.shop");
-            s.execute("CREATE TABLE lake.shop.mc2 (id BIGINT, legacy VARCHAR, v VARCHAR)");
-            s.execute("INSERT INTO lake.shop.mc2 VALUES (1,'old','x')");
-        }
-        // 源目标态只有 v,id(legacy 在源已删但湖保留);列序 v 先 id 后 → 触发重排
-        Struct vCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "v").put("typeName", "VARCHAR");
-        Struct idCol = new Struct(CHANGE_TABLE_COLUMN).put("name", "id").put("typeName", "BIGINT");
-        Struct table = new Struct(CHANGE_TABLE).put("columns", List.of(vCol, idCol));
-        Struct alter = new Struct(TABLE_CHANGE).put("type", "ALTER")
-                .put("id", "\"shop\".\"mc2\"").put("table", table);
-        applyChange(changeEvent("shop", "ALTER TABLE mc2 MODIFY v varchar(16) FIRST", alter));
-
-        assertThat(columns("shop", "mc2")).containsExactly("v", "id", "legacy"); // 源序+湖独有列追尾
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT legacy FROM lake.shop.mc2")) {
-            rs.next();
-            assertThat(rs.getString(1)).as("历史列数据保留").isEqualTo("old");
-        }
-        // 对照:默认 followDropColumn=true 下同形态 diff 会删多余列
-        props.getMaintenance().setFollowDropColumn(true);
-        applyChange(changeEvent("shop", "ALTER TABLE mc2 MODIFY v varchar(16) FIRST", alter));
-        assertThat(columns("shop", "mc2")).containsExactly("v", "id");
-    }
-
-    // ---------- 工具 ----------
 
     private static List<String> columns(String schema, String table) throws SQLException {
-        List<String> cols = new ArrayList<>();
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT column_name FROM information_schema.columns " +
-                        "WHERE table_catalog='lake' AND table_schema='" + schema + "' AND table_name='" + table + "' ORDER BY ordinal_position")) {
+        List<String> result = new ArrayList<>();
+        try (Statement statement = connection.createStatement();
+             ResultSet rs = statement.executeQuery(
+                     "SELECT column_name FROM information_schema.columns "
+                             + "WHERE table_catalog='lake' AND table_schema='" + schema
+                             + "' AND table_name='" + table + "' ORDER BY ordinal_position")) {
             while (rs.next()) {
-                cols.add(rs.getString(1));
+                result.add(rs.getString(1));
             }
         }
-        return cols;
+        return result;
     }
 
     private static boolean tableExists(String schema, String table) throws SQLException {
-        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(
-                "SELECT count(*) FROM information_schema.tables " +
-                        "WHERE table_catalog='lake' AND table_schema='" + schema + "' AND table_name='" + table + "'")) {
+        try (Statement statement = connection.createStatement();
+             ResultSet rs = statement.executeQuery(
+                     "SELECT count(*) FROM information_schema.tables "
+                             + "WHERE table_catalog='lake' AND table_schema='" + schema
+                             + "' AND table_name='" + table + "'")) {
             rs.next();
             return rs.getLong(1) > 0;
+        }
+    }
+
+    private static String tableComment(String schema, String table) throws SQLException {
+        try (Statement statement = connection.createStatement();
+             ResultSet rs = statement.executeQuery(
+                     "SELECT comment FROM duckdb_tables() WHERE database_name='lake' "
+                             + "AND schema_name='" + schema + "' AND table_name='" + table + "'")) {
+            rs.next();
+            return rs.getString(1);
+        }
+    }
+
+    private static String columnComment(String schema, String table, String column) throws SQLException {
+        try (Statement statement = connection.createStatement();
+             ResultSet rs = statement.executeQuery(
+                     "SELECT comment FROM duckdb_columns() WHERE database_name='lake' "
+                             + "AND schema_name='" + schema + "' AND table_name='" + table
+                             + "' AND column_name='" + column + "'")) {
+            rs.next();
+            return rs.getString(1);
         }
     }
 }

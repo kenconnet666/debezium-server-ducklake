@@ -1,5 +1,6 @@
 package org.dpdns.zerodep.ducklake;
 
+import org.dpdns.zerodep.ducklake.config.DucklakeProperties;
 import org.dpdns.zerodep.ducklake.metrics.SyncState;
 import org.dpdns.zerodep.ducklake.sink.DuckLakeEngine;
 import org.junit.jupiter.api.BeforeAll;
@@ -26,15 +27,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 /**
- * RAW_PG 引擎全链集成测试（Testcontainers，Docker 不可用时整类跳过）：
- * 真 PG18(wal_level=logical) + 真 DuckLake + source.engine=RAW_PG。
+ * PostgreSQL 原生 CDC 全链集成测试（Testcontainers，Docker 不可用时整类跳过）：
+ * 真 PG18（wal_level=logical）+ 真 DuckLake。
  * <p>
  * 验证范围：
  * <ul>
  *   <li>流式 INSERT / UPDATE / DELETE（pgoutput 切帧+Relation 缓存）</li>
+ *   <li>unchanged TOAST 保值、同事务连续 UPDATE、主键变更按旧 tuple 定位</li>
  *   <li>类型映射矩阵（bool/int/numeric/text/date/time/ts/tstz/interval/uuid/bytea/array）</li>
  *   <li>ADD COLUMN：Relation 消息自愈（不需 DDL 审计，ensureTable 即刻感知）</li>
- *   <li>RENAME COLUMN：DDL 审计表 → DdlApplier.applyRaw（与 Debezium 路径同原语）</li>
+ *   <li>RENAME COLUMN：DDL 审计表 → DdlApplier.applyRaw</li>
  *   <li>多 schema 自动对应</li>
  *   <li>无主键表降级 insert-only</li>
  * </ul>
@@ -55,6 +57,7 @@ class RawPgIntegrationTest {
     static Path lakeDir;
 
     @Autowired DuckLakeEngine engine;
+    @Autowired DucklakeProperties props;
     @Autowired SyncState syncState;
 
     // ──────────── 源库初始化（Spring 上下文启动前完成） ────────────
@@ -117,6 +120,7 @@ class RawPgIntegrationTest {
                     + "EXECUTE FUNCTION fn_capture_drop()");
 
             // 主测试表（丰富类型矩阵）
+            s.execute("CREATE DOMAIN amount_7_3 AS numeric(7,3)");
             s.execute("""
                     CREATE TABLE cdc_raw (
                         id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -135,11 +139,17 @@ class RawPgIntegrationTest {
                         evt_ts   timestamp,
                         dur      interval,
                         raw_data bytea,
-                        tags     text[])""");
+                        tags     text[],
+                        prices   numeric(12,2)[],
+                        matrix   numeric(10,3)[][],
+                        domain_prices amount_7_3[])""");
 
             // 非 public schema
             s.execute("CREATE SCHEMA app");
             s.execute("CREATE TABLE app.items (id bigint PRIMARY KEY, label text)");
+
+            // 大字段更新语义：marker-only UPDATE 会在 pgoutput 中把 payload 编码为 'u'
+            s.execute("CREATE TABLE toast_probe (id bigint PRIMARY KEY, payload text, marker integer)");
 
             // 无主键表（降级 insert-only）
             s.execute("CREATE TABLE nopk (v text)");
@@ -165,9 +175,6 @@ class RawPgIntegrationTest {
         r.add("ducklake.lake.s3-access-key", () -> "dummy");
         r.add("ducklake.lake.s3-secret-key", () -> "dummy");
 
-        // RAW_PG 引擎（核心）
-        r.add("ducklake.source.engine", () -> "RAW_PG");
-
         // scanner 路径关闭（测试环境无 postgres_scanner 扩展）
         r.add("ducklake.maintenance.scanner-bootstrap", () -> "false");
         r.add("ducklake.maintenance.scanner-refill", () -> "false");
@@ -178,9 +185,14 @@ class RawPgIntegrationTest {
 
     @Test
     @Order(1)
-    void engineStartsWithRawPg() {
+    void engineStartsWithRawPg() throws Exception {
         assertThat(syncState.getEngineRunning().get())
-                .as("RAW_PG 引擎应已启动").isEqualTo(1);
+                .as("PostgreSQL 原生 reader 应已启动").isEqualTo(1);
+        assertThat(engine.queryScalar(
+                "SELECT CAST(current_setting('ducklake_default_data_inlining_row_limit') AS INTEGER)",
+                Integer.class))
+                .as("Data Inlining 阈值必须显式下发，尤其是 0=禁用")
+                .isEqualTo(props.getLake().getDataInliningRowLimit());
     }
 
     @Test
@@ -188,7 +200,7 @@ class RawPgIntegrationTest {
     void insertLandsInLake() throws Exception {
         exec("""
                 INSERT INTO cdc_raw(name,flag,score,cnt,big,price,ratio,rate,
-                    uid,evt_date,evt_time,evt_tstz,evt_ts,dur,raw_data,tags)
+                    uid,evt_date,evt_time,evt_tstz,evt_ts,dur,raw_data,tags,prices,matrix,domain_prices)
                 VALUES (
                     'row1', true, 32767, 2147483647, 9223372036854775807,
                     9999999999.99, 3.14, 2.718281828,
@@ -197,7 +209,10 @@ class RawPgIntegrationTest {
                     '2024-02-29 12:00:00.123456+08', '2024-02-29 12:00:00.123456',
                     interval '1 year 2 months 3 days 04:05:06.7',
                     decode('48656c6c6f','hex'),
-                    ARRAY['a,b','c'])
+                    ARRAY['a,b','c'],
+                    ARRAY[1.23,9999999999.99]::numeric(12,2)[],
+                    ARRAY[[1.234,2.345],[3.456,4.567]]::numeric(10,3)[][],
+                    ARRAY[1234.567]::amount_7_3[])
                 """);
         await30s(() -> assertThat(lakeCount("SELECT count(*) FROM public.cdc_raw")).isEqualTo(1L));
     }
@@ -205,7 +220,7 @@ class RawPgIntegrationTest {
     @Test
     @Order(3)
     void typeMappingIsCorrect() throws Exception {
-        // 类型矩阵断言：pgoutput 文本 → DuckDB 原生类型，与 raw-passthrough.md CAST 兼容性矩阵对齐
+        // 类型矩阵断言：pgoutput 文本 → DuckDB 原生类型。
         assertThat(lakeColumnType("cdc_raw", "flag")).isEqualTo("BOOLEAN");
         assertThat(lakeColumnType("cdc_raw", "score")).isEqualTo("SMALLINT");
         assertThat(lakeColumnType("cdc_raw", "cnt")).isEqualTo("INTEGER");
@@ -221,6 +236,9 @@ class RawPgIntegrationTest {
         assertThat(lakeColumnType("cdc_raw", "dur")).isEqualTo("INTERVAL");
         assertThat(lakeColumnType("cdc_raw", "raw_data")).isEqualTo("BLOB");
         assertThat(lakeColumnType("cdc_raw", "tags")).isEqualTo("VARCHAR[]");
+        assertThat(lakeColumnType("cdc_raw", "prices")).isEqualTo("DECIMAL(12,2)[]");
+        assertThat(lakeColumnType("cdc_raw", "matrix")).isEqualTo("DECIMAL(10,3)[][]");
+        assertThat(lakeColumnType("cdc_raw", "domain_prices")).isEqualTo("DECIMAL(7,3)[]");
 
         // 值精度断言
         assertThat(engine.queryScalar(
@@ -236,6 +254,15 @@ class RawPgIntegrationTest {
         assertThat(engine.queryScalar(
                 "SELECT uid::text FROM public.cdc_raw WHERE name='row1'", String.class))
                 .isEqualTo("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+        assertThat(engine.queryScalar(
+                "SELECT prices[2] FROM public.cdc_raw WHERE name='row1'", java.math.BigDecimal.class))
+                .isEqualByComparingTo("9999999999.99");
+        assertThat(engine.queryScalar(
+                "SELECT matrix[2][2] FROM public.cdc_raw WHERE name='row1'", java.math.BigDecimal.class))
+                .isEqualByComparingTo("4.567");
+        assertThat(engine.queryScalar(
+                "SELECT domain_prices[1] FROM public.cdc_raw WHERE name='row1'", java.math.BigDecimal.class))
+                .isEqualByComparingTo("1234.567");
         // interval 可做日期运算
         assertThat(engine.queryScalar(
                 "SELECT date_part('month', dur) FROM public.cdc_raw WHERE name='row1'", Long.class))
@@ -269,6 +296,39 @@ class RawPgIntegrationTest {
 
     @Test
     @Order(5)
+    void unchangedToastAndPrimaryKeyUpdatePreserveCurrentState() throws Exception {
+        exec("""
+                INSERT INTO toast_probe
+                SELECT 9001, string_agg(md5(g::text), ''), 1
+                FROM generate_series(1, 10000) g
+                """);
+        await30s(() -> assertThat(lakeCount(
+                "SELECT length(payload) FROM public.toast_probe WHERE id=9001")).isEqualTo(320000L));
+
+        // 同一源事务的后一条 'u' 必须读取前一条 UPDATE 后的湖值，不能被批内折叠成 NULL。
+        try (Connection c = DriverManager.getConnection(PG.getJdbcUrl(), "postgres", "test");
+             Statement s = c.createStatement()) {
+            c.setAutoCommit(false);
+            s.execute("UPDATE toast_probe SET marker=2 WHERE id=9001");
+            s.execute("UPDATE toast_probe SET marker=3 WHERE id=9001");
+            c.commit();
+        }
+        await30s(() -> {
+            assertThat(lakeCount("SELECT marker FROM public.toast_probe WHERE id=9001")).isEqualTo(3L);
+            assertThat(lakeCount("SELECT length(payload) FROM public.toast_probe WHERE id=9001")).isEqualTo(320000L);
+        });
+
+        // UPDATE 主键时 pgoutput 携带旧 K tuple；旧 identity 必须消失，TOAST 值仍保持。
+        exec("UPDATE toast_probe SET id=9002, marker=4 WHERE id=9001");
+        await30s(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM public.toast_probe WHERE id=9001")).isZero();
+            assertThat(lakeCount("SELECT length(payload) FROM public.toast_probe WHERE id=9002 AND marker=4"))
+                    .isEqualTo(320000L);
+        });
+    }
+
+    @Test
+    @Order(6)
     void deletePhysicallyFollows() throws Exception {
         exec("INSERT INTO cdc_raw(name,cnt) VALUES ('del_target',1)");
         await30s(() -> assertThat(lakeCount(
@@ -283,7 +343,7 @@ class RawPgIntegrationTest {
     }
 
     @Test
-    @Order(6)
+    @Order(7)
     void addColumnViaRelationMessageHealing() throws Exception {
         // Relation 消息自愈：源加列后下一条事件触发新 Relation 消息，ensureTable 即刻补列
         exec("ALTER TABLE cdc_raw ADD COLUMN note text");
@@ -296,7 +356,7 @@ class RawPgIntegrationTest {
     }
 
     @Test
-    @Order(7)
+    @Order(8)
     void renameColumnViaAuditTable() throws Exception {
         // RENAME COLUMN：DDL 审计表 INSERT → DdlApplier.applyRaw → 湖侧真 rename
         exec("ALTER TABLE cdc_raw RENAME COLUMN cnt TO count_val");
@@ -312,7 +372,7 @@ class RawPgIntegrationTest {
     }
 
     @Test
-    @Order(8)
+    @Order(9)
     void dropColumnFollows() throws Exception {
         exec("ALTER TABLE cdc_raw DROP COLUMN score");
         exec("INSERT INTO cdc_raw(name) VALUES ('after_dropcol')");
@@ -324,7 +384,7 @@ class RawPgIntegrationTest {
     }
 
     @Test
-    @Order(9)
+    @Order(10)
     void multiSchemaStreamsAutomatically() throws Exception {
         exec("INSERT INTO app.items VALUES (1,'item-a'), (2,'item-b')");
         await30s(() -> assertThat(lakeCount("SELECT count(*) FROM app.items")).isEqualTo(2L));
@@ -335,7 +395,7 @@ class RawPgIntegrationTest {
     }
 
     @Test
-    @Order(10)
+    @Order(11)
     void noKeyTableInsertOnly() throws Exception {
         // 无主键表：INSERT 落湖（insert-only 语义）
         // DELETE 不测——对 FOR ALL TABLES publication，无 replica identity 表的 DELETE
@@ -348,7 +408,7 @@ class RawPgIntegrationTest {
     }
 
     @Test
-    @Order(11)
+    @Order(12)
     void nullValuesRoundtrip() throws Exception {
         exec("INSERT INTO cdc_raw(name,flag,uid,evt_date,dur,raw_data,tags) VALUES ('nulls',NULL,NULL,NULL,NULL,NULL,NULL)");
         await30s(() -> assertThat(lakeCount(

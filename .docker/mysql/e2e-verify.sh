@@ -5,7 +5,7 @@
 # 自建唯一名测试表(t_e2e_<时分秒>),不碰业务对象;可重复执行。
 # 断言口径与 PG 版一致 = 湖侧当前态行数(Σ活跃 data - Σ活跃 delete + 活跃 inlined)。
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit
 
 DC="docker compose"
 PASS=0; FAIL=0
@@ -61,7 +61,11 @@ else
   ok "mysql/catalog-pg/rustfs/ducklake 全部 healthy"
 fi
 bi=$($DC ps -a --format '{{.Service}} {{.ExitCode}}' | grep '^bucket-init ')
-[ "$bi" = "bucket-init 0" ] && ok "bucket-init 建桶完成(exit 0)" || bad "bucket-init 异常: ${bi:-未找到}"
+if [ "$bi" = "bucket-init 0" ]; then
+  ok "bucket-init 建桶完成(exit 0)"
+else
+  bad "bucket-init 异常: ${bi:-未找到}"
+fi
 
 echo "── 2. 引擎在线 ──"
 engine_up() {
@@ -100,16 +104,14 @@ wait_for "新列行落湖(当前态 951)" 60 "951" lakecount
 msrc "ALTER TABLE $TBL RENAME COLUMN note TO remark"
 wait_for "RENAME COLUMN 湖侧真 rename(remark 列)" 60 "1" hasremark
 
-echo "── 7. 心跳闭环(offset 持续推进) ──"
-hb=$(msrc "SELECT count(*) FROM dbz_heartbeat")
-if [ "${hb:-0}" -ge 1 ]; then ok "dbz_heartbeat 已有心跳行(action query 生效)"; else
-  echo "  … 等待一个心跳周期(65s)"; sleep 65
-  hb=$(msrc "SELECT count(*) FROM dbz_heartbeat")
-  [ "${hb:-0}" -ge 1 ] && ok "dbz_heartbeat 心跳行出现" || bad "心跳表仍为空(interval 60s 应已触发)"
-fi
-# binlog 客户端在线(Debezium 以 replica 身份注册,server_id=6400)
+echo "── 7. 原生 binlog reader 在线 ──"
+# 原生 reader 以 replica 身份注册（server_id=6400）
 replica=$(msrc "SELECT count(*) FROM information_schema.processlist WHERE command LIKE 'Binlog Dump%'")
-[ "${replica:-0}" -ge 1 ] && ok "binlog 客户端在线(Binlog Dump 线程存在)" || bad "无 Binlog Dump 线程(连接器未在读流)"
+if [ "${replica:-0}" -ge 1 ]; then
+  ok "binlog 客户端在线(Binlog Dump 线程存在)"
+else
+  bad "无 Binlog Dump 线程(连接器未在读流)"
+fi
 
 echo "── 8. DROP TABLE 跟随 + 日志 ERROR 扫描 ──"
 msrc "DROP TABLE $TBL"

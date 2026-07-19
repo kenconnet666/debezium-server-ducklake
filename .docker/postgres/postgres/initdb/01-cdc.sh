@@ -26,7 +26,7 @@ cat >> "$PGDATA/pg_hba.conf" <<-EOF
     host replication dbuser_cdc 0.0.0.0/0 scram-sha-256
 EOF
 
-# ── DDL 审计流 + signal 表 + 心跳表(湖侧 DDL 跟随/类型重建兜底/防空闲 WAL 扣留)──
+# ── DDL 审计流（湖侧 rename/drop/comment 跟随）──
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-'EOSQL'
     CREATE TABLE public.dbz_ddl_log (
         id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -75,12 +75,4 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-'
 
     GRANT TRUNCATE ON public.dbz_ddl_log TO dbuser_cdc;
 
-    CREATE TABLE public.dbz_signal (
-        id varchar(42) PRIMARY KEY, type varchar(32) NOT NULL, data varchar(2048));
-    GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON public.dbz_signal TO dbuser_cdc;
-
-    CREATE TABLE public.dbz_heartbeat (
-        id int PRIMARY KEY, ts timestamptz NOT NULL DEFAULT now());
-    ALTER TABLE public.dbz_heartbeat REPLICA IDENTITY FULL;
-    GRANT SELECT, INSERT, UPDATE ON public.dbz_heartbeat TO dbuser_cdc;
 EOSQL

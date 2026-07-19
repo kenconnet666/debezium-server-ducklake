@@ -7,7 +7,7 @@
 #      mvn package -DskipTests
 #      docker compose -f .docker/postgres/docker-compose.yml --profile app up -d --build
 #      查 watermark: curl http://127.0.0.1:19992/api/ducklake/watermark
-# CDC 基建(角色/publication/DDL 审计/signal/心跳表)由 initdb 自动完成,up 即可用。
+# CDC 基建（复制角色/publication/DDL 审计表）由 initdb 自动完成，up 即可用。
 # 与 MySQL 源栈(.docker/mysql/)互相独立:project/端口/数据目录全错开,可并存同机。
 # 布局约定:每个服务一个子目录——Dockerfile 放 <服务>/,持久化数据落 <服务>/data/
 # (bind mount,不用 named volume;数据与栈定义同处一树,备份/清理一个目录搞定)。
@@ -142,6 +142,8 @@ services:
       DUCKLAKE_S3_ENDPOINT: rustfs:9000
       DUCKLAKE_S3_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-admin}
       DUCKLAKE_S3_SECRET_KEY: ${RUSTFS_SECRET_KEY:-changeme}
+      DUCKLAKE_DATA_INLINING_ROW_LIMIT: ${DUCKLAKE_DATA_INLINING_ROW_LIMIT:-512}
+      DUCKLAKE_MAX_RETRY_COUNT: ${DUCKLAKE_MAX_RETRY_COUNT:-20}
     ports:
       - "19992:19992"
     deploy:
@@ -155,7 +157,7 @@ services:
   # ── 方案B 分片实例模板（取消注释并按需调整）──
   # 场景：多 schema 横向分片，聚合吞吐随实例数近线性（harness 实测 2slot 聚合 ~170k，完美 2×）。
   # 前置：在源库先建 per-schema publication（见 .doc/init-source-db.sql 方案B 注释）。
-  # 每实例独立 slot-name + publication-name + topic-prefix（三者不同才能共存同一 catalog）。
+  # 每实例独立 slot-name + publication-name；schema-prefix 隔离湖命名空间。
   # schema-prefix 隔离湖命名空间：实例A 的表落 lake.a_schema_a.*，实例B 落 lake.b_schema_b.*。
   #
   # ducklake-b:
@@ -179,11 +181,10 @@ services:
   #     DUCKLAKE_SOURCE_USER: dbuser_cdc
   #     DUCKLAKE_SOURCE_PASSWORD: ${PG_PASSWORD:-changeme}
   #     DUCKLAKE_SOURCE_DBNAME: postgres
-  #     DUCKLAKE_SOURCE_SLOT_NAME: dbz_ducklake_b
-  #     DUCKLAKE_SOURCE_PUBLICATION_NAME: pub_schema_b
-  #     DUCKLAKE_SOURCE_SCHEMA_INCLUDE_LIST: schema_b
-  #     DUCKLAKE_ENGINE_TOPIC_PREFIX: ducklake_b
-  #     DUCKLAKE_MAINTENANCE_SCHEMA_PREFIX: "b_"
+  #     DUCKLAKE_SLOT: dbz_ducklake_b
+  #     DUCKLAKE_PUBLICATION: pub_schema_b
+  #     DUCKLAKE_SCHEMA_INCLUDE: schema_b
+  #     DUCKLAKE_SCHEMA_PREFIX: "b_"
   #     DUCKLAKE_CATALOG_HOST: catalog-pg
   #     DUCKLAKE_CATALOG_PORT: "5432"
   #     DUCKLAKE_CATALOG_DB: ducklake_catalog

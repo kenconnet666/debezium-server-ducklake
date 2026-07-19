@@ -14,13 +14,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
- * raw-pg 引擎生命周期（随 Spring 容器启停，与 {@link DebeziumEngineRunner} 互斥）。
+ * PostgreSQL 原生 CDC 生命周期（随 Spring 容器启停）。
  * <p>
- * source.engine=RAW_PG 时启动；DEBEZIUM 时静默跳过（DebeziumEngineRunner 接管）。
- * 致命退出模型与 Debezium 路径一致：异常 → 进程自杀 → 容器重启 → 从上个 LSN offset 续传。
+ * source.type=POSTGRES 时启动；异常 → 进程退出 → 容器重启 → 从上个已提交 LSN 续传。
  * <p>
  * 首次接入存量：评估 {@link ScannerBootstrap}（开关 scanner-bootstrap 控制），
- * 流式启动后异步直拉历史行，与增量 anti-join 收敛（与 DebeziumEngineRunner 同机制）。
+ * 流式启动后异步直拉历史行，与增量 anti-join 收敛。
  */
 @Slf4j
 @Component
@@ -40,11 +39,7 @@ public class RawPgRunner implements SmartLifecycle {
     @Override
     public void start() {
         DucklakeProperties.Source src = props.getSource();
-        if (src.getEngine() != DucklakeProperties.CdcEngine.RAW_PG) {
-            return;
-        }
         if (src.getType() != DucklakeProperties.SourceType.POSTGRES) {
-            log.warn("engine=raw-pg 仅支持 source.type=POSTGRES（当前 {}），跳过启动", src.getType());
             return;
         }
         DucklakeProperties.Lake lake = props.getLake();
@@ -57,6 +52,7 @@ public class RawPgRunner implements SmartLifecycle {
         bootstrap.evaluateForRawPg(startLsn);
 
         reader = new RawPgReader(props, engine, ddlApplier, syncState, offset);
+        long preparedStartLsn = startLsn;
 
         // running=true 在 executor 启动前设置，防止线程启动后立即报错时 if(running) 误判
         running = true;
@@ -64,7 +60,9 @@ public class RawPgRunner implements SmartLifecycle {
         executor = Executors.newSingleThreadExecutor(r -> new Thread(r, "raw-pg-reader"));
         executor.execute(() -> {
             try {
-                reader.run();
+                // 必须先建立 slot/replication stream，再允许 scanner 读取源快照；否则两者之间
+                // 提交的变更既不在快照里，也可能早于 slot 起点，形成不可恢复的首启缺口。
+                reader.run(preparedStartLsn, bootstrap::runAsync);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 log.info("RawPgReader 已停止（interrupted）");
@@ -80,7 +78,6 @@ public class RawPgRunner implements SmartLifecycle {
                 }
             }
         });
-        bootstrap.runAsync(); // 流式已开始，异步直拉存量（与增量 anti-join 收敛）
         log.info("RawPgReader 已启动: slot={} publication={} -> DuckLake",
                 src.getSlotName(), src.getPublicationName());
     }

@@ -1,8 +1,10 @@
 # prod = 全环境变量注入（容器化部署推荐;变量名与 docker compose 两栈对齐）
 ducklake:
   source:
-    # postgres(默认)/mysql——解码机制与 DDL 跟随路线随之切换
+    # postgres=原生 pgoutput；mysql=原生 ROW binlog
     type: ${DUCKLAKE_SOURCE_TYPE:postgres}
+    # 多个源共享同一 catalog 时必须唯一（MySQL offset 命名空间）
+    name: ${DUCKLAKE_SOURCE_NAME:ducklake}
     hostname: ${DUCKLAKE_SOURCE_HOST}
     # ⚠️ 默认 5432 是 PG 习惯值,type=mysql 时务必显式给 3306(或实际端口)
     port: ${DUCKLAKE_SOURCE_PORT:5432}
@@ -14,16 +16,10 @@ ducklake:
     # [仅 MySQL] binlog 客户端 ID(集群内唯一);会话时区透传(空=自动查询服务端)
     server-id: ${DUCKLAKE_SOURCE_SERVER_ID:6400}
     connection-time-zone: ${DUCKLAKE_SOURCE_TIMEZONE:}
-    # signal 表全名(空=按类型推导:PG public.dbz_signal / MySQL <dbname>.dbz_signal)
-    signal-table: ${DUCKLAKE_SIGNAL_TABLE:}
     # 捕获范围:默认空=整库(PG=全部用户 schema / MySQL=全部用户库,存量快照+增量都拉,
     # 湖表自动一一对应);收窄时给逗号分隔列表(正则),如 "public,app"
     schema-include-list: ${DUCKLAKE_SCHEMA_INCLUDE:}
     table-exclude-list: ${DUCKLAKE_TABLE_EXCLUDE:}
-    # CDC 读取引擎（仅 source.type=postgres 时生效；mysql 固定走 DEBEZIUM）：
-    # DEBEZIUM（默认）= Debezium Embedded Engine，PG/MySQL 通用；
-    # RAW_PG = pgjdbc 直读 pgoutput，PG 专用，harness 实测约 Debezium 13×
-    engine: ${DUCKLAKE_ENGINE:DEBEZIUM}
   lake:
     catalog-host: ${DUCKLAKE_CATALOG_HOST:${DUCKLAKE_SOURCE_HOST}}
     catalog-port: ${DUCKLAKE_CATALOG_PORT:5432}
@@ -39,21 +35,22 @@ ducklake:
     memory-limit: ${DUCKLAKE_MEMORY_LIMIT:1536MB}
     # 0=自动核数(需容器内存 ≥2.5G);2=已验证稳定值(8 线程在 1.75G 容器实测 OOM)
     threads: ${DUCKLAKE_THREADS:2}
+    # 小批写入 catalog 的行数阈值；0=显式禁用（不能省略 SET，否则 DuckLake 会采用非零默认值）
+    data-inlining-row-limit: ${DUCKLAKE_DATA_INLINING_ROW_LIMIT:512}
+    max-retry-count: ${DUCKLAKE_MAX_RETRY_COUNT:20}
   engine:
-    # 零流量防 WAL 扣留闭环(见 README 运维节):周期 UPSERT 心跳表触发 LSN flush。
-    # 前置=init-source-db.sql 已建 public.dbz_heartbeat;置空可禁用
-    heartbeat-action-query: ${DUCKLAKE_HEARTBEAT_QUERY:INSERT INTO public.dbz_heartbeat (id, ts) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET ts = now()}
+    # 两源共用：追赶场景可调大以减少湖事务；空闲 flush 超时=max(poll×50,500ms)
+    max-batch-size: ${DUCKLAKE_ENGINE_MAX_BATCH_SIZE:8192}
+    poll-interval-ms: ${DUCKLAKE_ENGINE_POLL_INTERVAL_MS:10}
   maintenance:
     enabled: true
     # 新建湖表自动 SET SORTED BY (主键)(写出与压实按键排序,查询剪枝受益)
     sorted-by-pk: ${DUCKLAKE_SORTED_BY_PK:true}
     # 源 JSON/jsonb → VARIANT(子字段 shredding 剪枝;PG catalog 下暂不 inline,小文件由压实吸收)
     json-as-variant: ${DUCKLAKE_JSON_AS_VARIANT:true}
-    # 重建重灌走 scanner 直拉(启动时按 source.type 自动 INSTALL/ATTACH 只读源;
-    # 实测比 Debezium 快照重灌快 36×/11× 且不停流;源不可达自动降级 signal 快照)
+    # 重建重灌走 scanner 直拉（PG 使用独立 postgres_scan；MySQL 使用只读 ATTACH）
     scanner-refill: ${DUCKLAKE_SCANNER_REFILL:true}
-    # 首次接入存量也走 scanner 直拉(首启 no_data 秒级拿位点,流式即刻开始,存量异步
-    # 逐表直灌;无主键/跨库表转 signal blocking;进度存 catalog,崩溃续跑)
+    # 首次接入存量异步逐表直灌；无主键/跨库表跳过存量、后续 insert-only；进度可续跑
     scanner-bootstrap: ${DUCKLAKE_SCANNER_BOOTSTRAP:true}
     # 湖 schema 前缀:空(默认)=纯镜像(源 public.demo → 湖 lake.public.demo);
     # 多源库实例共享同一湖 catalog 时各配不同前缀隔离(如 "erp_" → lake.erp_public.demo)

@@ -1,6 +1,7 @@
 package org.dpdns.zerodep.ducklake;
 
 import org.dpdns.zerodep.ducklake.metrics.SyncState;
+import org.dpdns.zerodep.ducklake.engine.RawMySqlRunner;
 import org.dpdns.zerodep.ducklake.sink.DuckLakeEngine;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
@@ -13,11 +14,12 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.web.client.RestClient;
-import org.testcontainers.containers.MySQLContainer;
-import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.mysql.MySQLContainer;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -30,27 +32,29 @@ import static org.awaitility.Awaitility.await;
 
 /**
  * MySQL 8.0+ 源全链集成测试(Testcontainers,Docker 不可用时整类跳过)：
- * 真 MySQL 8.4(binlog ROW/FULL 默认开) + 真 PG(DuckLake catalog + offset + schema history)
+ * 真 MySQL 8.4(binlog ROW/FULL metadata) + 真 PG(DuckLake catalog + raw offset)
  * + 真 DuckLake(湖数据落本地 @TempDir)。
  * <p>
- * 与 PG 版集成测试同口径，另覆盖 MySQL 专属面：JdbcSchemaHistory 落 catalog PG、
- * binlog schema change 事件驱动的 DDL 跟随(RENAME/DROP COLUMN/COMMENT/DROP TABLE)、
- * TRUNCATE 跟随(op=t)、TINYINT(1) 两阶段一致(TinyIntOneToBooleanConverter)、
+ * 与 PG 版集成测试同口径，另覆盖 MySQL 专属面：原生 QueryEvent DDL 跟随
+ * (RENAME/DROP COLUMN/COMMENT/DROP TABLE)、TRUNCATE、TINYINT(1)、
  * MySQL 类型族落湖(DATETIME/TIMESTAMP/DECIMAL/JSON/ENUM)。
  */
 @Testcontainers(disabledWithoutDocker = true)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class MySqlIntegrationTest {
 
     /** 源库：8.4 LTS 默认 log_bin=ON / binlog_format=ROW / binlog_row_image=FULL，零参数调整 */
     @Container
-    static final MySQLContainer<?> MYSQL = new MySQLContainer<>("mysql:8.4")
-            .withDatabaseName("shop").withUsername("test").withPassword("test");
+    static final MySQLContainer MYSQL = new MySQLContainer("mysql:8.4")
+            .withDatabaseName("shop").withUsername("test").withPassword("test")
+            .withCommand("--server-id=1", "--gtid-mode=ON", "--enforce-gtid-consistency=ON",
+                    "--binlog-row-image=FULL", "--binlog-row-metadata=FULL");
 
-    /** 湖 catalog（恒为 PG，与源库类型无关）：offset + schema history + DuckLake 元数据同库 */
+    /** 湖 catalog（恒为 PG，与源库类型无关）：原生 offset + DuckLake 元数据同库。 */
     @Container
-    static final PostgreSQLContainer<?> CATALOG = new PostgreSQLContainer<>("postgres:18-alpine")
+    static final PostgreSQLContainer CATALOG = new PostgreSQLContainer("postgres:18-alpine")
             .withDatabaseName("ducklake_catalog").withUsername("lake_admin").withPassword("test");
 
     @TempDir
@@ -60,21 +64,19 @@ class MySqlIntegrationTest {
     DuckLakeEngine engine;
     @Autowired
     SyncState syncState;
+    @Autowired
+    RawMySqlRunner rawRunner;
     @LocalServerPort
     int port;
 
-    /** 等价于 docker/mysql/initdb：CDC 账号(官方权限清单)/signal 表/心跳表/冒烟表 */
+    /** 等价于 docker/mysql/initdb：复制账号与冒烟表。 */
     @BeforeAll
     static void provisionSourceDatabase() throws Exception {
         try (Connection c = DriverManager.getConnection(MYSQL.getJdbcUrl(), "root", "test");
              Statement s = c.createStatement()) {
-            // 官方 GRANT 原文(caching_sha2_password 为 8.0+ 默认认证插件,顺带验证其连通性)
+            // 原生 binlog reader 所需复制权限；SELECT 用于 scanner/information_schema 对齐。
             s.execute("CREATE USER 'dbuser_cdc'@'%' IDENTIFIED BY 'test'");
             s.execute("GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'dbuser_cdc'@'%'");
-            // signal 表(增量/blocking 快照触发;连接器要写水位,CDC 账号要 INSERT/DELETE)
-            s.execute("CREATE TABLE shop.dbz_signal (id varchar(42) PRIMARY KEY, type varchar(32) NOT NULL, data varchar(2048))");
-            s.execute("GRANT INSERT, UPDATE, DELETE, DROP ON shop.dbz_signal TO 'dbuser_cdc'@'%'");
-
             // 冒烟表:覆盖 MySQL 类型族(BOOLEAN=TINYINT(1)/DATETIME/TIMESTAMP/DECIMAL/JSON/ENUM)
             s.execute("""
                     CREATE TABLE shop.cdc_test (
@@ -94,6 +96,8 @@ class MySqlIntegrationTest {
                     + "('gamma', 99.99, true, '{\"k\": 3}', 'silver', 42)");
             // 存量空表:无任何数据事件,湖表应由快照期 schema change(历史 CREATE)直接建出
             s.execute("CREATE TABLE shop.empty_seed (id bigint PRIMARY KEY, note varchar(64) COMMENT '备注') COMMENT='存量空表'");
+            // 兼容旧部署的过滤表：用于验证零捕获行事务仍推进持久化 binlog offset。
+            s.execute("CREATE TABLE shop.dbz_heartbeat (id bigint PRIMARY KEY, touched_at timestamp(6))");
         }
     }
 
@@ -106,6 +110,7 @@ class MySqlIntegrationTest {
         r.add("ducklake.source.user", () -> "dbuser_cdc");
         r.add("ducklake.source.password", () -> "test");
         r.add("ducklake.source.dbname", () -> "shop");
+        r.add("ducklake.source.name", () -> "ducklake");
         r.add("ducklake.source.server-id", () -> "6401");
 
         r.add("ducklake.lake.catalog-host", CATALOG::getHost);
@@ -290,27 +295,36 @@ class MySqlIntegrationTest {
 
     @Test
     @Order(7)
-    void schemaHistoryPersistedInCatalogPg() throws Exception {
-        // MySQL 硬前提:schema history 经 JdbcSchemaHistory 落 catalog PG(与 offset 同库),
-        // 容器无本地状态——重启后结构从此表重放恢复
+    void rawOffsetPersistedInCatalogPg() throws Exception {
+        // FULL TableMap 自带列名/主键，不需要额外的结构历史存储。
         try (Connection c = DriverManager.getConnection(CATALOG.getJdbcUrl(), "lake_admin", "test");
              Statement s = c.createStatement();
-             var rs = s.executeQuery("SELECT count(*) FROM debezium_database_history")) {
+             var rs = s.executeQuery("SELECT count(*) FROM raw_mysql_offset")) {
             rs.next();
-            assertThat(rs.getLong(1)).as("schema history 应已写入 catalog PG").isGreaterThan(0);
+            assertThat(rs.getLong(1)).as("raw offset 应写入 catalog PG").isEqualTo(1);
         }
-        // offset 表同库(复用 PG 版机制)
-        try (Connection c = DriverManager.getConnection(CATALOG.getJdbcUrl(), "lake_admin", "test");
-             Statement s = c.createStatement();
-             var rs = s.executeQuery("SELECT count(*) FROM debezium_offset_storage")) {
-            rs.next();
-            assertThat(rs.getLong(1)).isGreaterThan(0);
+    }
+
+    @Test
+    @Order(8)
+    void filteredTransactionsStillAdvanceOffset() throws Exception {
+        TestOffset before = rawOffset();
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("INSERT INTO shop.dbz_heartbeat VALUES (1, NOW(6))");
+            // 超过空闲 flush 窗口后再提交一笔，确保事件线程主动执行持久化分支。
+            Thread.sleep(750);
+            s.execute("INSERT INTO shop.dbz_heartbeat VALUES (2, NOW(6))");
         }
+        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(250)).untilAsserted(() ->
+                assertThat(rawOffset().gtidSet()).isNotEqualTo(before.gtidSet()));
+        assertThat(engine.queryScalar(
+                "SELECT count(*) FROM information_schema.tables WHERE table_catalog='lake' "
+                        + "AND table_schema='shop' AND table_name='dbz_heartbeat'", Long.class)).isZero();
     }
 
     /** DDL 驱动建空表:存量空表借快照期历史 CREATE 补齐(含表/列注释),流式 CREATE 即刻建 */
     @Test
-    @Order(9)
+    @Order(10)
     void emptyTablesCreatedByDdlWithComments() throws Exception {
         // 存量空表(快照期已建):0 行 + 注释落湖
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(500))
@@ -334,7 +348,7 @@ class MySqlIntegrationTest {
 
     /** ADD COLUMN DDL 驱动(不等数据即建列,含 AFTER 位置语义的列序重排换表跟随) */
     @Test
-    @Order(11)
+    @Order(12)
     void addColumnWithPositionFollowsImmediately() throws Exception {
         try (Connection c = mysql(); Statement s = c.createStatement()) {
             s.execute("CREATE TABLE shop.colpos (id bigint PRIMARY KEY, name varchar(32))");
@@ -363,9 +377,9 @@ class MySqlIntegrationTest {
     }
 
     /** MySQL TIME 毒丸(合法值域 ±838h 超湖 TIME 24h):行不丢、链路不断(TRY_CAST 置 NULL 或
-     *  Debezium 侧钳制,两者皆可——钉死"不 crash loop"这一行为) */
+     *  reader 侧钳制——钉死"不 crash loop"这一行为。 */
     @Test
-    @Order(10)
+    @Order(11)
     void poisonTimeValuesDoNotBreakPipeline() throws Exception {
         try (Connection c = mysql(); Statement s = c.createStatement()) {
             s.execute("CREATE TABLE shop.poison_t (id bigint PRIMARY KEY, dur time)");
@@ -379,7 +393,7 @@ class MySqlIntegrationTest {
     }
 
     @Test
-    @Order(8)
+    @Order(9)
     void watermarkEndpointReportsHealthyPipeline() {
         String body = RestClient.create("http://127.0.0.1:" + port + "/api/ducklake")
                 .get().uri("/watermark").retrieve().body(String.class);
@@ -389,12 +403,10 @@ class MySqlIntegrationTest {
                 .contains("\"lastSyncedAt\":\"2026-");
     }
 
-    /** 主键变更(存量表补主键):存量行的 id 回填是 DDL 内部重写、无 binlog 行事件，湖旧行
-     *  主键恒 NULL——湖表重建+当前态重灌。主路径 scanner 直拉(引擎启动时 INSTALL mysql 扩展
-     *  只读 attach 源库,DDL 段事务内就地重建直灌,秒级)；扩展装不上/源瞬断自动降级 signal
-     *  blocking 快照——两条路径断言口径相同，用例对降级健壮 */
+    /** 主键变更（存量表补主键）：id 回填是 DDL 内部重写、无行事件，必须重建湖表并由
+     *  mysql scanner 直灌当前态。 */
     @Test
-    @Order(12)
+    @Order(13)
     void primaryKeyAdditionRebuildsAndRefillsCurrentState() throws Exception {
         try (Connection c = mysql(); Statement s = c.createStatement()) {
             s.execute("CREATE TABLE shop.pkfix (name varchar(16) NOT NULL)");
@@ -421,6 +433,66 @@ class MySqlIntegrationTest {
                 assertThat(lakeCount("SELECT count(*) FROM shop.pkfix")).isEqualTo(2L));
     }
 
+    /** UPDATE 主键必须先删除旧 key 再 upsert 新 key，不能在湖中残留两行。 */
+    @Test
+    @Order(14)
+    void primaryKeyUpdateMovesRatherThanDuplicatesRow() throws Exception {
+        long oldId;
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("INSERT INTO shop.cdc_test (name, price) VALUES ('pk_move', 8.88)",
+                    Statement.RETURN_GENERATED_KEYS);
+            try (var rs = s.getGeneratedKeys()) {
+                assertThat(rs.next()).isTrue();
+                oldId = rs.getLong(1);
+            }
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(250)).untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test WHERE id=" + oldId)).isEqualTo(1L));
+        long newId = oldId + 100_000;
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("UPDATE shop.cdc_test SET id=" + newId + " WHERE id=" + oldId);
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(250)).untilAsserted(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test WHERE id=" + oldId)).isZero();
+            assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test WHERE id=" + newId)).isEqualTo(1L);
+            assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test WHERE name='pk_move'")).isEqualTo(1L);
+        });
+    }
+
+    /**
+     * 模拟最危险的双系统提交窗口：数据已落湖，但 catalog offset 仍是上一事务。人工回退位点后
+     * 重启 RAW_MYSQL，GTID 重放同一 INSERT；主键 upsert 必须保持一行且 offset 再次前进。
+     */
+    @Test
+    @Order(15)
+    void restartFromPreviousOffsetReplaysIdempotently() throws Exception {
+        TestOffset before = rawOffset();
+        try (Connection c = mysql(); Statement s = c.createStatement()) {
+            s.execute("INSERT INTO shop.cdc_test (name, price) VALUES ('replay_once', 6.66)");
+        }
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(250)).untilAsserted(() ->
+                assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test WHERE name='replay_once'")).isEqualTo(1L));
+        TestOffset committed = rawOffset();
+        assertThat(committed.gtidSet()).isNotEqualTo(before.gtidSet());
+
+        rawRunner.stop();
+        try (Connection c = DriverManager.getConnection(CATALOG.getJdbcUrl(), "lake_admin", "test");
+             var ps = c.prepareStatement("UPDATE raw_mysql_offset SET binlog_filename=?, binlog_position=?, gtid_set=? "
+                     + "WHERE source_name='ducklake'")) {
+            ps.setString(1, before.filename());
+            ps.setLong(2, before.position());
+            ps.setString(3, before.gtidSet());
+            assertThat(ps.executeUpdate()).isEqualTo(1);
+        }
+        rawRunner.start();
+
+        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(250)).untilAsserted(() -> {
+            assertThat(lakeCount("SELECT count(*) FROM shop.cdc_test WHERE name='replay_once'")).isEqualTo(1L);
+            assertThat(rawOffset().gtidSet()).isEqualTo(committed.gtidSet());
+            assertThat(syncState.getEngineRunning().get()).isEqualTo(1);
+        });
+    }
+
     /**
      * 闭环兜底(最后执行)：把本类在 MySQL 源库 shop 建的所有用户表(CDC 基建 dbz_* 保留)全部 DROP,
      * 经 binlog schema change 跟随后源库与湖两侧都不再残留任何测试数据——"新建的数据最终都删掉",
@@ -429,7 +501,7 @@ class MySqlIntegrationTest {
     @Test
     @Order(1000)
     void teardownDropsEveryCreatedTableSoSourceAndLakeEndEmpty() throws Exception {
-        // ① 源侧:动态枚举 shop 库所有用户表并 DROP(排除基建 dbz_signal 等 dbz_*)
+        // ① 源侧：动态枚举并 DROP 本测试创建的全部用户表。
         try (Connection c = mysql(); Statement s = c.createStatement()) {
             var toDrop = new java.util.ArrayList<String>();
             try (var rs = s.executeQuery(
@@ -464,5 +536,18 @@ class MySqlIntegrationTest {
         return engine.queryScalar("SELECT data_type FROM information_schema.columns "
                         + "WHERE table_catalog='lake' AND table_schema='shop' AND table_name='cdc_test' AND column_name='" + column + "'",
                 String.class);
+    }
+
+    private static TestOffset rawOffset() throws Exception {
+        try (Connection c = DriverManager.getConnection(CATALOG.getJdbcUrl(), "lake_admin", "test");
+             Statement s = c.createStatement();
+             var rs = s.executeQuery("SELECT binlog_filename, binlog_position, gtid_set "
+                     + "FROM raw_mysql_offset WHERE source_name='ducklake'")) {
+            assertThat(rs.next()).isTrue();
+            return new TestOffset(rs.getString(1), rs.getLong(2), rs.getString(3));
+        }
+    }
+
+    private record TestOffset(String filename, long position, String gtidSet) {
     }
 }

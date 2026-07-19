@@ -10,7 +10,7 @@
 # (flush_inlined_data 每 5 分钟把 inlined 转 parquet,分量互补守恒;
 #  ducklake_table_stats.record_count 是近似统计,不作断言口径)
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ✓ $1"; }
@@ -66,7 +66,11 @@ else
   ok "postgres/catalog-pg/rustfs/ducklake 全部 healthy"
 fi
 bi=$(docker compose ps -a --format '{{.Service}} {{.ExitCode}}' | grep '^bucket-init ')
-[ "$bi" = "bucket-init 0" ] && ok "bucket-init 建桶完成(exit 0)" || bad "bucket-init 异常: ${bi:-未找到}"
+if [ "$bi" = "bucket-init 0" ]; then
+  ok "bucket-init 建桶完成(exit 0)"
+else
+  bad "bucket-init 异常: ${bi:-未找到}"
+fi
 
 echo "── 2. 引擎在线 ──"
 # 走 ducklake 容器内的 curl+jq(镜像内置排障工具),不依赖宿主装了什么;
@@ -108,15 +112,13 @@ psrc "INSERT INTO app_e2e.$SCHEMA_ONLY_TBL SELECT g, 'sku-'||g FROM generate_ser
 wait_for "app_e2e schema 表自动镜像(lake.app_e2e.$SCHEMA_ONLY_TBL,100 行)" 120 "100" schemacount
 psrc "DROP TABLE IF EXISTS app_e2e.$SCHEMA_ONLY_TBL" >/dev/null
 
-echo "── 7. 心跳闭环(空闲 WAL 确认) ──"
-hb=$(psrc "SELECT count(*) FROM dbz_heartbeat")
-if [ "${hb:-0}" -ge 1 ]; then ok "dbz_heartbeat 已有心跳行(action query 生效)"; else
-  echo "  … 等待一个心跳周期(65s)"; sleep 65
-  hb=$(psrc "SELECT count(*) FROM dbz_heartbeat")
-  [ "${hb:-0}" -ge 1 ] && ok "dbz_heartbeat 心跳行出现" || bad "心跳表仍为空(interval 60s 应已触发)"
-fi
+echo "── 7. 原生 pgoutput reader 在线 ──"
 slot=$(psrc "SELECT active FROM pg_replication_slots WHERE slot_name='dbz_ducklake'")
-[ "$slot" = "t" ] && ok "复制槽 dbz_ducklake active" || bad "复制槽状态异常: ${slot:-不存在}"
+if [ "$slot" = "t" ]; then
+  ok "复制槽 dbz_ducklake active"
+else
+  bad "复制槽状态异常: ${slot:-不存在}"
+fi
 
 echo "── 8. 应用日志 ERROR 扫描 ──"
 errs=$(docker compose logs ducklake 2>/dev/null | grep -c ' ERROR ' || true)

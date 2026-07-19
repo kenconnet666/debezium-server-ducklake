@@ -24,7 +24,7 @@ import java.sql.Statement;
  *       高流量保持 5 分钟级收敛）</li>
  *   <li>每小时：Tier1（1–10MB 归并）——白天查询性能的碎片防线</li>
  *   <li><b>每日凌晨（cron 可配，默认 04:40）：全量归并</b>（target/max=100GB，整表收敛到
- *       极少文件）+ 快照过期/物理清理/信号表 TRUNCATE。merge 是流式读写（无 sort order 时
+ *       极少文件）+ 快照过期/物理清理/PG DDL 审计表 TRUNCATE。merge 是流式读写（无 sort order 时
  *       无阻塞算子），内存峰值 ≈ row group 缓冲，与文件大小无关；即便超 memory_limit 也只是
  *       本次 CALL 报错被 catch，不伤数据链路。原"每日 Tier2 + 每月全量"两级被本档吸收。</li>
  * </ul>
@@ -87,7 +87,7 @@ public class LakeMaintenanceJobs {
                 .formatted(DuckLakeEngine.LAKE, days), "expire_snapshots");
         call("CALL ducklake_cleanup_old_files('%s', older_than => now() - INTERVAL 2 HOURS)"
                 .formatted(DuckLakeEngine.LAKE), "cleanup_old_files");
-        truncateDdlSignals();
+        truncateDdlAudit();
     }
 
     /** 全量归并本体（public 供集成测试跨包直接驱动）：所有文件(含已很大的)参与，不限分批 */
@@ -177,34 +177,20 @@ public class LakeMaintenanceJobs {
         }
     }
 
-    /**
-     * 源库信号表阅后即焚：已提交信号早在复制流内、消费与表内容无关，任意时刻清空都安全；
-     * 重快照后无历史信号也安全（rename/删列应用有列存在性幂等兜底）。
-     * ⚠️ 不能用 DELETE 清——会产生墓碑事件流进 DdlApplier（其 __op 过滤只是兜底）。
-     * 需要 GRANT TRUNCATE（PG）/ DROP 权限（MySQL 的 TRUNCATE 走 DROP 权限）。
-     * followTruncate 放行 op=t 后，本清理的 TRUNCATE 会产生事件——信号表从不落湖
-     * （dbz_ddl_log 走 DdlApplier 路由、dbz_signal 被连接器内部消费），消费者对
-     * 未落湖表的 TRUNCATE 段静默跳过，无副作用。
-     * DDL 审计表是 PG event trigger 专属基建，MySQL 模式不存在、跳过。
-     */
-    private void truncateDdlSignals() {
+    /** PG DDL 审计表阅后即焚；MySQL 的 binlog 自带 DDL，无审计表。 */
+    private void truncateDdlAudit() {
         DucklakeProperties.Source src = props.getSource();
+        if (src.getType() != DucklakeProperties.SourceType.POSTGRES) {
+            return;
+        }
         try (Connection c = DriverManager.getConnection(src.jdbcUrl(), src.getUser(), src.getPassword());
              Statement s = c.createStatement()) {
-            if (src.getType() == DucklakeProperties.SourceType.POSTGRES) {
-                for (String table : props.getMaintenance().getDdlAuditTables()) {
-                    s.execute("TRUNCATE TABLE " + table);
-                }
+            for (String table : props.getMaintenance().getDdlAuditTables()) {
+                s.execute("TRUNCATE TABLE " + table);
             }
-            // 增量快照 signal 表同样阅后即焚(已消费的 execute-snapshot 与水位标记行无保留价值)
-            s.execute("TRUNCATE TABLE " + src.resolvedSignalTable());
-            log.info("信号表已清空(防堆积): {} + {}",
-                    src.getType() == DucklakeProperties.SourceType.POSTGRES
-                            ? props.getMaintenance().getDdlAuditTables() : "[]",
-                    src.resolvedSignalTable());
+            log.info("PG DDL 审计表已清空（防堆积）: {}", props.getMaintenance().getDdlAuditTables());
         } catch (SQLException e) {
-            // 单项失败不影响主链;常见原因是 TRUNCATE 未授权(见 init 脚本 GRANT)或源库瞬时不可达
-            log.warn("信号表清理失败: {}", e.getMessage());
+            log.warn("PG DDL 审计表清理失败: {}", e.getMessage());
         }
     }
 
