@@ -53,11 +53,12 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
-        <!-- Debezium PG 连接与 offset storage 的 JDBC 驱动（connector 亦有传递，显式声明防版本漂移） -->
+        <!-- Debezium PG 连接与 offset storage 的 JDBC 驱动（connector 亦有传递，显式声明防版本漂移）。
+             compile scope：RawPgReader 直接使用 pgjdbc replication API（PGConnection/PGReplicationStream），
+             需要编译期可见；运行期由 Spring Boot fat jar 覆盖，无副作用。 -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
-            <scope>runtime</scope>
         </dependency>
         <!-- MySQL 源（source.type=mysql）的 JDBC 驱动：snapshot/元数据读取用；binlog 流式
              走 connector 传递的 io.debezium:mysql-binlog-connector-java。版本由 Boot BOM 托管 -->

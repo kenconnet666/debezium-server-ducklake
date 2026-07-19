@@ -22,6 +22,14 @@ public class DucklakeProperties {
     /** 源库类型：解码机制与 DDL 跟随路线随之切换（见 DebeziumEngineRunner / DdlApplier） */
     public enum SourceType { POSTGRES, MYSQL }
 
+    /**
+     * CDC 读取引擎：
+     * DEBEZIUM（默认）= Debezium Embedded Engine，PG/MySQL 通用；
+     * RAW_PG = pgjdbc 直读 pgoutput，PG 专用，harness 实测 153-163k rows/s（约 Debezium 13×）。
+     * source.type=MYSQL 时本字段忽略（只能 DEBEZIUM）。
+     */
+    public enum CdcEngine { DEBEZIUM, RAW_PG }
+
     /** CDC 源库。PG=逻辑复制（slot+publication）；MySQL 8.0+=binlog（ROW/FULL，8.0 起默认即是）。
      *  集群形态填代理读写口（HAProxy 等），故障转移自动跟随；单机直连 */
     @Data
@@ -53,6 +61,11 @@ public class DucklakeProperties {
         private String schemaIncludeList = "";
         /** 排除表（正则，PG schema.table / MySQL db.table 形式），如内部状态表 */
         private String tableExcludeList = "";
+        /**
+         * CDC 读取引擎（仅 source.type=POSTGRES 时生效；MySQL 固定走 DEBEZIUM）。
+         * RAW_PG 时 DebeziumEngineRunner 跳过，由 RawPgRunner 接管，吞吐约13× Debezium。
+         */
+        private CdcEngine engine = CdcEngine.DEBEZIUM;
         /** Debezium 增量快照 signal 表（source channel；类型严格跟随的"重建+重拉"兜底经由它触发，
          *  连接器的快照水位标记也写在此表；行由连接器内部消费不进变更流，维护任务定期 TRUNCATE）。
          *  空 = 按类型推导默认：PG "public.dbz_signal"；MySQL "<dbname>.dbz_signal" */
@@ -111,50 +124,41 @@ public class DucklakeProperties {
         private int maxRetryCount = 20;
     }
 
-    /** Debezium Embedded Engine 调参 */
+    /**
+     * CDC 引擎调参。标注适用范围：
+     * <ul>
+     *   <li><b>[双引擎]</b> DEBEZIUM 与 RAW_PG 均生效</li>
+     *   <li><b>[仅 Debezium]</b> source.engine=DEBEZIUM 时有效；RAW_PG 路径忽略</li>
+     * </ul>
+     */
     @Data
     public static class Engine {
-        /** 连续消费模型：批串行处理，上一批写湖期间到达的事件在队列自然堆积成下一批——
-         *  批大小自动 = 单批写入耗时内的流量(负反馈自稳,自动抗大流量)。上限放大让高流量时
-         *  "自然批"能长到真实尺寸(更少湖事务/snapshot);毒丸批重放粒度随之变大,可接受 */
+        /** [双引擎] 批上限：流量持续时"自然批"能长到此值（单批写湖耗时内的流量），
+         *  更少湖事务/snapshot，追赶场景建议调大（如 32768）。
+         *  RAW_PG 路径：Commit 消息到达时若 pending.size >= 本值则强制 flush */
         private int maxBatchSize = 8192;
+        /** [仅 Debezium] Debezium 内部事件队列上限 */
         private int maxQueueSize = 32768;
-        /** 队列空后发现新事件的唤醒间隔——连续消费模型的唯一延迟参数,仅空闲时燃烧
-         *  (持续有流时 poll 立即返回,不经过此参数)。空闲首条端到端延迟 ≈ 本值 + 单批写入耗时;
-         *  空闲期仅一个 condition await,调低近乎零成本 */
+        /** [双引擎] 空闲时的唤醒/轮询间隔（ms）。空闲首条延迟 ≈ 本值 + 单批写入耗时；
+         *  RAW_PG 路径同时影响心跳超时（flush timeout = max(pollIntervalMs×50, 500ms)） */
         private long pollIntervalMs = 10;
+        /** [仅 Debezium] offset 落盘刷新间隔 */
         private long offsetFlushIntervalMs = 10_000;
-        /** 心跳间隔(ms)：空闲期让连接器周期生成心跳事件（topic 前缀 __debezium-heartbeat），
-         *  借此向 PG 确认 slot 位置。没有它，publication 内表空闲时 confirmed_flush_lsn 冻结，
-         *  而 WAL 是实例级——其他库(含本模块维护任务写 catalog 自产的)的 WAL 被 slot 无限扣留
-         *  （2026-07-10 实测：业务表空闲数小时即扣 2.6MB，无上限累积）。
-         *  消费者按前缀识别心跳，只确认 offset+推水位、不写湖。0=禁用。
-         *  ⚠️ 单独配本值只覆盖"低流量"：pgoutput 服务端过滤下，publication 零事件时 walsender
-         *  不发任何消息、心跳无从挂靠（LSN flush mode 'connector' 只在事件处理时确认，实测
-         *  confirmed_flush_lsn 仍冻结）——零流量场景必须配 heartbeatActionQuery */
+        /** [仅 Debezium] 心跳间隔(ms)：防空闲期 confirmed_flush_lsn 冻结导致 WAL 无限扣留。
+         *  RAW_PG 路径通过 pgjdbc statusInterval（硬编码 10s）和 forceUpdateStatus 实现等效功能 */
         private long heartbeatIntervalMs = 60_000;
-        /** 心跳动作 SQL（Debezium 官方防"零流量 WAL 无限扣留"的完整方案）：连接器每个心跳周期
-         *  以 source.user 身份对源库执行本 SQL——UPSERT 心跳表产生真实 WAL 事件流回连接器，
-         *  触发 LSN flush。空=禁用。前置：心跳表存在且在 publication 内、source.user 有写权限
-         *  （见 test yml 配置与建表 SQL）；心跳表变更作为普通表落湖（单行 upsert，每天 1440 行
-         *  append，量可忽略且让 lastBatchAt 监控口径"永远有活"不误报） */
+        /** [仅 Debezium] 心跳动作 SQL（零流量 WAL 防扣留的完整闭环，强烈建议配置） */
         private String heartbeatActionQuery = "";
-        /** initial=首启全量快照后转流式；no_data=只流式不快照 */
+        /** [仅 Debezium] topic 前缀（connector topic.prefix）；多实例各配不同值防 topic 冲突 */
+        private String topicPrefix = "ducklake";
+        /** [仅 Debezium] 快照模式：initial=首启全量快照；no_data=只流式不快照。
+         *  RAW_PG 路径由 ScannerBootstrap.evaluateForRawPg() 独立判断，本字段被忽略 */
         private String snapshotMode = "initial";
-        /** 批写失败重试的退避基数(实际等待 = 基数 << 重试次数;测试可调小) */
+        /** [双引擎] 批写失败重试退避基数（实际等待 = 基数 << 重试次数） */
         private long retrySleepBaseMs = 2000;
-        /** 诊断开关:handleBatch 空转(只确认 offset、不写湖)——测 Debezium 纯解码+交付吞吐天花板,
-         *  区分"吞吐上限是解码瓶颈(no-op 也就这么快)还是写侧瓶颈(no-op 快很多)"。
-         *  ⚠️ 生产必须 false:开启则数据不落湖、offset 照推进=永久丢数据,仅压测诊断用 */
+        /** [仅 Debezium] 诊断：空转不写湖（⚠️ 生产必须 false） */
         private boolean dryRun = false;
-        /** SMT 并行线程数(AsyncEmbeddedEngine record.processing.threads):ChangeConsumer 模式下
-         *  引擎用 ParallelSmtBatchProcessor 把每条记录的 SMT(unwrap 扁平化/墓碑 rewrite)转换
-         *  提交线程池并行执行,再按提交序收集——<b>交付顺序不变,保序语义零影响</b>。
-         *  ⚠️ Debezium 3.6 默认(不设)= ThreadPoolExecutor(core=0, max=核数, 无界 LinkedBlockingQueue)
-         *  ——无界队列下超 core 的线程永不创建,<b>实际恒 1 线程</b>(官方 javadoc 称
-         *  newCachedThreadPool,与实现不符,3.6.0 源码实测);显式设置才走 newFixedThreadPool 真并行。
-         *  -1=AVAILABLE_CORES(默认,真并行到核数);>0=固定 N 线程;0=沿用引擎默认(事实单线程)。
-         *  注:并行的只是 SMT 段,连接器 WAL 解码(pgoutput 解析→Struct 构建)固有单线程,是另一半地板 */
+        /** [仅 Debezium] SMT 并行线程数（-1=核数；0=引擎默认事实单线程；>0=固定值） */
         private int recordProcessingThreads = -1;
     }
 

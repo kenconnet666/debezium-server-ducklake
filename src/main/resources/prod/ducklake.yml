@@ -20,6 +20,10 @@ ducklake:
     # 湖表自动一一对应);收窄时给逗号分隔列表(正则),如 "public,app"
     schema-include-list: ${DUCKLAKE_SCHEMA_INCLUDE:}
     table-exclude-list: ${DUCKLAKE_TABLE_EXCLUDE:}
+    # CDC 读取引擎（仅 source.type=postgres 时生效；mysql 固定走 DEBEZIUM）：
+    # DEBEZIUM（默认）= Debezium Embedded Engine，PG/MySQL 通用；
+    # RAW_PG = pgjdbc 直读 pgoutput，PG 专用，harness 实测约 Debezium 13×
+    engine: ${DUCKLAKE_ENGINE:DEBEZIUM}
   lake:
     catalog-host: ${DUCKLAKE_CATALOG_HOST:${DUCKLAKE_SOURCE_HOST}}
     catalog-port: ${DUCKLAKE_CATALOG_PORT:5432}

@@ -519,6 +519,38 @@ public class DdlApplier {
     }
 
     /**
+     * [RawPgReader] 读取 PG 源表列定义（列名 → DuckDB 类型，按列序）。
+     * 失败返回空 Map（调用方降级全列 VARCHAR）。
+     */
+    public Map<String, String> pgColumnTypes(String schema, String table) {
+        TableDef def = readPgTableDef(schema + "." + table);
+        return def != null ? new LinkedHashMap<>(def.cols()) : Map.of();
+    }
+
+    /**
+     * [RawPgReader] 处理来自 raw-pg 流的 DDL 审计行（Map 形态，与 PG 前端 {@link #apply} 同语义）。
+     * key 集合：ev / tag / object_type / object_identity / query_text / xid / __op（均可缺失）。
+     */
+    public void applyRaw(Connection conn, List<Map<String, String>> rows,
+                         java.util.function.Consumer<String> cacheInvalidator,
+                         java.util.function.Consumer<String> rebuildRequester) throws SQLException {
+        // 复用 apply() 全部逻辑：把 Map 行转为 Struct 列表
+        org.apache.kafka.connect.data.SchemaBuilder builder =
+                org.apache.kafka.connect.data.SchemaBuilder.struct();
+        for (String f : List.of("ev", "tag", "object_type", "object_identity", "query_text",
+                "__op", "xid")) {
+            builder.field(f, org.apache.kafka.connect.data.Schema.OPTIONAL_STRING_SCHEMA);
+        }
+        org.apache.kafka.connect.data.Schema sch = builder.build();
+        List<Struct> structs = rows.stream().map(row -> {
+            Struct s = new Struct(sch);
+            row.forEach((k, v) -> { if (sch.field(k) != null) s.put(k, v); });
+            return s;
+        }).toList();
+        apply(conn, structs, cacheInvalidator, rebuildRequester);
+    }
+
+    /**
      * [bootstrap] 首次接入的单表落地：连源库读目标态 → 建湖表（不存在时，含注释/排序聚簇）
      * → scanner 直拉存量（按主键 anti-join：no_data 模式下流式已并行开跑，先落的增量行
      * 更新、不被快照读覆盖）。返回灌入行数；<b>-1 = 表已建但无主键/scanner 够不到</b>

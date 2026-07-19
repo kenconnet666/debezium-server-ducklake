@@ -51,6 +51,8 @@ public class ScannerBootstrap {
     private final DdlApplier ddlApplier;
 
     private volatile boolean takeOver;
+    /** raw-pg 模式标记：true 时 requestBlockingSnapshot 降级为仅告警（无 Debezium signal 通道） */
+    private volatile boolean rawPgMode = false;
 
     /** 是否接管首次快照（Runner buildProps 据此把 snapshot.mode 改为 no_data） */
     public boolean shouldTakeOver() {
@@ -69,6 +71,45 @@ public class ScannerBootstrap {
                 && needsBootstrap();
         if (takeOver) {
             log.info("scanner bootstrap 接管首次存量：snapshot.mode → no_data，流式即刻开始，存量由 scanner 直拉");
+        }
+    }
+
+    /**
+     * RAW_PG 引擎专用评估：绕过 snapshotMode 检查，用 {@code startLsn} 判断首次接入，
+     * 兜底 signal 通道不可用时降级为仅告警（无主键表流式后续 insert-only）。
+     *
+     * @param startLsn 从 raw_pg_offset 读到的已确认 LSN；0 = 首次接入
+     */
+    public void evaluateForRawPg(long startLsn) {
+        DucklakeProperties.Maintenance m = props.getMaintenance();
+        rawPgMode = true;
+        takeOver = m.isScannerRefill() && m.isScannerBootstrap()
+                && engine.isScannerSrcAttached()
+                && needsBootstrapRawPg(startLsn);
+        if (takeOver) {
+            log.info("scanner bootstrap 接管首次存量（raw-pg 模式）：流式即刻开始，存量由 scanner 直拉");
+        }
+    }
+
+    /**
+     * RAW_PG 模式的首次接入检测：ducklake_bootstrap 有 pending 行（崩溃续跑），
+     * 或状态表不存在且 startLsn=0（真正首次）。
+     */
+    private boolean needsBootstrapRawPg(long startLsn) {
+        try (Connection c = catalog()) {
+            try (Statement s = c.createStatement();
+                 ResultSet rs = s.executeQuery(
+                         "SELECT count(*) FROM ducklake_bootstrap WHERE status='pending'")) {
+                if (rs.next() && rs.getLong(1) > 0) {
+                    return true; // 崩溃续跑：上次 bootstrap 未完成
+                }
+            } catch (SQLException e) {
+                // 状态表不存在 = 从未 bootstrap 过，继续判断 lsn
+            }
+            return startLsn == 0; // 首次接入
+        } catch (SQLException e) {
+            log.warn("bootstrap 评估失败(跳过 scanner bootstrap): {}", e.getMessage());
+            return false;
         }
     }
 
@@ -226,11 +267,23 @@ public class ScannerBootstrap {
         return out;
     }
 
-    /** 兜底表一次性 blocking 快照（无主键/跨库/直灌失败）：一轮流式停顿换全部补齐；
-     *  signal 写入失败保留 pending（重启续跑再试）。
-     *  ⚠️ 必须先等复制位点确立：bootstrap 与引擎启动并发，位点确立前写入的 signal 行
-     *  其 WAL/binlog 事件在位点之前、流式看不到 = signal 静默丢失（集成测试实测踩坑） */
+    /**
+     * 兜底表一次性 blocking 快照（无主键/跨库/直灌失败）：一轮流式停顿换全部补齐；
+     * signal 写入失败保留 pending（重启续跑再试）。
+     * <p>
+     * raw-pg 模式无 Debezium signal 通道：无主键表流式后续 insert-only，标记 no-pk-skip 防重跑。
+     * ⚠️ 必须先等复制位点确立：bootstrap 与引擎启动并发，位点确立前写入的 signal 行
+     * 其 WAL/binlog 事件在位点之前、流式看不到 = signal 静默丢失（集成测试实测踩坑）
+     */
     private void requestBlockingSnapshot(Connection catalog, List<String> tables) {
+        if (rawPgMode) {
+            log.warn("raw-pg 模式无 Debezium signal 通道，以下无主键表跳过存量快照（流式后续 insert-only）: {}",
+                    tables);
+            for (String t : tables) {
+                markDone(catalog, t, "no-pk-skip", null);
+            }
+            return;
+        }
         if (!waitForStreamingPosition(catalog)) {
             log.error("复制位点未就绪,兜底 signal 暂缓(表保持 pending,重启续跑): {}", tables);
             return;

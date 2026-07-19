@@ -57,6 +57,10 @@ public class DebeziumEngineRunner implements SmartLifecycle {
 
     @Override
     public void start() {
+        if (props.getSource().getEngine() == DucklakeProperties.CdcEngine.RAW_PG) {
+            log.info("engine=raw-pg，Debezium 引擎跳过，由 RawPgRunner 负责");
+            return;
+        }
         // 首次接入的存量 scanner 化评估(须在 buildProps 前:决定 snapshot.mode 是否改 no_data)
         bootstrap.evaluate();
         engine = DebeziumEngine.create(Connect.class)
@@ -124,7 +128,7 @@ public class DebeziumEngineRunner implements SmartLifecycle {
         DucklakeProperties.Engine eng = props.getEngine();
 
         Properties p = new Properties();
-        p.setProperty("name", "ducklake");
+        p.setProperty("name", eng.getTopicPrefix());
 
         // --- offset 存 PG（3.2+ 的 .connection.* 新 key；老教程的 offset.storage.jdbc.url 已弃用）。
         //     catalog 恒为 PG，与源库类型无关 ---
@@ -142,7 +146,7 @@ public class DebeziumEngineRunner implements SmartLifecycle {
         p.setProperty("database.port", String.valueOf(src.getPort()));
         p.setProperty("database.user", src.getUser());
         p.setProperty("database.password", src.getPassword());
-        p.setProperty("topic.prefix", "ducklake");
+        p.setProperty("topic.prefix", eng.getTopicPrefix());
         switch (src.getType()) {
             case POSTGRES -> {
                 p.setProperty("connector.class", "io.debezium.connector.postgresql.PostgresConnector");
@@ -254,7 +258,8 @@ public class DebeziumEngineRunner implements SmartLifecycle {
         p.setProperty("predicates", "isDataTopic");
         p.setProperty("predicates.isDataTopic.type",
                 "org.apache.kafka.connect.transforms.predicates.TopicNameMatches");
-        p.setProperty("predicates.isDataTopic.pattern", "ducklake\\.[^.]+\\.[^.]+");
+        p.setProperty("predicates.isDataTopic.pattern",
+                java.util.regex.Pattern.quote(eng.getTopicPrefix()) + "\\.[^.]+\\.[^.]+");
 
         return p;
     }

@@ -24,6 +24,21 @@ DO $$ BEGIN
   END IF;
 END $$;
 
+-- ② 方案B 按 schema 分片 publication（多实例横向扩展，聚合吞吐近线性，harness 实测 2× 线性）。
+-- 按需取消注释，每实例对应一个独立 slot + publication：
+--   实例A：slot=dbz_ducklake_a  publication=pub_schema_a  schema-include-list=schema_a  topic-prefix=ducklake_a
+--   实例B：slot=dbz_ducklake_b  publication=pub_schema_b  schema-include-list=schema_b  topic-prefix=ducklake_b
+-- 注意：每路 walsender 全量解码 WAL 再按 publication 过滤，N 个分片 = N× WAL 读放大；
+--       按表拆 publication（每路只解码自己 schema 的 WAL 再过滤）优于按行 hash 分片同一热表。
+-- DO $$ BEGIN
+--   IF NOT EXISTS (SELECT FROM pg_publication WHERE pubname = 'pub_schema_a') THEN
+--     CREATE PUBLICATION pub_schema_a FOR TABLES IN SCHEMA schema_a;
+--   END IF;
+--   IF NOT EXISTS (SELECT FROM pg_publication WHERE pubname = 'pub_schema_b') THEN
+--     CREATE PUBLICATION pub_schema_b FOR TABLES IN SCHEMA schema_b;
+--   END IF;
+-- END $$;
+
 -- ③ DuckLake catalog（湖元数据 + Debezium offset 存储）——**推荐独立 PG 实例承载**
 --    （.docker/postgres/docker-compose.yml 即此形态：catalog-pg 容器由 POSTGRES_USER=lake_admin /
 --     POSTGRES_DB=ducklake_catalog 环境变量直接建好，无需任何脚本）。

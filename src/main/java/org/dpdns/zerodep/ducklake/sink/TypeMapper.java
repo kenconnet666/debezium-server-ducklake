@@ -25,7 +25,7 @@ import java.time.OffsetDateTime;
  * </ul>
  * 未识别类型一律 VARCHAR + toString 兜底（打日志），保证不丢数据。
  */
-final class TypeMapper {
+public final class TypeMapper {
 
     private TypeMapper() {
     }
@@ -205,7 +205,7 @@ final class TypeMapper {
      * 供湖列现型与事件类型比对(差异仅时区时间戳一处;LIST 列递归归一元素类型,
      * 否则 "TIMESTAMP WITH TIME ZONE[]" 与事件 "TIMESTAMPTZ[]" 恒不等,每批误触类型跟随)。
      */
-    static String normalizeDuckType(String infoSchemaType) {
+    public static String normalizeDuckType(String infoSchemaType) {
         String t = infoSchemaType == null ? "" : infoSchemaType.toUpperCase();
         if (t.endsWith("[]")) {
             return normalizeDuckType(t.substring(0, t.length() - 2)) + "[]";
